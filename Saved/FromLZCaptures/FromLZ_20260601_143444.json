@@ -1,7 +1,7 @@
 {
-	"capture_timestamp": "20260601_115753",
-	"json_path": "../../../../UE_Proj/Test_0529_1510/Saved/FromLZCaptures/FromLZ_20260601_115753.json",
-	"png_path": "../../../../UE_Proj/Test_0529_1510/Saved/FromLZCaptures/FromLZ_20260601_115753.png",
+	"capture_timestamp": "20260601_143444",
+	"json_path": "../../../../UE_Proj/Test_0529_1510/Saved/FromLZCaptures/FromLZ_20260601_143444.json",
+	"png_path": "../../../../UE_Proj/Test_0529_1510/Saved/FromLZCaptures/FromLZ_20260601_143444.png",
 	"pawn":
 	{
 		"object_name": "FromLZCameraPawn_0",
@@ -511,7 +511,7 @@
 			"ActorGuid":
 			{
 				"cpp_type": "FGuid",
-				"value_text": "752DAC154BA0DE8C9285BF8EE5CEFAB1"
+				"value_text": "C4CE62CC400DA309BC4769AC65DEB77B"
 			},
 			"ActorInstanceGuid":
 			{
@@ -732,11 +732,11 @@
 	},
 	"pawn_transform":
 	{
-		"location_x": 346.41323037750379,
-		"location_y": 412.56562105042474,
-		"location_z": 97.160093783080583,
+		"location_x": -604.41373403281966,
+		"location_y": -806.05960733968095,
+		"location_z": 579.08672273584375,
 		"pitch": 0,
-		"yaw": 91.051833999999999,
+		"yaw": 80.425938000000002,
 		"roll": 0,
 		"scale_x": 1,
 		"scale_y": 1,
@@ -1142,12 +1142,12 @@
 	},
 	"camera_component_transform":
 	{
-		"location_x": 496.96659826461945,
-		"location_y": -728.60388499806857,
-		"location_z": 436.37365760811576,
-		"pitch": -16.420099541546833,
-		"yaw": 97.515572750666379,
-		"roll": 3.4815790733148984e-14,
+		"location_x": -1224.8391299188875,
+		"location_y": -1779.8223947172687,
+		"location_z": 905.97869580683744,
+		"pitch": -15.807725019753493,
+		"yaw": 57.497066904819235,
+		"roll": 0,
 		"scale_x": 1,
 		"scale_y": 1,
 		"scale_z": 1
@@ -1286,7 +1286,7 @@
 			"RelativeRotation":
 			{
 				"cpp_type": "FRotator",
-				"value_text": "(Pitch=-16.420100,Yaw=6.463739,Roll=0.000000)"
+				"value_text": "(Pitch=-15.807725,Yaw=-22.928871,Roll=-0.000000)"
 			},
 			"RelativeScale3D":
 			{
@@ -1502,12 +1502,12 @@
 	},
 	"camera_boom_transform":
 	{
-		"location_x": 346.41323037750379,
-		"location_y": 412.56562105042474,
-		"location_z": 97.160093783080583,
-		"pitch": -16.420099541546847,
-		"yaw": 97.515572750666422,
-		"roll": 3.3157895936332369e-14,
+		"location_x": -604.41373403281966,
+		"location_y": -806.05960733968095,
+		"location_z": 579.08672273584375,
+		"pitch": -15.807725019753498,
+		"yaw": 57.497066904819256,
+		"roll": 0,
 		"scale_x": 1,
 		"scale_y": 1,
 		"scale_z": 1
