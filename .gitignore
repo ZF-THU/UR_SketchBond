@@ -1,0 +1,30 @@
+# Unreal Engine project .gitignore
+
+# Visual Studio / Rider
+.vs/
+.vsconfig
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+
+# Build artifacts
+Binaries/
+DerivedDataCache/
+Intermediate/
+Build/
+
+# Saved: ignore everything by default, but keep selected debug/data outputs
+Saved/*
+!Saved/2DDebug/
+!Saved/FromAction/
+!Saved/FromLZCaptures/
+
+# Local working sub-project (excluded from this repo)
+Source/Test_0529_1510/12_ForOwnUse_V4/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

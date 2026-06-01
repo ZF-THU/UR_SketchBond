@@ -1,0 +1,263 @@
+#include "FromLZSketchProcessor.h"
+
+#include "FromLZSketch2DProcessor.h"
+#include "HAL/FileManager.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "Modules/ModuleManager.h"
+
+void FFromLZSketchProcessor::ProcessLatestSketch()
+{
+	const FString SketchDir = FPaths::ProjectSavedDir() / TEXT("FromSketch");
+	const FString CaptureDir = FPaths::ProjectSavedDir() / TEXT("FromLZCaptures");
+	const FString ProcessDir = FPaths::ProjectSavedDir() / TEXT("FromProcess");
+
+	IFileManager::Get().MakeDirectory(*ProcessDir, true);
+
+	// 1) Latest hand sketch (red/green/blue lines on white) from FromSketch.
+	const FString SketchPng = FindLatestPng(SketchDir);
+	if (SketchPng.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: No PNG found in %s"), *SketchDir);
+		return;
+	}
+
+	TArray<uint8> SketchPixels;
+	int32 SW = 0;
+	int32 SH = 0;
+	if (!DecodePngToRGBA(SketchPng, SketchPixels, SW, SH) || SW <= 0 || SH <= 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: Failed to decode sketch %s"), *SketchPng);
+		return;
+	}
+	UE_LOG(LogTemp, Log, TEXT("ProcessSketch: sketch=%s (%dx%d)"), *SketchPng, SW, SH);
+
+	// 2) Latest captured line-art (black lines on white) from FromLZCaptures.
+	const FString CapturePng = FindLatestPng(CaptureDir);
+	TArray<uint8> CapturePixels;
+	int32 CW = 0;
+	int32 CH = 0;
+	const bool bHasCapture = !CapturePng.IsEmpty() && DecodePngToRGBA(CapturePng, CapturePixels, CW, CH) && CW > 0 && CH > 0;
+	if (bHasCapture)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ProcessSketch: capture=%s (%dx%d)"), *CapturePng, CW, CH);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: no usable PNG in %s; composite will contain sketch lines only."), *CaptureDir);
+	}
+
+	// 3) Composite onto a clean white canvas at the sketch resolution:
+	//      - non-white sketch pixels (the red/green/blue lines) are copied as-is
+	//      - elsewhere, black lines from the capture (scaled to the sketch size) are drawn black
+	//    Result: white background with black + red + green + blue lines.
+	TArray<uint8> Composite;
+	Composite.SetNumUninitialized(SW * SH * 4);
+
+	for (int32 y = 0; y < SH; ++y)
+	{
+		for (int32 x = 0; x < SW; ++x)
+		{
+			const int32 Idx = (y * SW + x) * 4;
+			const uint8 sr = SketchPixels[Idx + 0];
+			const uint8 sg = SketchPixels[Idx + 1];
+			const uint8 sb = SketchPixels[Idx + 2];
+
+			uint8 r = 255;
+			uint8 g = 255;
+			uint8 b = 255;
+
+			const bool bSketchMark = !(sr > 240 && sg > 240 && sb > 240);
+			if (bSketchMark)
+			{
+				r = sr;
+				g = sg;
+				b = sb;
+			}
+			else if (bHasCapture)
+			{
+				const int32 cx = FMath::Clamp((x * CW) / SW, 0, CW - 1);
+				const int32 cy = FMath::Clamp((y * CH) / SH, 0, CH - 1);
+				const int32 CIdx = (cy * CW + cx) * 4;
+				const bool bCaptureLine = CapturePixels[CIdx + 0] < 128 && CapturePixels[CIdx + 1] < 128 && CapturePixels[CIdx + 2] < 128;
+				if (bCaptureLine)
+				{
+					r = 0;
+					g = 0;
+					b = 0;
+				}
+			}
+
+			Composite[Idx + 0] = r;
+			Composite[Idx + 1] = g;
+			Composite[Idx + 2] = b;
+			Composite[Idx + 3] = 255;
+		}
+	}
+
+	const FString CompositePath = ProcessDir / TEXT("wContextSketch_raw.png");
+	if (SaveRGBAToPng(Composite, SW, SH, CompositePath))
+	{
+		UE_LOG(LogTemp, Log, TEXT("ProcessSketch: saved composite %s"), *CompositePath);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: failed to save composite %s"), *CompositePath);
+	}
+
+	// Run the migrated 2D sketch-analysis pipeline (steps 1-8) on the composite,
+	// off the game thread. Debug artifacts go to <ProjectSaved>/2DDebug/.
+	{
+		const FString TwoDDebugDir = FPaths::ProjectSavedDir() / TEXT("2DDebug");
+
+		// Record which source files this press consumed (paths relative to Saved/).
+		FSketchSourceInfo Source;
+		Source.bHasCapture = bHasCapture;
+		Source.SketchPngRel = TEXT("FromSketch/") + FPaths::GetCleanFilename(SketchPng);
+		if (bHasCapture)
+		{
+			const FString CaptureStem = FPaths::GetBaseFilename(CapturePng); // FromLZ_<timestamp>
+			Source.CaptureStem = CaptureStem;
+			Source.CapturePngRel = TEXT("FromLZCaptures/") + FPaths::GetCleanFilename(CapturePng);
+			Source.CaptureJsonRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT(".json");
+		}
+
+		FFromLZSketch2DProcessor::ProcessCompositeAsync(Composite, SW, SH, TwoDDebugDir, Source);
+	}
+
+	// 4) Continue with red/green/blue line decomposition, now from the composite.
+	const bool bR = ExtractAndSaveChannel(Composite, SW, SH, 255, 0, 0, ProcessDir / TEXT("Sketch_R.png"));
+	const bool bG = ExtractAndSaveChannel(Composite, SW, SH, 0, 255, 0, ProcessDir / TEXT("Sketch_G.png"));
+	const bool bB = ExtractAndSaveChannel(Composite, SW, SH, 0, 0, 255, ProcessDir / TEXT("Sketch_B.png"));
+
+	if (bR && bG && bB)
+	{
+		UE_LOG(LogTemp, Log, TEXT("ProcessSketch: Saved Sketch_R.png, Sketch_G.png, Sketch_B.png to %s"), *ProcessDir);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: One or more channel files failed to save (R=%d G=%d B=%d)"), bR, bG, bB);
+	}
+}
+
+bool FFromLZSketchProcessor::DecodePngToRGBA(const FString& Path, TArray<uint8>& OutPixels, int32& OutWidth, int32& OutHeight)
+{
+	OutWidth = 0;
+	OutHeight = 0;
+	OutPixels.Reset();
+
+	TArray<uint8> RawFileData;
+	if (!FFileHelper::LoadFileToArray(RawFileData, *Path))
+	{
+		return false;
+	}
+
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> ImageWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+	if (!ImageWrapper.IsValid() || !ImageWrapper->SetCompressed(RawFileData.GetData(), RawFileData.Num()))
+	{
+		return false;
+	}
+
+	if (!ImageWrapper->GetRaw(ERGBFormat::RGBA, 8, OutPixels))
+	{
+		return false;
+	}
+
+	OutWidth = ImageWrapper->GetWidth();
+	OutHeight = ImageWrapper->GetHeight();
+	return true;
+}
+
+bool FFromLZSketchProcessor::SaveRGBAToPng(const TArray<uint8>& RGBAPixels, int32 Width, int32 Height, const FString& OutputPath)
+{
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> OutputWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+	if (!OutputWrapper.IsValid())
+	{
+		return false;
+	}
+
+	OutputWrapper->SetRaw(RGBAPixels.GetData(), RGBAPixels.Num(), Width, Height, ERGBFormat::RGBA, 8);
+	const TArray64<uint8>& CompressedData = OutputWrapper->GetCompressed();
+	return FFileHelper::SaveArrayToFile(
+		TArrayView<const uint8>(CompressedData.GetData(), static_cast<int32>(CompressedData.Num())),
+		*OutputPath
+	);
+}
+
+FString FFromLZSketchProcessor::FindLatestPng(const FString& Directory)
+{
+	TArray<FString> Filenames;
+	IFileManager::Get().FindFiles(Filenames, *(Directory / TEXT("*.png")), true, false);
+
+	if (Filenames.IsEmpty())
+	{
+		return FString();
+	}
+
+	FString LatestPath;
+	FDateTime LatestTime = FDateTime::MinValue();
+
+	for (const FString& Filename : Filenames)
+	{
+		const FString FullPath = Directory / Filename;
+		const FFileStatData Stat = IFileManager::Get().GetStatData(*FullPath);
+		if (Stat.ModificationTime > LatestTime)
+		{
+			LatestTime = Stat.ModificationTime;
+			LatestPath = FullPath;
+		}
+	}
+
+	return LatestPath;
+}
+
+bool FFromLZSketchProcessor::ExtractAndSaveChannel(const TArray<uint8>& RGBAPixels, int32 Width, int32 Height, uint8 TargetR, uint8 TargetG, uint8 TargetB, const FString& OutputPath)
+{
+	TArray<uint8> OutputPixels;
+	OutputPixels.SetNumUninitialized(RGBAPixels.Num());
+
+	const int32 PixelCount = Width * Height;
+	for (int32 i = 0; i < PixelCount; ++i)
+	{
+		const int32 Offset = i * 4;
+		const uint8 R = RGBAPixels[Offset + 0];
+		const uint8 G = RGBAPixels[Offset + 1];
+		const uint8 B = RGBAPixels[Offset + 2];
+
+		if (R == TargetR && G == TargetG && B == TargetB)
+		{
+			OutputPixels[Offset + 0] = R;
+			OutputPixels[Offset + 1] = G;
+			OutputPixels[Offset + 2] = B;
+			OutputPixels[Offset + 3] = 255;
+		}
+		else
+		{
+			OutputPixels[Offset + 0] = 0;
+			OutputPixels[Offset + 1] = 0;
+			OutputPixels[Offset + 2] = 0;
+			OutputPixels[Offset + 3] = 0;
+		}
+	}
+
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> OutputWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
+
+	if (!OutputWrapper.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: Failed to create image wrapper for %s"), *OutputPath);
+		return false;
+	}
+
+	OutputWrapper->SetRaw(OutputPixels.GetData(), OutputPixels.Num(), Width, Height, ERGBFormat::RGBA, 8);
+
+	const TArray64<uint8>& CompressedData = OutputWrapper->GetCompressed();
+	return FFileHelper::SaveArrayToFile(
+		TArrayView<const uint8>(CompressedData.GetData(), static_cast<int32>(CompressedData.Num())),
+		*OutputPath
+	);
+}
