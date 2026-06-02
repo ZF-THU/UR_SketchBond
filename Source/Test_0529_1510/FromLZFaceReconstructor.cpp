@@ -1,4 +1,5 @@
 #include "FromLZFaceReconstructor.h"
+#include "FromLZManifoldBoolean.h"
 
 #include "Algo/Reverse.h"
 #include "Async/Async.h"
@@ -22,7 +23,6 @@
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
-#include "Operations/MeshBoolean.h"
 #include "ProceduralMeshComponent.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -44,7 +44,6 @@ namespace
 	constexpr int32 SolidTargetMaxLoopPoints = 384;
 	constexpr int32 MinSolidDepthSamples = 3;
 	constexpr double ExcavationCutterNormalScale = 1.2;
-	constexpr double Step11BooleanSnapToleranceCm = 0.05;
 	constexpr double Step11BooleanMinRenderableEdgeCm = 0.05;
 	constexpr double Step11BooleanBoundsExpandCm = 1.0;
 	const FColor ReconstructedDebugBlue(0, 120, 255, 255);
@@ -2893,6 +2892,7 @@ namespace
 		double VolumeDelta = 0.0;
 		double MinRequiredVolumeDelta = 0.0;
 		FStep11MeshDiagnostics ResultDiagnostics;
+		FFromLZManifoldBooleanDiagnostics ManifoldDiagnostics;
 		UE::Geometry::FDynamicMesh3 ResultMesh;
 		TArray<int8> TriangleSourceMeshById;
 	};
@@ -2949,6 +2949,8 @@ namespace
 	{
 		TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
 		Object->SetStringField(TEXT("pass_name"), Attempt.PassName);
+		Object->SetStringField(TEXT("boolean_backend"), Attempt.ManifoldDiagnostics.BooleanBackend);
+		Object->SetStringField(TEXT("manifold_library_version"), Attempt.ManifoldDiagnostics.LibraryVersion);
 		Object->SetStringField(TEXT("status"), Attempt.Status);
 		Object->SetStringField(TEXT("reject_reason"), Attempt.RejectReason);
 		Object->SetBoolField(TEXT("compute_success"), Attempt.bComputeSuccess);
@@ -2957,6 +2959,19 @@ namespace
 		Object->SetBoolField(TEXT("target_reversed_for_pass"), Attempt.bTargetReversedForPass);
 		Object->SetBoolField(TEXT("cutter_reversed_for_pass"), Attempt.bCutterReversedForPass);
 		Object->SetBoolField(TEXT("result_reversed_to_target_sign"), Attempt.bResultReversedToTargetSign);
+		Object->SetBoolField(TEXT("target_manifold_input_valid"), Attempt.ManifoldDiagnostics.bTargetManifoldInputValid);
+		Object->SetBoolField(TEXT("cutter_manifold_input_valid"), Attempt.ManifoldDiagnostics.bCutterManifoldInputValid);
+		Object->SetBoolField(TEXT("manifold_difference_success"), Attempt.ManifoldDiagnostics.bManifoldDifferenceSuccess);
+		Object->SetStringField(TEXT("manifold_error_message"), Attempt.ManifoldDiagnostics.ManifoldErrorMessage);
+		Object->SetNumberField(TEXT("target_input_triangles"), Attempt.ManifoldDiagnostics.TargetInputTriangles);
+		Object->SetNumberField(TEXT("cutter_input_triangles"), Attempt.ManifoldDiagnostics.CutterInputTriangles);
+		Object->SetNumberField(TEXT("result_output_triangles"), Attempt.ManifoldDiagnostics.ResultOutputTriangles);
+		Object->SetBoolField(TEXT("target_orientation_reversed_for_manifold"), Attempt.ManifoldDiagnostics.bTargetOrientationReversedForManifold);
+		Object->SetBoolField(TEXT("cutter_orientation_reversed_for_manifold"), Attempt.ManifoldDiagnostics.bCutterOrientationReversedForManifold);
+		Object->SetNumberField(TEXT("target_signed_volume_for_manifold"), Attempt.ManifoldDiagnostics.TargetSignedVolumeForManifold);
+		Object->SetNumberField(TEXT("cutter_signed_volume_for_manifold"), Attempt.ManifoldDiagnostics.CutterSignedVolumeForManifold);
+		Object->SetNumberField(TEXT("result_signed_volume_before_render_fix"), Attempt.ManifoldDiagnostics.ResultSignedVolumeBeforeRenderFix);
+		Object->SetBoolField(TEXT("cap_section_unavailable"), Attempt.ManifoldDiagnostics.bCapSectionUnavailable);
 		Object->SetNumberField(TEXT("volume_delta"), Attempt.VolumeDelta);
 		Object->SetNumberField(TEXT("min_required_volume_delta"), Attempt.MinRequiredVolumeDelta);
 		if (Attempt.bComputeSuccess && !Attempt.bEmptyResult)
@@ -3250,12 +3265,17 @@ namespace
 			OutNormals[*C] += TriNormal;
 		}
 
+		const bool bFlipNormalsForLighting = Step11SignedVolumeSign(AnalyzeStep11DynamicMesh(Mesh, TEXT("procedural_normal_check"), TEXT("procedural_normal_check")).SignedVolume) < 0;
 		for (FVector& Normal : OutNormals)
 		{
 			Normal = Normal.GetSafeNormal();
 			if (Normal.IsNearlyZero())
 			{
 				Normal = FVector::UpVector;
+			}
+			if (bFlipNormalsForLighting)
+			{
+				Normal *= -1.0;
 			}
 		}
 		return OutVertices.Num() >= 3 && OutTriangles.Num() >= 3;
@@ -3308,12 +3328,17 @@ namespace
 		const FVector& BWorld,
 		const FVector& CWorld,
 		const FVector& Origin,
-		const FColor& Color)
+		const FColor& Color,
+		bool bFlipNormalForLighting)
 	{
 		FVector Normal = FVector::CrossProduct(BWorld - AWorld, CWorld - AWorld).GetSafeNormal();
 		if (Normal.IsNearlyZero())
 		{
 			Normal = FVector::UpVector;
+		}
+		if (bFlipNormalForLighting)
+		{
+			Normal *= -1.0;
 		}
 		const FVector Tangent = Step11StableTangent(Normal);
 		const int32 BaseIndex = Section.Vertices.Num();
@@ -3351,6 +3376,7 @@ namespace
 			return false;
 		}
 
+		const bool bFlipNormalsForLighting = Step11SignedVolumeSign(AnalyzeStep11DynamicMesh(Mesh, TEXT("flat_procedural_normal_check"), TEXT("flat_procedural_normal_check")).SignedVolume) < 0;
 		for (int32 TriangleId : Mesh.TriangleIndicesItr())
 		{
 			const UE::Geometry::FIndex3i Tri = Mesh.GetTriangle(TriangleId);
@@ -3379,7 +3405,8 @@ namespace
 				B,
 				C,
 				Origin,
-				bFromCutter ? FColor(180, 180, 180, 255) : FColor::White);
+				bFromCutter ? FColor(180, 180, 180, 255) : FColor::White,
+				bFlipNormalsForLighting);
 		}
 
 		return OutSourceSection.HasGeometry() || OutCapSection.HasGeometry();
@@ -3397,48 +3424,53 @@ namespace
 		FStep11BooleanAttemptResult Attempt;
 		Attempt.PassName = PassName;
 		Attempt.MinRequiredVolumeDelta = FMath::Max(1.0, TargetBeforeDiagnostics.AbsVolume * 1e-4);
+		Attempt.ManifoldDiagnostics.TargetInputTriangles = CurrentMesh.TriangleCount();
+		Attempt.ManifoldDiagnostics.CutterInputTriangles = CutterMesh.TriangleCount();
 		if (TargetBeforeDiagnostics.AbsVolume <= 1e-6 || TargetRenderSign == 0)
 		{
 			Attempt.Status = TEXT("rejected");
 			Attempt.RejectReason = TEXT("target_zero_volume");
 			return Attempt;
 		}
+		if (TargetBeforeDiagnostics.TriangleCount <= 0 ||
+			TargetBeforeDiagnostics.BoundaryEdgeCount > 0 ||
+			TargetBeforeDiagnostics.NonManifoldEdgeCount > 0)
+		{
+			Attempt.Status = TEXT("rejected");
+			Attempt.RejectReason = TEXT("target_not_closed_manifold");
+			return Attempt;
+		}
+		const FStep11MeshDiagnostics CutterBeforeDiagnostics = AnalyzeStep11DynamicMesh(CutterMesh, TEXT("manifold_cutter_precheck"), TEXT("excavate_cutter"));
+		if (CutterBeforeDiagnostics.TriangleCount <= 0 ||
+			CutterBeforeDiagnostics.BoundaryEdgeCount > 0 ||
+			CutterBeforeDiagnostics.NonManifoldEdgeCount > 0)
+		{
+			Attempt.Status = TEXT("rejected");
+			Attempt.RejectReason = TEXT("cutter_not_closed_manifold");
+			return Attempt;
+		}
 
 		UE::Geometry::FDynamicMesh3 TargetWork = CurrentMesh;
-		UE::Geometry::FDynamicMesh3 CutterWork = CutterMesh;
-		const int32 WorkingTargetSign = bReverseTargetForPass ? -TargetRenderSign : TargetRenderSign;
 		if (bReverseTargetForPass)
 		{
 			TargetWork.ReverseOrientation(false);
 			Attempt.bTargetReversedForPass = true;
 		}
-		Attempt.bCutterReversedForPass = ReverseStep11MeshIfSignMismatch(CutterWork, WorkingTargetSign);
-
-		UE::Geometry::FMeshBoolean MeshBoolean(
-			&TargetWork,
-			&CutterWork,
-			&Attempt.ResultMesh,
-			UE::Geometry::FMeshBoolean::EBooleanOp::Difference);
-		MeshBoolean.SnapTolerance = Step11BooleanSnapToleranceCm;
-		MeshBoolean.DegenerateEdgeTolFactor = 2.0;
-		MeshBoolean.bCollapseDegenerateEdgesOnCut = true;
-		MeshBoolean.bPutResultInInputSpace = true;
-		MeshBoolean.bWeldSharedEdges = true;
-		MeshBoolean.bTrackAllNewEdges = true;
-		MeshBoolean.bSimplifyAlongNewEdges = true;
-		MeshBoolean.SimplificationAngleTolerance = 0.25;
-		MeshBoolean.TryToImproveTriQualityThreshold = 0.2;
-		MeshBoolean.bPreserveTriangleGroups = false;
-		MeshBoolean.bPreserveVertexUVs = false;
-		MeshBoolean.bPreserveOverlayUVs = false;
-		MeshBoolean.bPreserveVertexNormals = false;
-		MeshBoolean.TrackPerTriangleSourceMesh.Emplace();
-
-		Attempt.bComputeSuccess = MeshBoolean.Compute();
+		const int32 RenderSignForAttempt = bReverseTargetForPass ? -TargetRenderSign : TargetRenderSign;
+		Attempt.bComputeSuccess = FFromLZManifoldBoolean::Difference(
+			TargetWork,
+			CutterMesh,
+			RenderSignForAttempt,
+			Attempt.ResultMesh,
+			Attempt.ManifoldDiagnostics);
+		Attempt.bCutterReversedForPass = Attempt.ManifoldDiagnostics.bCutterOrientationReversedForManifold;
+		Attempt.bResultReversedToTargetSign = Attempt.ManifoldDiagnostics.bResultOrientationReversedToTargetSign;
 		if (!Attempt.bComputeSuccess)
 		{
 			Attempt.Status = TEXT("rejected");
-			Attempt.RejectReason = TEXT("compute_failed");
+			Attempt.RejectReason = Attempt.ManifoldDiagnostics.ManifoldErrorMessage.IsEmpty()
+				? TEXT("manifold_difference_failed")
+				: Attempt.ManifoldDiagnostics.ManifoldErrorMessage;
 			return Attempt;
 		}
 
@@ -3451,10 +3483,7 @@ namespace
 			return Attempt;
 		}
 
-		if (MeshBoolean.TrackPerTriangleSourceMesh.IsSet())
-		{
-			Attempt.TriangleSourceMeshById = MoveTemp(MeshBoolean.TrackPerTriangleSourceMesh.GetValue());
-		}
+		Attempt.TriangleSourceMeshById.Init(0, Attempt.ResultMesh.TriangleCount());
 
 		Attempt.ResultDiagnostics = AnalyzeStep11DynamicMesh(Attempt.ResultMesh, ResultLabel, TEXT("boolean_result"));
 		const int32 ResultSign = Step11SignedVolumeSign(Attempt.ResultDiagnostics.SignedVolume);
@@ -3462,6 +3491,7 @@ namespace
 		{
 			Attempt.ResultMesh.ReverseOrientation(false);
 			Attempt.bResultReversedToTargetSign = true;
+			Attempt.ManifoldDiagnostics.bResultOrientationReversedToTargetSign = true;
 			Attempt.ResultDiagnostics = AnalyzeStep11DynamicMesh(Attempt.ResultMesh, ResultLabel, TEXT("boolean_result"));
 		}
 
@@ -3534,6 +3564,8 @@ namespace
 			OperationJson->SetStringField(TEXT("target_source_type"), TargetSourceType);
 			OperationJson->SetStringField(TEXT("cutter_actor"), Cutters[CutterIndex]->ActorName);
 			OperationJson->SetNumberField(TEXT("cutter_index"), CutterIndex);
+			OperationJson->SetStringField(TEXT("boolean_backend"), FFromLZManifoldBoolean::BackendName());
+			OperationJson->SetStringField(TEXT("manifold_library_version"), FFromLZManifoldBoolean::LibraryVersion());
 			OperationJson->SetBoolField(TEXT("bounds_intersect"), bBoundsIntersect);
 			OperationJson->SetBoolField(TEXT("expanded_bounds_intersect"), bExpandedBoundsIntersect);
 			OperationJson->SetNumberField(TEXT("center_distance"), CenterDistance);
@@ -3541,7 +3573,6 @@ namespace
 			OperationJson->SetObjectField(TEXT("cutter_bounds"), Step11BoxJson(CutterBounds[CutterIndex]));
 			OperationJson->SetObjectField(TEXT("target_before"), Step11MeshDiagnosticsJson(TargetBeforeDiagnostics));
 			OperationJson->SetNumberField(TEXT("target_render_sign"), TargetRenderSign);
-			OperationJson->SetNumberField(TEXT("snap_tolerance_cm"), Step11BooleanSnapToleranceCm);
 			OperationJson->SetNumberField(TEXT("min_renderable_edge_cm"), Step11BooleanMinRenderableEdgeCm);
 			if (CutterDiagnostics.IsValidIndex(CutterIndex))
 			{
@@ -3719,6 +3750,15 @@ namespace
 			return nullptr;
 		}
 
+		UMaterialInterface* SourceMaterial = SourceComponent->GetMaterial(0);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("Step11Diag: boolean result component material source_actor=%s source_component=%s material_slot=0 material=%s."),
+			*GetNameSafe(SourceComponent->GetOwner()),
+			*GetNameSafe(SourceComponent),
+			*GetNameSafe(SourceMaterial));
+
 		const FName ComponentName = MakeUniqueObjectName(Owner, UProceduralMeshComponent::StaticClass(), TEXT("FromLZ_Step11BooleanMesh"));
 		UProceduralMeshComponent* ResultComponent = NewObject<UProceduralMeshComponent>(Owner, ComponentName);
 		if (!ResultComponent)
@@ -3739,7 +3779,7 @@ namespace
 		Colors.Init(FColor::White, Vertices.Num());
 		TArray<FProcMeshTangent> Tangents;
 		ResultComponent->CreateMeshSection(0, Vertices, Triangles, Normals, UV0, Colors, Tangents, SourceComponent->GetCollisionEnabled() != ECollisionEnabled::NoCollision);
-		ResultComponent->SetMaterial(0, SourceComponent->GetMaterial(0));
+		ResultComponent->SetMaterial(0, SourceMaterial);
 		ResultComponent->RegisterComponent();
 		ResultComponent->SetWorldTransform(FTransform::Identity);
 		return ResultComponent;
@@ -3768,6 +3808,17 @@ namespace
 		{
 			return nullptr;
 		}
+
+		UMaterialInterface* SourceMaterial = SourceComponent->GetMaterial(0);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("Step11Diag: boolean result actor material source_actor=%s source_component=%s material_slot=0 material=%s source_section=%d cap_section=%d."),
+			*GetNameSafe(SourceComponent->GetOwner()),
+			*GetNameSafe(SourceComponent),
+			*GetNameSafe(SourceMaterial),
+			SourceSection.HasGeometry() ? 1 : 0,
+			CapSection.HasGeometry() ? 1 : 0);
 
 		const FString BaseName = ObjSafeName(FString::Printf(TEXT("FromLZ_BooleanResult_%s_%s"), *SourceActorName, *SourceComponentName));
 		FActorSpawnParameters Params;
@@ -3812,7 +3863,7 @@ namespace
 				SourceSection.Colors,
 				SourceSection.Tangents,
 				SourceComponent->GetCollisionEnabled() != ECollisionEnabled::NoCollision);
-			MeshComponent->SetMaterial(0, SourceComponent->GetMaterial(0));
+			MeshComponent->SetMaterial(0, SourceMaterial);
 		}
 		if (CapSection.HasGeometry())
 		{
@@ -3826,7 +3877,7 @@ namespace
 				CapSection.Colors,
 				CapSection.Tangents,
 				SourceComponent->GetCollisionEnabled() != ECollisionEnabled::NoCollision);
-			MeshComponent->SetMaterial(SectionIndex, GetReconstructionVertexColorMaterial());
+			MeshComponent->SetMaterial(SectionIndex, SourceMaterial);
 		}
 
 		ResultActor->SetActorLocation(Origin, false, nullptr, ETeleportType::TeleportPhysics);
@@ -3984,8 +4035,9 @@ namespace
 		DiagnosticsRoot->SetNumberField(TEXT("diagnostic_version"), 2);
 		DiagnosticsRoot->SetStringField(TEXT("press_id"), PressId);
 		DiagnosticsRoot->SetStringField(TEXT("active_undo_press_id"), GActiveUndoPressId);
+		DiagnosticsRoot->SetStringField(TEXT("boolean_backend"), FFromLZManifoldBoolean::BackendName());
+		DiagnosticsRoot->SetStringField(TEXT("manifold_library_version"), FFromLZManifoldBoolean::LibraryVersion());
 		DiagnosticsRoot->SetNumberField(TEXT("excavation_cutter_normal_scale"), ExcavationCutterNormalScale);
-		DiagnosticsRoot->SetNumberField(TEXT("snap_tolerance_cm"), Step11BooleanSnapToleranceCm);
 		DiagnosticsRoot->SetNumberField(TEXT("min_renderable_edge_cm"), Step11BooleanMinRenderableEdgeCm);
 
 		TArray<TSharedPtr<FJsonValue>> InputMeshDiagnostics;
