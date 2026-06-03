@@ -1,10 +1,13 @@
 #include "FromLZCaptureUtils.h"
 
 #include "Camera/CameraComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Dom/JsonObject.h"
+#include "Dom/JsonValue.h"
 #include "Engine/Engine.h"
 #include "Engine/Scene.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -15,6 +18,7 @@
 #include "HAL/FileManager.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
+#include "Materials/MaterialInterface.h"
 #include "Math/Float16Color.h"
 #include "Misc/DateTime.h"
 #include "Misc/FileHelper.h"
@@ -23,6 +27,8 @@
 #include "RenderingThread.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "ProceduralMeshComponent.h"
+#include "StaticMeshResources.h"
 #include "TextureResource.h"
 #include "UnrealClient.h"
 #include "UObject/FieldIterator.h"
@@ -402,6 +408,398 @@ static void SaveNormalFaces(
 	UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: %d planar face(s) -> %s"), NumFaces, *FacesJsonPath);
 }
 
+namespace FromLZActorMaterialId
+{
+	struct FProjectedVertex
+	{
+		FVector2D Pixel = FVector2D::ZeroVector;
+		double Depth = 0.0;
+		bool bValid = false;
+	};
+
+	static FColor EncodeIdColor(int32 Id)
+	{
+		return FColor(
+			uint8((Id >> 16) & 0xff),
+			uint8((Id >> 8) & 0xff),
+			uint8(Id & 0xff),
+			255);
+	}
+
+	static TArray<TSharedPtr<FJsonValue>> JsonColorArray(const FColor& Color)
+	{
+		TArray<TSharedPtr<FJsonValue>> Values;
+		Values.Add(MakeShared<FJsonValueNumber>(Color.R));
+		Values.Add(MakeShared<FJsonValueNumber>(Color.G));
+		Values.Add(MakeShared<FJsonValueNumber>(Color.B));
+		return Values;
+	}
+
+	static bool ProjectWorldToCapturePixel(
+		const FVector& WorldPosition,
+		const FTransform& CameraTransform,
+		int32 W,
+		int32 H,
+		double CaptureOrthoWidth,
+		FProjectedVertex& Out)
+	{
+		Out = FProjectedVertex();
+		if (W <= 0 || H <= 0 || CaptureOrthoWidth <= 1e-6)
+		{
+			return false;
+		}
+
+		const FVector Loc = CameraTransform.GetLocation();
+		const FVector Fwd = CameraTransform.GetUnitAxis(EAxis::X);
+		const FVector Rgt = CameraTransform.GetUnitAxis(EAxis::Y);
+		const FVector Up = CameraTransform.GetUnitAxis(EAxis::Z);
+		const FVector Delta = WorldPosition - Loc;
+		const double Depth = FVector::DotProduct(Delta, Fwd);
+		if (!FMath::IsFinite(Depth) || Depth <= 0.0)
+		{
+			return false;
+		}
+
+		const double HalfW = CaptureOrthoWidth * 0.5;
+		const double HalfH = HalfW * (double(H) / double(W));
+		const double NdcX = FVector::DotProduct(Delta, Rgt) / HalfW;
+		const double NdcY = FVector::DotProduct(Delta, Up) / HalfH;
+		Out.Pixel.X = ((NdcX + 1.0) * 0.5 * double(W)) - 0.5;
+		Out.Pixel.Y = ((1.0 - NdcY) * 0.5 * double(H)) - 0.5;
+		Out.Depth = Depth;
+		Out.bValid = FMath::IsFinite(Out.Pixel.X) && FMath::IsFinite(Out.Pixel.Y);
+		return Out.bValid;
+	}
+
+	static bool Barycentric2D(
+		const FVector2D& P,
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C,
+		double& OutA,
+		double& OutB,
+		double& OutC)
+	{
+		const double Denom =
+			(double(B.Y) - double(C.Y)) * (double(A.X) - double(C.X)) +
+			(double(C.X) - double(B.X)) * (double(A.Y) - double(C.Y));
+		if (FMath::Abs(Denom) < 1e-8)
+		{
+			return false;
+		}
+
+		OutA = ((double(B.Y) - double(C.Y)) * (double(P.X) - double(C.X)) +
+			(double(C.X) - double(B.X)) * (double(P.Y) - double(C.Y))) / Denom;
+		OutB = ((double(C.Y) - double(A.Y)) * (double(P.X) - double(C.X)) +
+			(double(A.X) - double(C.X)) * (double(P.Y) - double(C.Y))) / Denom;
+		OutC = 1.0 - OutA - OutB;
+		return FMath::IsFinite(OutA) && FMath::IsFinite(OutB) && FMath::IsFinite(OutC);
+	}
+
+	static int32 FindOrAddEntry(
+		UPrimitiveComponent* Component,
+		int32 MaterialSlot,
+		TMap<FString, int32>& EntryIdByKey,
+		TArray<TSharedPtr<FJsonValue>>& Entries)
+	{
+		if (!Component || MaterialSlot < 0)
+		{
+			return 0;
+		}
+
+		const FString Key = FString::Printf(TEXT("%s|%d"), *Component->GetPathName(), MaterialSlot);
+		if (const int32* Existing = EntryIdByKey.Find(Key))
+		{
+			return *Existing;
+		}
+
+		const int32 Id = Entries.Num() + 1;
+		if (Id > 0x00ffffff)
+		{
+			return 0;
+		}
+
+		AActor* Owner = Component->GetOwner();
+		UMaterialInterface* Material = Component->GetMaterial(MaterialSlot);
+		const FColor Color = EncodeIdColor(Id);
+		TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+		Entry->SetNumberField(TEXT("id"), Id);
+		Entry->SetArrayField(TEXT("color_rgb"), JsonColorArray(Color));
+		Entry->SetStringField(TEXT("actor_name"), Owner ? Owner->GetName() : FString());
+		Entry->SetStringField(TEXT("actor_path"), Owner ? Owner->GetPathName() : FString());
+#if WITH_EDITOR
+		Entry->SetStringField(TEXT("actor_label"), Owner ? Owner->GetActorLabel() : FString());
+#endif
+		Entry->SetStringField(TEXT("component_name"), Component->GetName());
+		Entry->SetStringField(TEXT("component_path"), Component->GetPathName());
+		Entry->SetStringField(TEXT("component_type"), Component->GetClass() ? Component->GetClass()->GetName() : FString());
+		Entry->SetNumberField(TEXT("material_slot"), MaterialSlot);
+		Entry->SetStringField(TEXT("material_name"), GetNameSafe(Material));
+		Entry->SetStringField(TEXT("material_path"), Material ? Material->GetPathName() : FString());
+		Entries.Add(MakeShared<FJsonValueObject>(Entry));
+		EntryIdByKey.Add(Key, Id);
+		return Id;
+	}
+
+	static void RasterizeTriangle(
+		const FProjectedVertex& A,
+		const FProjectedVertex& B,
+		const FProjectedVertex& C,
+		int32 Id,
+		int32 W,
+		int32 H,
+		TArray<double>& ZBuffer,
+		TArray<FColor>& OutPixels)
+	{
+		if (!A.bValid || !B.bValid || !C.bValid || Id <= 0)
+		{
+			return;
+		}
+
+		const double MinX = FMath::Min3(A.Pixel.X, B.Pixel.X, C.Pixel.X);
+		const double MaxX = FMath::Max3(A.Pixel.X, B.Pixel.X, C.Pixel.X);
+		const double MinY = FMath::Min3(A.Pixel.Y, B.Pixel.Y, C.Pixel.Y);
+		const double MaxY = FMath::Max3(A.Pixel.Y, B.Pixel.Y, C.Pixel.Y);
+		int32 X0 = FMath::Clamp(FMath::FloorToInt(MinX), 0, W - 1);
+		int32 X1 = FMath::Clamp(FMath::CeilToInt(MaxX), 0, W - 1);
+		int32 Y0 = FMath::Clamp(FMath::FloorToInt(MinY), 0, H - 1);
+		int32 Y1 = FMath::Clamp(FMath::CeilToInt(MaxY), 0, H - 1);
+		if (X1 < X0 || Y1 < Y0)
+		{
+			return;
+		}
+
+		const FColor Color = EncodeIdColor(Id);
+		for (int32 Y = Y0; Y <= Y1; ++Y)
+		{
+			for (int32 X = X0; X <= X1; ++X)
+			{
+				double Wa = 0.0;
+				double Wb = 0.0;
+				double Wc = 0.0;
+				const FVector2D P(static_cast<double>(X), static_cast<double>(Y));
+				if (!Barycentric2D(P, A.Pixel, B.Pixel, C.Pixel, Wa, Wb, Wc))
+				{
+					continue;
+				}
+
+				constexpr double EdgeTolerance = -1e-4;
+				if (Wa < EdgeTolerance || Wb < EdgeTolerance || Wc < EdgeTolerance)
+				{
+					continue;
+				}
+
+				const double Depth = Wa * A.Depth + Wb * B.Depth + Wc * C.Depth;
+				const int32 PixelIndex = Y * W + X;
+				if (Depth > 0.0 && Depth < ZBuffer[PixelIndex])
+				{
+					ZBuffer[PixelIndex] = Depth;
+					OutPixels[PixelIndex] = Color;
+				}
+			}
+		}
+	}
+
+	static void RasterizeStaticMeshComponent(
+		UStaticMeshComponent* Component,
+		const FTransform& CameraTransform,
+		int32 W,
+		int32 H,
+		TMap<FString, int32>& EntryIdByKey,
+		TArray<TSharedPtr<FJsonValue>>& Entries,
+		TArray<double>& ZBuffer,
+		TArray<FColor>& OutPixels)
+	{
+		if (!Component || !Component->IsRegistered() || !Component->IsVisible())
+		{
+			return;
+		}
+
+		UStaticMesh* StaticMesh = Component->GetStaticMesh();
+		if (!StaticMesh || !StaticMesh->GetRenderData() || StaticMesh->GetRenderData()->LODResources.Num() == 0)
+		{
+			return;
+		}
+
+		const FStaticMeshLODResources& LOD = StaticMesh->GetRenderData()->LODResources[0];
+		const FPositionVertexBuffer& PositionBuffer = LOD.VertexBuffers.PositionVertexBuffer;
+		const FIndexArrayView Indices = LOD.IndexBuffer.GetArrayView();
+		const int32 NumVertices = PositionBuffer.GetNumVertices();
+		if (NumVertices <= 0 || Indices.Num() < 3)
+		{
+			return;
+		}
+
+		TArray<FProjectedVertex> Projected;
+		Projected.SetNum(NumVertices);
+		const FTransform& ComponentTransform = Component->GetComponentTransform();
+		for (int32 VertexIndex = 0; VertexIndex < NumVertices; ++VertexIndex)
+		{
+			const FVector3f Local = PositionBuffer.VertexPosition(VertexIndex);
+			const FVector World = ComponentTransform.TransformPosition(FVector(Local.X, Local.Y, Local.Z));
+			ProjectWorldToCapturePixel(World, CameraTransform, W, H, FromLZCaptureOrthoWidth, Projected[VertexIndex]);
+		}
+
+		for (const FStaticMeshSection& Section : LOD.Sections)
+		{
+			const int32 MaterialSlot = int32(Section.MaterialIndex);
+			const int32 Id = FindOrAddEntry(Component, MaterialSlot, EntryIdByKey, Entries);
+			for (uint32 TriIndex = 0; TriIndex < Section.NumTriangles; ++TriIndex)
+			{
+				const uint32 IndexBase = Section.FirstIndex + TriIndex * 3;
+				if (IndexBase + 2 >= uint32(Indices.Num()))
+				{
+					continue;
+				}
+				const int32 IA = int32(Indices[IndexBase]);
+				const int32 IB = int32(Indices[IndexBase + 1]);
+				const int32 IC = int32(Indices[IndexBase + 2]);
+				if (!Projected.IsValidIndex(IA) || !Projected.IsValidIndex(IB) || !Projected.IsValidIndex(IC))
+				{
+					continue;
+				}
+				RasterizeTriangle(Projected[IA], Projected[IB], Projected[IC], Id, W, H, ZBuffer, OutPixels);
+			}
+		}
+	}
+
+	static void RasterizeProceduralMeshComponent(
+		UProceduralMeshComponent* Component,
+		const FTransform& CameraTransform,
+		int32 W,
+		int32 H,
+		TMap<FString, int32>& EntryIdByKey,
+		TArray<TSharedPtr<FJsonValue>>& Entries,
+		TArray<double>& ZBuffer,
+		TArray<FColor>& OutPixels)
+	{
+		if (!Component || !Component->IsRegistered() || !Component->IsVisible())
+		{
+			return;
+		}
+
+		const FTransform& ComponentTransform = Component->GetComponentTransform();
+		for (int32 SectionIndex = 0; SectionIndex < Component->GetNumSections(); ++SectionIndex)
+		{
+			if (!Component->IsMeshSectionVisible(SectionIndex))
+			{
+				continue;
+			}
+
+			const FProcMeshSection* Section = Component->GetProcMeshSection(SectionIndex);
+			if (!Section || Section->ProcVertexBuffer.Num() < 3 || Section->ProcIndexBuffer.Num() < 3)
+			{
+				continue;
+			}
+
+			TArray<FProjectedVertex> Projected;
+			Projected.SetNum(Section->ProcVertexBuffer.Num());
+			for (int32 VertexIndex = 0; VertexIndex < Section->ProcVertexBuffer.Num(); ++VertexIndex)
+			{
+				const FVector World = ComponentTransform.TransformPosition(Section->ProcVertexBuffer[VertexIndex].Position);
+				ProjectWorldToCapturePixel(World, CameraTransform, W, H, FromLZCaptureOrthoWidth, Projected[VertexIndex]);
+			}
+
+			const int32 Id = FindOrAddEntry(Component, SectionIndex, EntryIdByKey, Entries);
+			for (int32 Index = 0; Index + 2 < Section->ProcIndexBuffer.Num(); Index += 3)
+			{
+				const int32 IA = Section->ProcIndexBuffer[Index];
+				const int32 IB = Section->ProcIndexBuffer[Index + 1];
+				const int32 IC = Section->ProcIndexBuffer[Index + 2];
+				if (!Projected.IsValidIndex(IA) || !Projected.IsValidIndex(IB) || !Projected.IsValidIndex(IC))
+				{
+					continue;
+				}
+				RasterizeTriangle(Projected[IA], Projected[IB], Projected[IC], Id, W, H, ZBuffer, OutPixels);
+			}
+		}
+	}
+
+	static bool SaveActorMaterialIdBuffer(
+		UWorld* World,
+		const UCameraComponent* Camera,
+		int32 W,
+		int32 H,
+		const FString& PngPath,
+		const FString& JsonPath)
+	{
+		if (!World || !Camera || W <= 0 || H <= 0)
+		{
+			return false;
+		}
+
+		TArray<FColor> Pixels;
+		Pixels.Init(FColor(0, 0, 0, 0), W * H);
+		TArray<double> ZBuffer;
+		ZBuffer.Init(TNumericLimits<double>::Max(), W * H);
+		TMap<FString, int32> EntryIdByKey;
+		TArray<TSharedPtr<FJsonValue>> Entries;
+		const FTransform CameraTransform = Camera->GetComponentTransform();
+
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* Actor = *It;
+			if (!Actor || Actor->IsHidden())
+			{
+				continue;
+			}
+
+			TArray<UStaticMeshComponent*> StaticComponents;
+			Actor->GetComponents<UStaticMeshComponent>(StaticComponents);
+			for (UStaticMeshComponent* Component : StaticComponents)
+			{
+				RasterizeStaticMeshComponent(Component, CameraTransform, W, H, EntryIdByKey, Entries, ZBuffer, Pixels);
+			}
+
+			TArray<UProceduralMeshComponent*> ProceduralComponents;
+			Actor->GetComponents<UProceduralMeshComponent>(ProceduralComponents);
+			for (UProceduralMeshComponent* Component : ProceduralComponents)
+			{
+				RasterizeProceduralMeshComponent(Component, CameraTransform, W, H, EntryIdByKey, Entries, ZBuffer, Pixels);
+			}
+		}
+
+		IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+		TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
+		if (!IW.IsValid())
+		{
+			return false;
+		}
+		IW->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), W, H, ERGBFormat::BGRA, 8);
+		const TArray64<uint8>& Compressed = IW->GetCompressed();
+		const bool bSavedPng = FFileHelper::SaveArrayToFile(
+			TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())),
+			*PngPath);
+
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetNumberField(TEXT("version"), 1);
+		TSharedRef<FJsonObject> ImageObject = MakeShared<FJsonObject>();
+		ImageObject->SetNumberField(TEXT("w"), W);
+		ImageObject->SetNumberField(TEXT("h"), H);
+		Root->SetObjectField(TEXT("image"), ImageObject);
+		Root->SetStringField(TEXT("encoding"), TEXT("rgb24_id_background_zero"));
+		Root->SetStringField(TEXT("projection_mode"), TEXT("Orthographic"));
+		Root->SetNumberField(TEXT("ortho_width"), FromLZCaptureOrthoWidth);
+		Root->SetArrayField(TEXT("entries"), Entries);
+
+		FString JsonText;
+		const TSharedRef<TJsonWriter<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>> Writer =
+			TJsonWriterFactory<TCHAR, TPrettyJsonPrintPolicy<TCHAR>>::Create(&JsonText);
+		const bool bSerialized = FJsonSerializer::Serialize(Root, Writer);
+		const bool bSavedJson = bSerialized && FFileHelper::SaveStringToFile(JsonText, *JsonPath, FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+
+		if (bSavedPng && bSavedJson)
+		{
+			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: actor/material id buffer entries=%d -> %s"), Entries.Num(), *JsonPath);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save actor/material id buffer png=%d json=%d (%s / %s)."), bSavedPng ? 1 : 0, bSavedJson ? 1 : 0, *PngPath, *JsonPath);
+		}
+		return bSavedPng && bSavedJson;
+	}
+}
+
 // Renders scene depth and world-normal to off-screen render targets on the GPU,
 // then runs a CPU Sobel edge-detection pass to produce a white background with
 // black contour/crease lines (depth discontinuity = silhouette/occlusion edges,
@@ -629,6 +1027,13 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 				FaceDepth, FaceNormal, Size.X, Size.Y, Camera,
 				/*bCaptureOrthographic*/ true, FromLZCaptureOrthoWidth,
 				FacesBase + TEXT("_faces.png"), FacesBase + TEXT("_faces.json"));
+			FromLZActorMaterialId::SaveActorMaterialIdBuffer(
+				World,
+				Camera,
+				Size.X,
+				Size.Y,
+				FacesBase + TEXT("_actor_material_id.png"),
+				FacesBase + TEXT("_actor_material_id.json"));
 		}
 		else
 		{
@@ -668,11 +1073,15 @@ bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
 	const FString BaseFilename = FString::Printf(TEXT("FromLZ_%s"), *Timestamp);
 	const FString JsonPath = CaptureDirectory / (BaseFilename + TEXT(".json"));
 	const FString PngPath = CaptureDirectory / (BaseFilename + TEXT(".png"));
+	const FString ActorMaterialPngPath = CaptureDirectory / (BaseFilename + TEXT("_actor_material_id.png"));
+	const FString ActorMaterialJsonPath = CaptureDirectory / (BaseFilename + TEXT("_actor_material_id.json"));
 
 	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
 	RootObject->SetStringField(TEXT("capture_timestamp"), Timestamp);
 	RootObject->SetStringField(TEXT("json_path"), JsonPath);
 	RootObject->SetStringField(TEXT("png_path"), PngPath);
+	RootObject->SetStringField(TEXT("actor_material_png_path"), ActorMaterialPngPath);
+	RootObject->SetStringField(TEXT("actor_material_json_path"), ActorMaterialJsonPath);
 	RootObject->SetObjectField(TEXT("pawn"), SerializeObjectProperties(Pawn));
 	RootObject->SetObjectField(TEXT("pawn_transform"), SerializeTransform(Pawn->GetActorTransform()));
 	RootObject->SetObjectField(TEXT("camera_component"), SerializeObjectProperties(CameraComponent));

@@ -2839,7 +2839,7 @@ namespace FromLZImageOps
 		return bIn;
 	}
 
-	static constexpr double InteriorGreenMinInsideLengthPx = 50.0;
+	static constexpr double InteriorGreenMinInsideLengthPx = 10.0;
 
 	struct FInteriorGreenStats
 	{

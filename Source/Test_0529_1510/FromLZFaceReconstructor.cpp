@@ -59,6 +59,30 @@ namespace
 		TArray<FVector> KeyPoints3D;
 	};
 
+	struct FActorMaterialIdEntry
+	{
+		uint32 ColorKey = 0;
+		FString ActorName;
+		FString ActorPath;
+		FString ComponentName;
+		FString ComponentPath;
+		FString ComponentType;
+		int32 MaterialSlot = -1;
+		FString MaterialName;
+		FString MaterialPath;
+	};
+
+	struct FAttachMaterialIdSelection
+	{
+		bool bLookupAttempted = false;
+		bool bFound = false;
+		FString Error;
+		FActorMaterialIdEntry Entry;
+		int32 PixelCount = 0;
+		int32 ConsideredPixelCount = 0;
+		double Coverage = 0.0;
+	};
+
 	struct FCameraInfo
 	{
 		FVector Location = FVector::ZeroVector;
@@ -102,6 +126,12 @@ namespace
 		FColor Color = ReconstructedDebugBlue;
 		bool bIsExcavateCutter = false;
 		FString PressId;
+		int32 SourceFaceId = -1;
+		FVector SourcePlanePoint = FVector::ZeroVector;
+		FVector SourcePlaneNormal = FVector::UpVector;
+		TArray<FVector> SourceFaceVerticesWorld;
+		TArray<FVector> SourceMaterialProbePointsWorld;
+		FAttachMaterialIdSelection AttachMaterialId;
 	};
 
 	struct FSolidDepthSample
@@ -136,6 +166,9 @@ namespace
 		int32 SelectedFaceId = -1;
 		FVector SourcePlanePoint = FVector::ZeroVector;
 		FVector SourcePlaneNormal = FVector::UpVector;
+		TArray<FVector> SourceFaceVerticesWorld;
+		TArray<FVector> SourceMaterialProbePointsWorld;
+		FAttachMaterialIdSelection AttachMaterialId;
 		FVector OrientedNormal = FVector::UpVector;
 		FVector2D SourceToCopiedVector2D = FVector2D::ZeroVector;
 		FVector2D ProjectedNormal2D = FVector2D::ZeroVector;
@@ -189,9 +222,13 @@ namespace
 		FString CaptureJsonRel;
 		FString FacesPngRel;
 		FString FacesJsonRel;
+		FString ActorMaterialPngRel;
+		FString ActorMaterialJsonRel;
 		FString CaptureJsonPath;
 		FString FacesPngPath;
 		FString FacesJsonPath;
+		FString ActorMaterialPngPath;
+		FString ActorMaterialJsonPath;
 		FCameraInfo Camera;
 		TArray<FFaceInfo> Faces;
 		TMap<int32, int32> FaceIndexById;
@@ -199,6 +236,10 @@ namespace
 		TArray<uint8> FacesRGBA;
 		int32 FacesWidth = 0;
 		int32 FacesHeight = 0;
+		TArray<uint8> ActorMaterialRGBA;
+		int32 ActorMaterialWidth = 0;
+		int32 ActorMaterialHeight = 0;
+		TMap<uint32, FActorMaterialIdEntry> ActorMaterialEntryByColorKey;
 	};
 
 	struct FStep11MeshDiagnostics
@@ -256,13 +297,33 @@ namespace
 		return Stem;
 	}
 
+	static FString StripTrailingCaptureAuxSuffixes(FString Stem)
+	{
+		bool bChanged = true;
+		while (bChanged)
+		{
+			bChanged = false;
+			if (Stem.EndsWith(TEXT("_faces")))
+			{
+				Stem.LeftChopInline(6);
+				bChanged = true;
+			}
+			if (Stem.EndsWith(TEXT("_actor_material_id")))
+			{
+				Stem.LeftChopInline(18);
+				bChanged = true;
+			}
+		}
+		return Stem;
+	}
+
 	static FString BuildCaptureRelPath(const FString& CaptureStem, const FString& Extension)
 	{
 		if (CaptureStem.IsEmpty())
 		{
 			return FString();
 		}
-		return TEXT("FromLZCaptures/") + StripTrailingFacesSuffixes(CaptureStem) + Extension;
+		return TEXT("FromLZCaptures/") + StripTrailingCaptureAuxSuffixes(CaptureStem) + Extension;
 	}
 
 	static FString BuildFacesRelPath(const FString& CaptureStem, const FString& Extension)
@@ -271,7 +332,16 @@ namespace
 		{
 			return FString();
 		}
-		return TEXT("FromLZCaptures/") + StripTrailingFacesSuffixes(CaptureStem) + TEXT("_faces") + Extension;
+		return TEXT("FromLZCaptures/") + StripTrailingCaptureAuxSuffixes(CaptureStem) + TEXT("_faces") + Extension;
+	}
+
+	static FString BuildActorMaterialRelPath(const FString& CaptureStem, const FString& Extension)
+	{
+		if (CaptureStem.IsEmpty())
+		{
+			return FString();
+		}
+		return TEXT("FromLZCaptures/") + StripTrailingCaptureAuxSuffixes(CaptureStem) + TEXT("_actor_material_id") + Extension;
 	}
 
 	static void NormalizeFacesRelPath(FString& RelPath, const FString& Extension)
@@ -282,8 +352,21 @@ namespace
 		}
 
 		const FString Dir = FPaths::GetPath(RelPath);
-		const FString Stem = StripTrailingFacesSuffixes(FPaths::GetBaseFilename(RelPath));
+		const FString Stem = StripTrailingCaptureAuxSuffixes(FPaths::GetBaseFilename(RelPath));
 		const FString Filename = Stem + TEXT("_faces") + Extension;
+		RelPath = Dir.IsEmpty() ? Filename : Dir / Filename;
+	}
+
+	static void NormalizeActorMaterialRelPath(FString& RelPath, const FString& Extension)
+	{
+		if (RelPath.IsEmpty())
+		{
+			return;
+		}
+
+		const FString Dir = FPaths::GetPath(RelPath);
+		const FString Stem = StripTrailingCaptureAuxSuffixes(FPaths::GetBaseFilename(RelPath));
+		const FString Filename = Stem + TEXT("_actor_material_id") + Extension;
 		RelPath = Dir.IsEmpty() ? Filename : Dir / Filename;
 	}
 
@@ -295,7 +378,7 @@ namespace
 		}
 
 		const FString Dir = FPaths::GetPath(RelPath);
-		const FString Stem = StripTrailingFacesSuffixes(FPaths::GetBaseFilename(RelPath));
+		const FString Stem = StripTrailingCaptureAuxSuffixes(FPaths::GetBaseFilename(RelPath));
 		const FString Filename = Stem + Extension;
 		RelPath = Dir.IsEmpty() ? Filename : Dir / Filename;
 	}
@@ -539,6 +622,57 @@ namespace
 		return OutFaces.Num() > 0;
 	}
 
+	static bool LoadActorMaterialIdJson(const FString& Path, TMap<uint32, FActorMaterialIdEntry>& OutEntriesByColorKey)
+	{
+		OutEntriesByColorKey.Reset();
+
+		TSharedPtr<FJsonObject> Root;
+		if (!LoadJsonObject(Path, Root))
+		{
+			return false;
+		}
+
+		const TArray<TSharedPtr<FJsonValue>>* EntriesArray = nullptr;
+		if (!Root->TryGetArrayField(TEXT("entries"), EntriesArray))
+		{
+			return false;
+		}
+
+		for (const TSharedPtr<FJsonValue>& EntryValue : *EntriesArray)
+		{
+			const TSharedPtr<FJsonObject> EntryObject = EntryValue.IsValid() ? EntryValue->AsObject() : nullptr;
+			if (!EntryObject.IsValid())
+			{
+				continue;
+			}
+
+			FActorMaterialIdEntry Entry;
+			FColor Color = FColor::Black;
+			if (!ParseColorField(EntryObject, Color))
+			{
+				continue;
+			}
+
+			Entry.ColorKey = ColorKey(Color.R, Color.G, Color.B);
+			EntryObject->TryGetStringField(TEXT("actor_name"), Entry.ActorName);
+			EntryObject->TryGetStringField(TEXT("actor_path"), Entry.ActorPath);
+			EntryObject->TryGetStringField(TEXT("component_name"), Entry.ComponentName);
+			EntryObject->TryGetStringField(TEXT("component_path"), Entry.ComponentPath);
+			EntryObject->TryGetStringField(TEXT("component_type"), Entry.ComponentType);
+			EntryObject->TryGetStringField(TEXT("material_name"), Entry.MaterialName);
+			EntryObject->TryGetStringField(TEXT("material_path"), Entry.MaterialPath);
+			double MaterialSlotNumber = -1.0;
+			EntryObject->TryGetNumberField(TEXT("material_slot"), MaterialSlotNumber);
+			Entry.MaterialSlot = FMath::RoundToInt(MaterialSlotNumber);
+			if (Entry.ColorKey != 0 && Entry.MaterialSlot >= 0)
+			{
+				OutEntriesByColorKey.Add(Entry.ColorKey, Entry);
+			}
+		}
+
+		return OutEntriesByColorKey.Num() > 0;
+	}
+
 	static bool LoadCameraJson(const FString& Path, FCameraInfo& OutCamera)
 	{
 		TSharedPtr<FJsonObject> Root;
@@ -594,10 +728,12 @@ namespace
 
 		FString CaptureStem;
 		Root->TryGetStringField(TEXT("capture_stem"), CaptureStem);
-		CaptureStem = StripTrailingFacesSuffixes(CaptureStem);
+		CaptureStem = StripTrailingCaptureAuxSuffixes(CaptureStem);
 		Root->TryGetStringField(TEXT("capture_json"), OutInputs.CaptureJsonRel);
 		Root->TryGetStringField(TEXT("faces_png"), OutInputs.FacesPngRel);
 		Root->TryGetStringField(TEXT("faces_json"), OutInputs.FacesJsonRel);
+		Root->TryGetStringField(TEXT("actor_material_png"), OutInputs.ActorMaterialPngRel);
+		Root->TryGetStringField(TEXT("actor_material_json"), OutInputs.ActorMaterialJsonRel);
 
 		if (OutInputs.CaptureJsonRel.IsEmpty() && !CaptureStem.IsEmpty())
 		{
@@ -611,13 +747,25 @@ namespace
 		{
 			OutInputs.FacesJsonRel = BuildFacesRelPath(CaptureStem, TEXT(".json"));
 		}
+		if (OutInputs.ActorMaterialPngRel.IsEmpty() && !CaptureStem.IsEmpty())
+		{
+			OutInputs.ActorMaterialPngRel = BuildActorMaterialRelPath(CaptureStem, TEXT(".png"));
+		}
+		if (OutInputs.ActorMaterialJsonRel.IsEmpty() && !CaptureStem.IsEmpty())
+		{
+			OutInputs.ActorMaterialJsonRel = BuildActorMaterialRelPath(CaptureStem, TEXT(".json"));
+		}
 		NormalizeCaptureRelPath(OutInputs.CaptureJsonRel, TEXT(".json"));
 		NormalizeFacesRelPath(OutInputs.FacesPngRel, TEXT(".png"));
 		NormalizeFacesRelPath(OutInputs.FacesJsonRel, TEXT(".json"));
+		NormalizeActorMaterialRelPath(OutInputs.ActorMaterialPngRel, TEXT(".png"));
+		NormalizeActorMaterialRelPath(OutInputs.ActorMaterialJsonRel, TEXT(".json"));
 
 		OutInputs.CaptureJsonPath = ResolveSavedPath(OutInputs.CaptureJsonRel);
 		OutInputs.FacesPngPath = ResolveSavedPath(OutInputs.FacesPngRel);
 		OutInputs.FacesJsonPath = ResolveSavedPath(OutInputs.FacesJsonRel);
+		OutInputs.ActorMaterialPngPath = ResolveSavedPath(OutInputs.ActorMaterialPngRel);
+		OutInputs.ActorMaterialJsonPath = ResolveSavedPath(OutInputs.ActorMaterialJsonRel);
 		return !OutInputs.CaptureJsonPath.IsEmpty() && !OutInputs.FacesPngPath.IsEmpty() && !OutInputs.FacesJsonPath.IsEmpty();
 	}
 
@@ -701,6 +849,141 @@ namespace
 				}
 			}
 		}
+	}
+
+	static bool HasActorMaterialIdBuffer(const FCommonInputs& Inputs)
+	{
+		return Inputs.ActorMaterialWidth > 0 &&
+			Inputs.ActorMaterialHeight > 0 &&
+			Inputs.ActorMaterialRGBA.Num() >= Inputs.ActorMaterialWidth * Inputs.ActorMaterialHeight * 4 &&
+			Inputs.ActorMaterialEntryByColorKey.Num() > 0;
+	}
+
+	static bool SelectAttachMaterialFromIdBuffer(
+		const FCommonInputs& Inputs,
+		const FSolidReconstructionResult& Solid,
+		FAttachMaterialIdSelection& OutSelection)
+	{
+		OutSelection = FAttachMaterialIdSelection();
+		OutSelection.bLookupAttempted = HasActorMaterialIdBuffer(Inputs);
+		if (!OutSelection.bLookupAttempted)
+		{
+			OutSelection.Error = TEXT("actor/material id buffer is unavailable");
+			return false;
+		}
+		if (!Solid.Action.Equals(TEXT("attach"), ESearchCase::IgnoreCase))
+		{
+			OutSelection.Error = TEXT("solid is not an attach mesh");
+			return false;
+		}
+		if (Solid.SourceLoop2D.Num() < 3)
+		{
+			OutSelection.Error = TEXT("attach source loop has fewer than three points");
+			return false;
+		}
+
+		TArray<FVector2D> IdSpaceLoop;
+		IdSpaceLoop.Reserve(Solid.SourceLoop2D.Num());
+		const double ScaleX = Inputs.FacesWidth > 0 ? double(Inputs.ActorMaterialWidth) / double(Inputs.FacesWidth) : 1.0;
+		const double ScaleY = Inputs.FacesHeight > 0 ? double(Inputs.ActorMaterialHeight) / double(Inputs.FacesHeight) : 1.0;
+		for (const FVector2D& P : Solid.SourceLoop2D)
+		{
+			IdSpaceLoop.Emplace(P.X * ScaleX, P.Y * ScaleY);
+		}
+
+		TArray<uint8> Mask;
+		int32 MaskPixels = 0;
+		RasterizePolygonMask(IdSpaceLoop, Inputs.ActorMaterialWidth, Inputs.ActorMaterialHeight, Mask, MaskPixels);
+		if (MaskPixels <= 0)
+		{
+			OutSelection.Error = TEXT("attach source loop rasterized to an empty actor/material id mask");
+			return false;
+		}
+
+		auto Accumulate = [&](bool bRequireSelectedFace, TMap<uint32, int32>& Counts, int32& ConsideredPixels)
+		{
+			Counts.Reset();
+			ConsideredPixels = 0;
+			for (int32 y = 0; y < Inputs.ActorMaterialHeight; ++y)
+			{
+				for (int32 x = 0; x < Inputs.ActorMaterialWidth; ++x)
+				{
+					const int32 PixelIndex = y * Inputs.ActorMaterialWidth + x;
+					if (Mask[PixelIndex] == 0)
+					{
+						continue;
+					}
+
+					if (bRequireSelectedFace &&
+						Inputs.FacesWidth > 0 &&
+						Inputs.FacesHeight > 0 &&
+						Inputs.FacesRGBA.Num() >= Inputs.FacesWidth * Inputs.FacesHeight * 4 &&
+						Solid.SelectedFaceId >= 0)
+					{
+						const int32 FaceX = FMath::Clamp(FMath::FloorToInt((double(x) + 0.5) * double(Inputs.FacesWidth) / double(Inputs.ActorMaterialWidth)), 0, Inputs.FacesWidth - 1);
+						const int32 FaceY = FMath::Clamp(FMath::FloorToInt((double(y) + 0.5) * double(Inputs.FacesHeight) / double(Inputs.ActorMaterialHeight)), 0, Inputs.FacesHeight - 1);
+						const int32 FaceOff = (FaceY * Inputs.FacesWidth + FaceX) * 4;
+						const uint32 FaceKey = ColorKey(Inputs.FacesRGBA[FaceOff + 0], Inputs.FacesRGBA[FaceOff + 1], Inputs.FacesRGBA[FaceOff + 2]);
+						const int32* FaceId = Inputs.FaceIdByColorKey.Find(FaceKey);
+						if (!FaceId || *FaceId != Solid.SelectedFaceId)
+						{
+							continue;
+						}
+					}
+
+					const int32 Off = PixelIndex * 4;
+					if (Inputs.ActorMaterialRGBA[Off + 3] == 0)
+					{
+						continue;
+					}
+
+					const uint32 Key = ColorKey(
+						Inputs.ActorMaterialRGBA[Off + 0],
+						Inputs.ActorMaterialRGBA[Off + 1],
+						Inputs.ActorMaterialRGBA[Off + 2]);
+					if (Key == 0 || !Inputs.ActorMaterialEntryByColorKey.Contains(Key))
+					{
+						continue;
+					}
+
+					++ConsideredPixels;
+					Counts.FindOrAdd(Key) += 1;
+				}
+			}
+		};
+
+		TMap<uint32, int32> Counts;
+		int32 ConsideredPixels = 0;
+		Accumulate(/*bRequireSelectedFace*/ true, Counts, ConsideredPixels);
+		if (Counts.Num() == 0)
+		{
+			Accumulate(/*bRequireSelectedFace*/ false, Counts, ConsideredPixels);
+		}
+
+		uint32 BestKey = 0;
+		int32 BestCount = 0;
+		for (const TPair<uint32, int32>& Pair : Counts)
+		{
+			if (Pair.Value > BestCount)
+			{
+				BestKey = Pair.Key;
+				BestCount = Pair.Value;
+			}
+		}
+
+		const FActorMaterialIdEntry* Entry = Inputs.ActorMaterialEntryByColorKey.Find(BestKey);
+		if (!Entry || BestCount <= 0)
+		{
+			OutSelection.Error = FString::Printf(TEXT("no actor/material id won the attach source mask vote (mask_pixels=%d considered=%d)"), MaskPixels, ConsideredPixels);
+			return false;
+		}
+
+		OutSelection.bFound = true;
+		OutSelection.Entry = *Entry;
+		OutSelection.PixelCount = BestCount;
+		OutSelection.ConsideredPixelCount = ConsideredPixels;
+		OutSelection.Coverage = double(BestCount) / double(FMath::Max(1, ConsideredPixels));
+		return true;
 	}
 
 	static bool SaveMaskPng(const TArray<uint8>& Mask, int32 Width, int32 Height, const FString& Path)
@@ -1583,6 +1866,23 @@ namespace
 		Root->SetNumberField(TEXT("faces_width"), Result.FacesWidth);
 		Root->SetNumberField(TEXT("faces_height"), Result.FacesHeight);
 		Root->SetNumberField(TEXT("selected_source_face_id"), Result.SelectedFaceId);
+		Root->SetBoolField(TEXT("attach_material_id_lookup_attempted"), Result.AttachMaterialId.bLookupAttempted);
+		Root->SetBoolField(TEXT("attach_material_id_found"), Result.AttachMaterialId.bFound);
+		Root->SetStringField(TEXT("attach_material_id_error"), Result.AttachMaterialId.Error);
+		if (Result.AttachMaterialId.bFound)
+		{
+			Root->SetNumberField(TEXT("attach_material_id_color_key"), double(Result.AttachMaterialId.Entry.ColorKey));
+			Root->SetStringField(TEXT("attach_material_actor_name"), Result.AttachMaterialId.Entry.ActorName);
+			Root->SetStringField(TEXT("attach_material_actor_path"), Result.AttachMaterialId.Entry.ActorPath);
+			Root->SetStringField(TEXT("attach_material_component_name"), Result.AttachMaterialId.Entry.ComponentName);
+			Root->SetStringField(TEXT("attach_material_component_path"), Result.AttachMaterialId.Entry.ComponentPath);
+			Root->SetNumberField(TEXT("attach_material_slot"), Result.AttachMaterialId.Entry.MaterialSlot);
+			Root->SetStringField(TEXT("attach_material_name"), Result.AttachMaterialId.Entry.MaterialName);
+			Root->SetStringField(TEXT("attach_material_path"), Result.AttachMaterialId.Entry.MaterialPath);
+			Root->SetNumberField(TEXT("attach_material_vote_pixels"), Result.AttachMaterialId.PixelCount);
+			Root->SetNumberField(TEXT("attach_material_considered_pixels"), Result.AttachMaterialId.ConsideredPixelCount);
+			Root->SetNumberField(TEXT("attach_material_vote_coverage"), Result.AttachMaterialId.Coverage);
+		}
 		Root->SetArrayField(TEXT("source_plane_point"), JsonVector(Result.SourcePlanePoint)->AsArray());
 		Root->SetArrayField(TEXT("source_plane_normal"), JsonVector(Result.SourcePlaneNormal)->AsArray());
 		Root->SetArrayField(TEXT("oriented_normal_source_to_copied"), JsonVector(Result.OrientedNormal)->AsArray());
@@ -1904,6 +2204,7 @@ namespace
 		Result.SelectedFaceId = SelectedFace.Id;
 		Result.SourcePlanePoint = SelectedFace.PlanePoint;
 		Result.SourcePlaneNormal = SelectedFace.Normal.GetSafeNormal();
+		Result.SourceFaceVerticesWorld = SelectedFace.KeyPoints3D;
 		Result.OrientedNormal = Result.SourcePlaneNormal;
 
 		if (SourcePolygonCapSpace.Num() != CopiedPolygonCapSpace.Num())
@@ -1955,6 +2256,8 @@ namespace
 			}
 			Result.SourceLoopWorld.Add(Hit);
 		}
+		Result.SourceMaterialProbePointsWorld = Result.SourceLoopWorld;
+		Result.SourceMaterialProbePointsWorld.Add(AverageVector(Result.SourceLoopWorld));
 
 		const FVector SourceAnchor = AverageVector(Result.SourceLoopWorld);
 		const double ProbeLength = FMath::Clamp(FaceWorldExtent(SelectedFace) * 0.25, 10.0, 250.0);
@@ -2480,6 +2783,10 @@ namespace
 			*SolidCopiedPoly,
 			SelectedFace,
 			Inputs);
+		if (Result.Solid.bSuccess && Result.Action.Equals(TEXT("attach"), ESearchCase::IgnoreCase) && HasActorMaterialIdBuffer(Inputs))
+		{
+			SelectAttachMaterialFromIdBuffer(Inputs, Result.Solid, Result.Solid.AttachMaterialId);
+		}
 		SaveSolidResultJson(Result.Solid, SolidJson);
 		SaveSolidProjectionCheckPng(
 			Result.Solid, Inputs.FacesRGBA, Inputs.FacesWidth, Inputs.FacesHeight,
@@ -3028,10 +3335,10 @@ namespace
 		return FString::Printf(TEXT("%lld_%lld_%lld"), X, Y, Z);
 	}
 
-	static bool BuildDynamicMeshFromStaticMeshComponent(UStaticMeshComponent* Component, UE::Geometry::FDynamicMesh3& OutMesh)
+	static bool BuildDynamicMeshFromStaticMeshComponent(UStaticMeshComponent* Component, UE::Geometry::FDynamicMesh3& OutMesh, bool bRequireVisible = true)
 	{
 		OutMesh = UE::Geometry::FDynamicMesh3();
-		if (!Component || !Component->IsRegistered() || !Component->IsVisible())
+		if (!Component || !Component->IsRegistered() || (bRequireVisible && !Component->IsVisible()))
 		{
 			return false;
 		}
@@ -3146,10 +3453,10 @@ namespace
 		return AddedTriangles > 0;
 	}
 
-	static bool BuildDynamicMeshFromProceduralMeshComponent(UProceduralMeshComponent* Component, UE::Geometry::FDynamicMesh3& OutMesh)
+	static bool BuildDynamicMeshFromProceduralMeshComponent(UProceduralMeshComponent* Component, UE::Geometry::FDynamicMesh3& OutMesh, bool bRequireVisible = true)
 	{
 		OutMesh = UE::Geometry::FDynamicMesh3();
-		if (!Component || !Component->IsRegistered() || !Component->IsVisible())
+		if (!Component || !Component->IsRegistered() || (bRequireVisible && !Component->IsVisible()))
 		{
 			return false;
 		}
@@ -3159,7 +3466,7 @@ namespace
 		int32 AddedTriangles = 0;
 		for (int32 SectionIndex = 0; SectionIndex < Component->GetNumSections(); ++SectionIndex)
 		{
-			if (!Component->IsMeshSectionVisible(SectionIndex))
+			if (bRequireVisible && !Component->IsMeshSectionVisible(SectionIndex))
 			{
 				continue;
 			}
@@ -3214,6 +3521,436 @@ namespace
 		}
 
 		return AddedTriangles > 0;
+	}
+
+	static double PointTriangleDistanceSquared(const FVector& P, const FVector& A, const FVector& B, const FVector& C)
+	{
+		const FVector AB = B - A;
+		const FVector AC = C - A;
+		const FVector AP = P - A;
+		const double D1 = FVector::DotProduct(AB, AP);
+		const double D2 = FVector::DotProduct(AC, AP);
+		if (D1 <= 0.0 && D2 <= 0.0)
+		{
+			return FVector::DistSquared(P, A);
+		}
+
+		const FVector BP = P - B;
+		const double D3 = FVector::DotProduct(AB, BP);
+		const double D4 = FVector::DotProduct(AC, BP);
+		if (D3 >= 0.0 && D4 <= D3)
+		{
+			return FVector::DistSquared(P, B);
+		}
+
+		const double VC = D1 * D4 - D3 * D2;
+		if (VC <= 0.0 && D1 >= 0.0 && D3 <= 0.0)
+		{
+			const double V = D1 / (D1 - D3);
+			return FVector::DistSquared(P, A + AB * V);
+		}
+
+		const FVector CP = P - C;
+		const double D5 = FVector::DotProduct(AB, CP);
+		const double D6 = FVector::DotProduct(AC, CP);
+		if (D6 >= 0.0 && D5 <= D6)
+		{
+			return FVector::DistSquared(P, C);
+		}
+
+		const double VB = D5 * D2 - D1 * D6;
+		if (VB <= 0.0 && D2 >= 0.0 && D6 <= 0.0)
+		{
+			const double W = D2 / (D2 - D6);
+			return FVector::DistSquared(P, A + AC * W);
+		}
+
+		const double VA = D3 * D6 - D5 * D4;
+		if (VA <= 0.0 && (D4 - D3) >= 0.0 && (D5 - D6) >= 0.0)
+		{
+			const double W = (D4 - D3) / ((D4 - D3) + (D5 - D6));
+			return FVector::DistSquared(P, B + (C - B) * W);
+		}
+
+		const FVector Normal = FVector::CrossProduct(AB, AC).GetSafeNormal();
+		if (Normal.IsNearlyZero())
+		{
+			return FMath::Min3(FVector::DistSquared(P, A), FVector::DistSquared(P, B), FVector::DistSquared(P, C));
+		}
+		const double SignedDistance = FVector::DotProduct(P - A, Normal);
+		return SignedDistance * SignedDistance;
+	}
+
+	static bool ScoreMeshAgainstSourceFace(
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const TArray<FVector>& ProbePoints,
+		const FVector& ExpectedNormal,
+		double& OutScore,
+		int32& OutMatchedProbeCount)
+	{
+		OutScore = TNumericLimits<double>::Max();
+		OutMatchedProbeCount = 0;
+		if (Mesh.TriangleCount() <= 0 || ProbePoints.Num() == 0)
+		{
+			return false;
+		}
+
+		constexpr double ProbeToleranceCm = 5.0;
+		constexpr double ProbeToleranceSq = ProbeToleranceCm * ProbeToleranceCm;
+		constexpr double NormalDotTolerance = 0.90;
+		const FVector Normal = ExpectedNormal.GetSafeNormal();
+		const bool bCheckNormal = !Normal.IsNearlyZero();
+		double DistanceSum = 0.0;
+		int32 ValidProbeCount = 0;
+		int32 MatchedProbeCount = 0;
+
+		for (const FVector& Probe : ProbePoints)
+		{
+			if (!FMath::IsFinite(Probe.X) || !FMath::IsFinite(Probe.Y) || !FMath::IsFinite(Probe.Z))
+			{
+				continue;
+			}
+
+			double BestDistanceSq = TNumericLimits<double>::Max();
+			double BestNormalDot = 0.0;
+			for (int32 TriangleId : Mesh.TriangleIndicesItr())
+			{
+				const UE::Geometry::FIndex3i Tri = Mesh.GetTriangle(TriangleId);
+				if (!Mesh.IsVertex(Tri.A) || !Mesh.IsVertex(Tri.B) || !Mesh.IsVertex(Tri.C))
+				{
+					continue;
+				}
+
+				const FVector3d A3 = Mesh.GetVertex(Tri.A);
+				const FVector3d B3 = Mesh.GetVertex(Tri.B);
+				const FVector3d C3 = Mesh.GetVertex(Tri.C);
+				const FVector A(A3.X, A3.Y, A3.Z);
+				const FVector B(B3.X, B3.Y, B3.Z);
+				const FVector C(C3.X, C3.Y, C3.Z);
+				const double DistanceSq = PointTriangleDistanceSquared(Probe, A, B, C);
+				if (DistanceSq < BestDistanceSq)
+				{
+					BestDistanceSq = DistanceSq;
+					const FVector TriNormal = FVector::CrossProduct(B - A, C - A).GetSafeNormal();
+					BestNormalDot = bCheckNormal && !TriNormal.IsNearlyZero() ? FMath::Abs(FVector::DotProduct(TriNormal, Normal)) : 1.0;
+				}
+			}
+
+			if (BestDistanceSq < TNumericLimits<double>::Max())
+			{
+				++ValidProbeCount;
+				DistanceSum += FMath::Sqrt(BestDistanceSq);
+				if (BestDistanceSq <= ProbeToleranceSq && BestNormalDot >= NormalDotTolerance)
+				{
+					++MatchedProbeCount;
+				}
+			}
+		}
+
+		if (ValidProbeCount == 0)
+		{
+			return false;
+		}
+
+		OutScore = DistanceSum / double(ValidProbeCount);
+		OutMatchedProbeCount = MatchedProbeCount;
+		const int32 RequiredMatches = FMath::Max(1, FMath::CeilToInt(double(ValidProbeCount) * 0.75));
+		return MatchedProbeCount >= RequiredMatches;
+	}
+
+	static bool StringEqualsNonEmpty(const FString& A, const FString& B)
+	{
+		return !A.IsEmpty() && !B.IsEmpty() && A.Equals(B, ESearchCase::CaseSensitive);
+	}
+
+	static bool PathEqualsOrSuffixMatches(const FString& Expected, const FString& Actual)
+	{
+		if (Expected.IsEmpty() || Actual.IsEmpty())
+		{
+			return false;
+		}
+		return Expected.Equals(Actual, ESearchCase::CaseSensitive) ||
+			Expected.EndsWith(Actual, ESearchCase::CaseSensitive) ||
+			Actual.EndsWith(Expected, ESearchCase::CaseSensitive);
+	}
+
+	static int32 ScoreActorMaterialIdComponent(UPrimitiveComponent* Component, const FActorMaterialIdEntry& Entry)
+	{
+		if (!Component)
+		{
+			return -1;
+		}
+
+		AActor* Owner = Component->GetOwner();
+		if (!Owner ||
+			Owner->ActorHasTag(ReconstructedFaceTag) ||
+			Owner->ActorHasTag(ReconstructedSolidTag) ||
+			ActorHasAnyStep11RuntimeTag(Owner))
+		{
+			return -1;
+		}
+
+		const FString ComponentPath = Component->GetPathName();
+		if (StringEqualsNonEmpty(Entry.ComponentPath, ComponentPath))
+		{
+			return 1000;
+		}
+
+		const FString ActorPath = Owner->GetPathName();
+		bool bActorMatched = false;
+		bool bComponentMatched = false;
+		int32 Score = 0;
+
+		if (PathEqualsOrSuffixMatches(Entry.ActorPath, ActorPath))
+		{
+			bActorMatched = true;
+			Score += 100;
+		}
+		if (StringEqualsNonEmpty(Entry.ActorName, Owner->GetName()))
+		{
+			bActorMatched = true;
+			Score += 40;
+		}
+
+		if (PathEqualsOrSuffixMatches(Entry.ComponentPath, ComponentPath))
+		{
+			bComponentMatched = true;
+			Score += 200;
+		}
+		if (StringEqualsNonEmpty(Entry.ComponentName, Component->GetName()))
+		{
+			bComponentMatched = true;
+			Score += 40;
+		}
+		if (StringEqualsNonEmpty(Entry.ComponentType, Component->GetClass() ? Component->GetClass()->GetName() : FString()))
+		{
+			Score += 10;
+		}
+
+		const bool bHasActorHint = !Entry.ActorPath.IsEmpty() || !Entry.ActorName.IsEmpty();
+		if (!bComponentMatched || (bHasActorHint && !bActorMatched))
+		{
+			return -1;
+		}
+		return Score;
+	}
+
+	static UPrimitiveComponent* FindActorMaterialIdComponent(UWorld* World, const FActorMaterialIdEntry& Entry)
+	{
+		if (!World)
+		{
+			return nullptr;
+		}
+
+		UPrimitiveComponent* BestComponent = nullptr;
+		int32 BestScore = -1;
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* Actor = *It;
+			if (!Actor)
+			{
+				continue;
+			}
+
+			TArray<UPrimitiveComponent*> Components;
+			Actor->GetComponents<UPrimitiveComponent>(Components);
+			for (UPrimitiveComponent* Component : Components)
+			{
+				const int32 Score = ScoreActorMaterialIdComponent(Component, Entry);
+				if (Score > BestScore)
+				{
+					BestComponent = Component;
+					BestScore = Score;
+					if (Score >= 1000)
+					{
+						return BestComponent;
+					}
+				}
+			}
+		}
+
+		return BestComponent;
+	}
+
+	static UMaterialInterface* ResolveAttachMaterialFromIdSelection(
+		UWorld* World,
+		const FReconstructedMesh& MeshData)
+	{
+		const FAttachMaterialIdSelection& Selection = MeshData.AttachMaterialId;
+		if (!Selection.bLookupAttempted)
+		{
+			return nullptr;
+		}
+		if (!Selection.bFound)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("Step10Diag: attach material id lookup failed; fallback to vertex color source_face_id=%d attach_actor=%s error=%s."),
+				MeshData.SourceFaceId,
+				*MeshData.ActorName,
+				*Selection.Error);
+			return nullptr;
+		}
+
+		UPrimitiveComponent* SourceComponent = FindActorMaterialIdComponent(World, Selection.Entry);
+		if (!SourceComponent)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("Step10Diag: attach material id matched actor=%s component=%s slot=%d, but source component was not found; fallback to vertex color attach_actor=%s."),
+				*Selection.Entry.ActorName,
+				*Selection.Entry.ComponentName,
+				Selection.Entry.MaterialSlot,
+				*MeshData.ActorName);
+			return nullptr;
+		}
+
+		const int32 MaterialSlot = FMath::Max(0, Selection.Entry.MaterialSlot);
+		UMaterialInterface* SourceMaterial = SourceComponent->GetMaterial(MaterialSlot);
+		if (!SourceMaterial && !Selection.Entry.MaterialPath.IsEmpty())
+		{
+			SourceMaterial = LoadObject<UMaterialInterface>(nullptr, *Selection.Entry.MaterialPath);
+		}
+		if (!SourceMaterial)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("Step10Diag: attach material id source component found but material is null actor=%s component=%s slot=%d material_path=%s; fallback to vertex color attach_actor=%s."),
+				*GetNameSafe(SourceComponent->GetOwner()),
+				*GetNameSafe(SourceComponent),
+				MaterialSlot,
+				*Selection.Entry.MaterialPath,
+				*MeshData.ActorName);
+			return nullptr;
+		}
+
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("Step10Diag: attach material inherited from id buffer source_actor=%s source_component=%s material_slot=%d material=%s vote_pixels=%d considered_pixels=%d coverage=%.6f attach_actor=%s."),
+			*GetNameSafe(SourceComponent->GetOwner()),
+			*GetNameSafe(SourceComponent),
+			MaterialSlot,
+			*GetNameSafe(SourceMaterial),
+			Selection.PixelCount,
+			Selection.ConsideredPixelCount,
+			Selection.Coverage,
+			*MeshData.ActorName);
+		return SourceMaterial;
+	}
+
+	static UMaterialInterface* ResolveAttachSourceMaterial(
+		UWorld* World,
+		const FReconstructedMesh& MeshData,
+		UPrimitiveComponent* SelfComponent)
+	{
+		if (!World || MeshData.bIsExcavateCutter)
+		{
+			return nullptr;
+		}
+
+		if (MeshData.AttachMaterialId.bLookupAttempted)
+		{
+			return ResolveAttachMaterialFromIdSelection(World, MeshData);
+		}
+
+		TArray<FVector> ProbePoints = MeshData.SourceMaterialProbePointsWorld;
+		if (ProbePoints.Num() == 0)
+		{
+			ProbePoints = MeshData.SourceFaceVerticesWorld;
+		}
+		if (ProbePoints.Num() == 0)
+		{
+			ProbePoints.Add(MeshData.SourcePlanePoint);
+		}
+
+		UPrimitiveComponent* BestComponent = nullptr;
+		UMaterialInterface* BestMaterial = nullptr;
+		double BestScore = TNumericLimits<double>::Max();
+		int32 BestMatchedProbeCount = 0;
+
+		auto ConsiderComponent = [&](UPrimitiveComponent* Component, UE::Geometry::FDynamicMesh3& CandidateMesh)
+		{
+			if (!Component || Component == SelfComponent)
+			{
+				return;
+			}
+
+			double Score = TNumericLimits<double>::Max();
+			int32 MatchedProbeCount = 0;
+			if (!ScoreMeshAgainstSourceFace(CandidateMesh, ProbePoints, MeshData.SourcePlaneNormal, Score, MatchedProbeCount))
+			{
+				return;
+			}
+			if (MatchedProbeCount > BestMatchedProbeCount || (MatchedProbeCount == BestMatchedProbeCount && Score < BestScore))
+			{
+				BestComponent = Component;
+				BestMaterial = Component->GetMaterial(0);
+				BestScore = Score;
+				BestMatchedProbeCount = MatchedProbeCount;
+			}
+		};
+
+		for (TActorIterator<AActor> It(World); It; ++It)
+		{
+			AActor* Actor = *It;
+			if (!Actor || Actor->IsHidden() ||
+				Actor->ActorHasTag(ReconstructedFaceTag) ||
+				ActorHasAnyStep11RuntimeTag(Actor))
+			{
+				continue;
+			}
+
+			TArray<UStaticMeshComponent*> StaticComponents;
+			Actor->GetComponents<UStaticMeshComponent>(StaticComponents);
+			for (UStaticMeshComponent* Component : StaticComponents)
+			{
+				UE::Geometry::FDynamicMesh3 CandidateMesh;
+				if (BuildDynamicMeshFromStaticMeshComponent(Component, CandidateMesh, false))
+				{
+					ConsiderComponent(Component, CandidateMesh);
+				}
+			}
+
+			TArray<UProceduralMeshComponent*> ProceduralComponents;
+			Actor->GetComponents<UProceduralMeshComponent>(ProceduralComponents);
+			for (UProceduralMeshComponent* Component : ProceduralComponents)
+			{
+				UE::Geometry::FDynamicMesh3 CandidateMesh;
+				if (BuildDynamicMeshFromProceduralMeshComponent(Component, CandidateMesh, false))
+				{
+					ConsiderComponent(Component, CandidateMesh);
+				}
+			}
+		}
+
+		if (BestComponent)
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("Step10Diag: attach material inherited source_actor=%s source_component=%s source_face_id=%d material_slot=0 material=%s matched_probe_count=%d score_cm=%.6f attach_actor=%s."),
+				*GetNameSafe(BestComponent->GetOwner()),
+				*GetNameSafe(BestComponent),
+				MeshData.SourceFaceId,
+				*GetNameSafe(BestMaterial),
+				BestMatchedProbeCount,
+				BestScore,
+				*MeshData.ActorName);
+			return BestMaterial;
+		}
+
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("Step10Diag: attach material fallback to vertex color; no source component matched source_face_id=%d attach_actor=%s probe_count=%d."),
+			MeshData.SourceFaceId,
+			*MeshData.ActorName,
+			ProbePoints.Num());
+		return nullptr;
 	}
 
 	static bool ConvertDynamicMeshToProceduralArrays(
@@ -4771,7 +5508,20 @@ namespace
 				{
 					MeshComponent->SetWorldLocation(Origin);
 				}
-				MeshComponent->SetMaterial(0, MeshData.bIsExcavateCutter ? CreateCutterMaterial(MeshComponent) : VertexColorMaterial);
+				UMaterialInterface* MeshMaterial = nullptr;
+				if (MeshData.bIsExcavateCutter)
+				{
+					MeshMaterial = CreateCutterMaterial(MeshComponent);
+				}
+				else
+				{
+					MeshMaterial = ResolveAttachSourceMaterial(World, MeshData, MeshComponent);
+					if (!MeshMaterial)
+					{
+						MeshMaterial = VertexColorMaterial;
+					}
+				}
+				MeshComponent->SetMaterial(0, MeshMaterial);
 
 				TArray<FVector> LocalVertices;
 				LocalVertices.Reserve(MeshData.VerticesWorld.Num());
@@ -4874,6 +5624,33 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
 		return;
 	}
+	if (!Inputs.ActorMaterialPngPath.IsEmpty() && !Inputs.ActorMaterialJsonPath.IsEmpty())
+	{
+		const bool bLoadedActorMaterialPng = DecodePngToRGBA(
+			Inputs.ActorMaterialPngPath,
+			Inputs.ActorMaterialRGBA,
+			Inputs.ActorMaterialWidth,
+			Inputs.ActorMaterialHeight);
+		const bool bLoadedActorMaterialJson = LoadActorMaterialIdJson(
+			Inputs.ActorMaterialJsonPath,
+			Inputs.ActorMaterialEntryByColorKey);
+		if (!bLoadedActorMaterialPng || !bLoadedActorMaterialJson)
+		{
+			Inputs.ActorMaterialRGBA.Reset();
+			Inputs.ActorMaterialWidth = 0;
+			Inputs.ActorMaterialHeight = 0;
+			Inputs.ActorMaterialEntryByColorKey.Reset();
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("FaceReconstruct: actor/material id buffer unavailable for press=%s png_ok=%d json_ok=%d png=%s json=%s; attach material will use fallback path."),
+				*PressId,
+				bLoadedActorMaterialPng ? 1 : 0,
+				bLoadedActorMaterialJson ? 1 : 0,
+				*Inputs.ActorMaterialPngPath,
+				*Inputs.ActorMaterialJsonPath);
+		}
+	}
 	if (!LoadCameraJson(Inputs.CaptureJsonPath, Inputs.Camera))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to read capture camera json: %s"), *Inputs.CaptureJsonPath));
@@ -4909,6 +5686,12 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 			SolidMesh.Normal = Result.Solid.MeshNormal;
 			SolidMesh.PressId = PressId;
 			SolidMesh.bIsExcavateCutter = Result.Solid.Action.Equals(TEXT("excavate"), ESearchCase::IgnoreCase);
+			SolidMesh.SourceFaceId = Result.Solid.SelectedFaceId;
+			SolidMesh.SourcePlanePoint = Result.Solid.SourcePlanePoint;
+			SolidMesh.SourcePlaneNormal = Result.Solid.SourcePlaneNormal;
+			SolidMesh.SourceFaceVerticesWorld = Result.Solid.SourceFaceVerticesWorld;
+			SolidMesh.SourceMaterialProbePointsWorld = Result.Solid.SourceMaterialProbePointsWorld;
+			SolidMesh.AttachMaterialId = Result.Solid.AttachMaterialId;
 			if (SolidMesh.bIsExcavateCutter)
 			{
 				ScaleVerticesAlongAxis(SolidMesh.VerticesWorld, SolidMesh.Normal, ExcavationCutterNormalScale);

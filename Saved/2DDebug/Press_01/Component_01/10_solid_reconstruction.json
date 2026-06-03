@@ -12,6 +12,9 @@
 	"faces_width": 1720,
 	"faces_height": 1222,
 	"selected_source_face_id": -1,
+	"attach_material_id_lookup_attempted": false,
+	"attach_material_id_found": false,
+	"attach_material_id_error": "",
 	"source_plane_point": [
 		0,
 		0,

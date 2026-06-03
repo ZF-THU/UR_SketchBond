@@ -187,11 +187,17 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 			{
 				CaptureStem.LeftChopInline(6);
 			}
+			if (CaptureStem.EndsWith(TEXT("_actor_material_id")))
+			{
+				CaptureStem.LeftChopInline(18);
+			}
 			Source.CaptureStem = CaptureStem;
 			Source.CapturePngRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT(".png");
 			Source.CaptureJsonRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT(".json");
 			Source.FacesPngRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT("_faces.png");
 			Source.FacesJsonRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT("_faces.json");
+			Source.ActorMaterialPngRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT("_actor_material_id.png");
+			Source.ActorMaterialJsonRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT("_actor_material_id.json");
 		}
 
 		FFromLZSketch2DProcessor::ProcessCompositeAsync(Composite, SW, SH, TwoDDebugDir, Source, World);
@@ -274,6 +280,10 @@ FString FFromLZSketchProcessor::FindLatestPng(const FString& Directory, bool bEx
 	for (const FString& Filename : Filenames)
 	{
 		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_faces")))
+		{
+			continue;
+		}
+		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_actor_material_id")))
 		{
 			continue;
 		}

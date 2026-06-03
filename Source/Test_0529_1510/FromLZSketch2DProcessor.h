@@ -37,6 +37,8 @@ struct FSketchSourceInfo
 	FString CaptureJsonRel;  // "FromLZCaptures/FromLZ_...json"
 	FString FacesPngRel;     // "FromLZCaptures/FromLZ_..._faces.png"
 	FString FacesJsonRel;    // "FromLZCaptures/FromLZ_..._faces.json"
+	FString ActorMaterialPngRel;  // "FromLZCaptures/FromLZ_..._actor_material_id.png"
+	FString ActorMaterialJsonRel; // "FromLZCaptures/FromLZ_..._actor_material_id.json"
 	FString SketchPngRel;    // "FromSketch/....png"
 };
 

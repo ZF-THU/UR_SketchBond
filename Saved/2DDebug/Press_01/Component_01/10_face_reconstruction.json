@@ -9,24 +9,16 @@
 	"cap_height": 1222,
 	"faces_width": 1720,
 	"faces_height": 1222,
-	"cap_mask_pixels": 80228,
-	"min_overlap_pixels": 4012,
+	"cap_mask_pixels": 80245,
+	"min_overlap_pixels": 4013,
 	"green_line_vector_2d": [
 		-0.89708903366019022,
 		0.44184982254904892
 	],
 	"green_line_vectors_2d": [
 		[
-			0.9908301680442988,
-			-0.13511320473331348
-		],
-		[
-			0.55470019622522915,
-			-0.83205029433784372
-		],
-		[
-			0.95072983948147882,
-			-0.31002059983091701
+			0.95782628522115143,
+			-0.28734788556634544
 		],
 		[
 			-0.94868329805051377,
@@ -59,48 +51,25 @@
 	"candidates": [
 		{
 			"face_id": 1,
-			"overlap_pixels": 74254,
-			"overlap_ratio": 0.92553721892606078,
+			"overlap_pixels": 80245,
+			"overlap_ratio": 1,
 			"mask_centroid_2d": [
-				1141.122094432623,
-				521.33226492848871
+				1146.2238955698174,
+				509.88579350738365
 			],
 			"has_plane_hit": true,
 			"plane_hit_3d": [
-				-341.50920407061722,
-				-49.988792033059894,
-				362.9596459685024
+				-326.96868681981152,
+				-49.998100726041116,
+				341.25644808615158
 			],
-			"distance_to_camera": 629.1435096831342,
+			"distance_to_camera": 760.67032417957546,
 			"has_projected_normal": true,
 			"projected_normal_2d": [
-				0.7208199611810554,
-				-0.69312234386357929
+				-0.63608703441862269,
+				0.77161731748614992
 			],
-			"normal_green_angle_degrees": 12.432151980657347,
-			"normal_parallel_pass": false
-		},
-		{
-			"face_id": 2,
-			"overlap_pixels": 5801,
-			"overlap_ratio": 0.072306426683950736,
-			"mask_centroid_2d": [
-				1208.4596621272194,
-				368.2636614376832
-			],
-			"has_plane_hit": true,
-			"plane_hit_3d": [
-				-389.16313906671917,
-				-5.6014534232934352,
-				499.69541097935979
-			],
-			"distance_to_camera": 664.79757808926979,
-			"has_projected_normal": true,
-			"projected_normal_2d": [
-				-0.00061771122545078517,
-				0.99999980921640286
-			],
-			"normal_green_angle_degrees": 23.92709672615122,
+			"normal_green_angle_degrees": 15.538165508780445,
 			"normal_parallel_pass": false
 		}
 	],

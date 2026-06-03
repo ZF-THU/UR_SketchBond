@@ -73,6 +73,8 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 		RefJson += FString::Printf(TEXT("  \"capture_json\": \"%s\",\n"), *Source.CaptureJsonRel);
 		RefJson += FString::Printf(TEXT("  \"faces_png\": \"%s\",\n"), *Source.FacesPngRel);
 		RefJson += FString::Printf(TEXT("  \"faces_json\": \"%s\",\n"), *Source.FacesJsonRel);
+		RefJson += FString::Printf(TEXT("  \"actor_material_png\": \"%s\",\n"), *Source.ActorMaterialPngRel);
+		RefJson += FString::Printf(TEXT("  \"actor_material_json\": \"%s\",\n"), *Source.ActorMaterialJsonRel);
 		RefJson += FString::Printf(TEXT("  \"sketch_png\": \"%s\"\n"), *Source.SketchPngRel);
 		RefJson += TEXT("}\n");
 		FFileHelper::SaveStringToFile(RefJson, *(PressDir / TEXT("capture_ref.json")));

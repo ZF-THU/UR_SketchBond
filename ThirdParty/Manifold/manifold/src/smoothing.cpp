@@ -72,7 +72,7 @@ vec4 CircularTangent(const vec3& tangent, const vec3& edgeVec) {
 
 struct InterpTri {
   VecView<vec3> vertPos;
-  VecView<const Barycentric> vertBary;
+  VecView<const manifold::Barycentric> vertBary;
   const Manifold::Impl* impl;
 
   static vec4 Homogeneous(vec4 v) {
@@ -1102,7 +1102,7 @@ void Manifold::Impl::Refine(std::function<int(vec3, vec4, vec4)> edgeDivisions,
 
   Manifold::Impl old = *this;
   halfedge_.MakeUnique();
-  Vec<Barycentric> vertBary = Subdivide(edgeDivisions, keepInterior);
+  Vec<manifold::Barycentric> vertBary = Subdivide(edgeDivisions, keepInterior);
   // Cancel observed AFTER Subdivide (which is currently cancel-blind) but
   // BEFORE the no-op early-return: the user requested cancel, so honour it
   // even when Subdivide produced nothing to interpolate.
@@ -1113,8 +1113,12 @@ void Manifold::Impl::Refine(std::function<int(vec3, vec4, vec4)> edgeDivisions,
   if (vertBary.size() == 0) return;
 
   if (old.halfedgeTangent_.size() == old.halfedge_.size()) {
+    InterpTri interpTri;
+    interpTri.vertPos = vertPos_;
+    interpTri.vertBary = vertBary;
+    interpTri.impl = &old;
     for_each_n(autoPolicy(NumTri(), 1e4), countAt(0), NumVert(),
-               InterpTri({vertPos_, vertBary, &old}));
+               interpTri);
   }
 
   halfedgeTangent_.clear();

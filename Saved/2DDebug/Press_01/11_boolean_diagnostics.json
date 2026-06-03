@@ -2,17 +2,18 @@
 	"diagnostic_version": 2,
 	"press_id": "Press_01",
 	"active_undo_press_id": "Press_01",
+	"boolean_backend": "Manifold3D",
+	"manifold_library_version": "3.5.0+37125da",
 	"excavation_cutter_normal_scale": 1.2,
-	"snap_tolerance_cm": 0.050000000000000003,
 	"min_renderable_edge_cm": 0.050000000000000003,
 	"input_reconstruction_meshes": [
 		{
 			"actor_name": "FromLZ_ReconstructedSolid_Press_01_Component_02",
 			"tag": "FromLZ_ReconstructedSolid",
 			"is_excavate_cutter": false,
-			"input_world_vertex_count": 32,
-			"input_triangle_index_count": 180,
-			"input_triangle_count": 60,
+			"input_world_vertex_count": 26,
+			"input_triangle_index_count": 144,
+			"input_triangle_count": 48,
 			"normal": [
 				-0.00097999905880935588,
 				-0.99999903960138359,
@@ -22,31 +23,31 @@
 			{
 				"valid": true,
 				"min": [
-					70.667449540944659,
-					-369.91654713499429,
-					148.36257840086051
+					72.792756054365995,
+					-506.25952140909732,
+					167.37309365872457
 				],
 				"max": [
-					265.28647358286963,
-					-50.218135456515483,
-					389.03236901760033
+					259.55460784181173,
+					-50.240858989129947,
+					386.1967344887139
 				],
 				"center": [
-					167.97696156190716,
-					-210.06734129575489,
-					268.69747370923039
+					166.17368194808887,
+					-278.2501901991136,
+					276.78491407371922
 				],
 				"extent": [
-					97.309512020962487,
-					159.8492058392394,
-					120.33489530836991
+					93.380925893722861,
+					228.00933120998369,
+					109.41182041499466
 				],
 				"size": [
-					194.61902404192497,
-					319.69841167847881,
-					240.66979061673982
+					186.76185178744572,
+					456.01866241996737,
+					218.82364082998933
 				],
-				"diagonal": 444.97818717806706
+				"diagonal": 539.18159792825293
 			}
 		}
 	],
