@@ -1,37 +1,15 @@
 {
   "nodes": [
-    {"id": 0, "pos": [1162.50, 345.50]},
-    {"id": 1, "pos": [1230.00, 344.50]},
-    {"id": 2, "pos": [1132.00, 351.00]},
-    {"id": 3, "pos": [1126.00, 404.00]},
-    {"id": 4, "pos": [1260.00, 352.00]},
-    {"id": 5, "pos": [1309.00, 528.00]},
-    {"id": 6, "pos": [1029.00, 426.00]},
-    {"id": 7, "pos": [1031.00, 492.00]},
-    {"id": 8, "pos": [945.00, 519.00]},
-    {"id": 9, "pos": [944.00, 602.00]},
-    {"id": 10, "pos": [976.33, 638.00]},
-    {"id": 11, "pos": [1280.00, 618.50]}
+    {"id": 0, "pos": [307.00, 414.67]},
+    {"id": 1, "pos": [368.00, 394.00]},
+    {"id": 2, "pos": [387.00, 438.50]}
   ],
   "edges": [
-    {"stroke_id": 15, "u": 0, "v": 1, "color": "red", "kept": true},
-    {"stroke_id": 16, "u": 0, "v": 0, "color": "red", "kept": true},
-    {"stroke_id": 17, "u": 0, "v": 2, "color": "red", "kept": true},
-    {"stroke_id": 18, "u": 2, "v": 3, "color": "red", "kept": true},
-    {"stroke_id": 19, "u": 1, "v": 1, "color": "red", "kept": true},
-    {"stroke_id": 20, "u": 1, "v": 4, "color": "red", "kept": true},
-    {"stroke_id": 26, "u": 4, "v": 4, "color": "red", "kept": true},
-    {"stroke_id": 27, "u": 4, "v": 4, "color": "red", "kept": true},
-    {"stroke_id": 28, "u": 4, "v": 5, "color": "red", "kept": true},
-    {"stroke_id": 35, "u": 3, "v": 6, "color": "red", "kept": true},
-    {"stroke_id": 36, "u": 6, "v": 7, "color": "red", "kept": true},
-    {"stroke_id": 53, "u": 7, "v": 8, "color": "red", "kept": true},
-    {"stroke_id": 54, "u": 8, "v": 9, "color": "red", "kept": true},
-    {"stroke_id": 55, "u": 9, "v": 10, "color": "red", "kept": true},
-    {"stroke_id": 56, "u": 10, "v": 10, "color": "red", "kept": true},
-    {"stroke_id": 57, "u": 10, "v": 10, "color": "red", "kept": true},
-    {"stroke_id": 77, "u": 5, "v": 11, "color": "red", "kept": true},
-    {"stroke_id": 78, "u": 11, "v": 11, "color": "red", "kept": true},
-    {"stroke_id": 79, "u": 11, "v": 10, "color": "red", "kept": true}
+    {"stroke_id": 10, "u": 0, "v": 0, "color": "red", "kept": true},
+    {"stroke_id": 11, "u": 0, "v": 1, "color": "red", "kept": true},
+    {"stroke_id": 12, "u": 1, "v": 2, "color": "red", "kept": true},
+    {"stroke_id": 13, "u": 2, "v": 2, "color": "red", "kept": true},
+    {"stroke_id": 14, "u": 0, "v": 0, "color": "red", "kept": true},
+    {"stroke_id": 15, "u": 0, "v": 2, "color": "red", "kept": true}
   ]
 }

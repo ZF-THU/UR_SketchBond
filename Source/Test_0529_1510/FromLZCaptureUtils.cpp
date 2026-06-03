@@ -44,6 +44,75 @@ static constexpr double FromLZCaptureOrthoWidth = 1536.0;
 // ===================================================================
 namespace FromLZFaces
 {
+	static uint32 FaceColorKey(const FColor& Color)
+	{
+		return (uint32(Color.R) << 16) | (uint32(Color.G) << 8) | uint32(Color.B);
+	}
+
+	// 100 visually distinct face colors: 20 hue buckets x 5 saturation/value pairs.
+	// These colors are also IDs in the faces PNG, so they must stay unique.
+	static const FColor FacePalette100[] = {
+		FColor(219, 60, 39), FColor(199, 76, 60), FColor(184, 30, 9), FColor(163, 74, 62), FColor(148, 33, 18),
+		FColor(219, 114, 39), FColor(199, 118, 60), FColor(184, 82, 9), FColor(163, 104, 62), FColor(148, 72, 18),
+		FColor(219, 168, 39), FColor(199, 159, 60), FColor(184, 134, 9), FColor(163, 135, 62), FColor(148, 111, 18),
+		FColor(216, 219, 39), FColor(197, 199, 60), FColor(181, 184, 9), FColor(162, 163, 62), FColor(146, 148, 18),
+		FColor(162, 219, 39), FColor(155, 199, 60), FColor(128, 184, 9), FColor(131, 163, 62), FColor(107, 148, 18),
+		FColor(108, 219, 39), FColor(113, 199, 60), FColor(76, 184, 9), FColor(101, 163, 62), FColor(68, 148, 18),
+		FColor(54, 219, 39), FColor(71, 199, 60), FColor(24, 184, 9), FColor(70, 163, 62), FColor(29, 148, 18),
+		FColor(39, 219, 78), FColor(60, 199, 90), FColor(9, 184, 47), FColor(62, 163, 84), FColor(18, 148, 46),
+		FColor(39, 219, 132), FColor(60, 199, 132), FColor(9, 184, 99), FColor(62, 163, 114), FColor(18, 148, 85),
+		FColor(39, 219, 186), FColor(60, 199, 173), FColor(9, 184, 152), FColor(62, 163, 145), FColor(18, 148, 124),
+		FColor(39, 198, 219), FColor(60, 183, 199), FColor(9, 163, 184), FColor(62, 151, 163), FColor(18, 133, 148),
+		FColor(39, 144, 219), FColor(60, 141, 199), FColor(9, 111, 184), FColor(62, 121, 163), FColor(18, 94, 148),
+		FColor(39, 90, 219), FColor(60, 99, 199), FColor(9, 59, 184), FColor(62, 91, 163), FColor(18, 55, 148),
+		FColor(42, 39, 219), FColor(62, 60, 199), FColor(12, 9, 184), FColor(64, 62, 163), FColor(20, 18, 148),
+		FColor(96, 39, 219), FColor(104, 60, 199), FColor(64, 9, 184), FColor(94, 62, 163), FColor(59, 18, 148),
+		FColor(150, 39, 219), FColor(146, 60, 199), FColor(117, 9, 184), FColor(124, 62, 163), FColor(98, 18, 148),
+		FColor(204, 39, 219), FColor(187, 60, 199), FColor(169, 9, 184), FColor(155, 62, 163), FColor(137, 18, 148),
+		FColor(219, 39, 180), FColor(199, 60, 169), FColor(184, 9, 146), FColor(163, 62, 141), FColor(148, 18, 120),
+		FColor(219, 39, 126), FColor(199, 60, 127), FColor(184, 9, 93), FColor(163, 62, 111), FColor(148, 18, 81),
+		FColor(219, 39, 72), FColor(199, 60, 85), FColor(184, 9, 41), FColor(163, 62, 81), FColor(148, 18, 42)
+	};
+	static_assert(UE_ARRAY_COUNT(FacePalette100) == 100, "FacePalette100 must contain exactly 100 colors.");
+
+	static FColor MakeFallbackFaceColor(int32 FaceId, int32 Attempt)
+	{
+		uint32 Seed = uint32(FaceId) * 1103515245u + 12345u + uint32(Attempt) * 2654435761u;
+		Seed ^= (Seed >> 16);
+		const uint8 R = uint8(32u + (Seed & 0x7fu));
+		const uint8 G = uint8(32u + ((Seed >> 7) & 0x7fu));
+		const uint8 B = uint8(32u + ((Seed >> 14) & 0x7fu));
+		return FColor(R, G, B, 255);
+	}
+
+	static bool GetUniqueFaceColor(int32 FaceId, TSet<uint32>& UsedColorKeys, FColor& OutColor)
+	{
+		if (FaceId >= 0 && FaceId < UE_ARRAY_COUNT(FacePalette100))
+		{
+			const FColor Candidate = FacePalette100[FaceId];
+			const uint32 Key = FaceColorKey(Candidate);
+			if (!UsedColorKeys.Contains(Key))
+			{
+				UsedColorKeys.Add(Key);
+				OutColor = Candidate;
+				return true;
+			}
+		}
+
+		for (int32 Attempt = 0; Attempt < 4096; ++Attempt)
+		{
+			const FColor Candidate = MakeFallbackFaceColor(FaceId, Attempt);
+			const uint32 Key = FaceColorKey(Candidate);
+			if (!UsedColorKeys.Contains(Key) && Key != FaceColorKey(FColor::White) && Key != FaceColorKey(FColor::Black))
+			{
+				UsedColorKeys.Add(Key);
+				OutColor = Candidate;
+				return true;
+			}
+		}
+		return false;
+	}
+
 	// Perpendicular distance from P to segment-line A-B.
 	static float PerpDist(const FVector2D& P, const FVector2D& A, const FVector2D& B)
 	{
@@ -116,7 +185,7 @@ namespace FromLZFaces
 // Segments the captured depth/normal buffers into planar faces, derives each face's
 // corner key points (2D), unprojects them to 3D world coordinates, and writes a
 // color-coded faces PNG plus a faces JSON. Reuses the already-read-back buffers.
-static void SaveNormalFaces(
+static bool SaveNormalFaces(
 	const TArray<float>& Depth, const TArray<FVector3f>& Normal,
 	int32 W, int32 H, const UCameraComponent* Camera,
 	bool bCaptureOrthographic, double CaptureOrthoWidth,
@@ -281,27 +350,28 @@ static void SaveNormalFaces(
 		if (FirstPixel[f] < 0) { FirstPixel[f] = i; }
 	}
 
-	// Color palette for the visualization + JSON legend.
-	static const FColor Palette[] = {
-		FColor(220, 50, 47), FColor(38, 139, 210), FColor(133, 153, 0), FColor(181, 137, 0),
-		FColor(211, 54, 130), FColor(42, 161, 152), FColor(203, 75, 22), FColor(108, 113, 196),
-		FColor(0, 150, 136), FColor(156, 39, 176), FColor(255, 152, 0), FColor(96, 125, 139)
-	};
-	const int32 NumPalette = UE_ARRAY_COUNT(Palette);
-
 	// Build JSON + faces visualization.
 	TArray<FColor> Out;
 	Out.Init(FColor(255, 255, 255, 255), NumPx);
+	TSet<uint32> UsedFaceColorKeys;
 
 	FString Json;
 	Json += TEXT("{\n");
 	Json += FString::Printf(TEXT("  \"image\": { \"w\": %d, \"h\": %d },\n"), W, H);
 	Json += FString::Printf(TEXT("  \"num_faces\": %d,\n"), NumFaces);
+	Json += TEXT("  \"palette_version\": 2,\n");
+	Json += TEXT("  \"unique_face_colors\": true,\n");
 	Json += TEXT("  \"faces\": [\n");
 
 	for (int32 f = 0; f < NumFaces; ++f)
 	{
-		const FColor Col = Palette[f % NumPalette];
+		FColor Col;
+		if (!GetUniqueFaceColor(f, UsedFaceColorKeys, Col))
+		{
+			UE_LOG(LogTemp, Error, TEXT("CaptureFromLZ: failed to allocate a unique face color for face_id=%d; faces output skipped."), f);
+			return false;
+		}
+		const uint32 ColKey = FaceColorKey(Col);
 
 		// Paint region pixels.
 		for (int32 i = 0; i < NumPx; ++i)
@@ -371,6 +441,7 @@ static void SaveNormalFaces(
 		Json += TEXT("    {\n");
 		Json += FString::Printf(TEXT("      \"id\": %d,\n"), f);
 		Json += FString::Printf(TEXT("      \"color_rgb\": [%d, %d, %d],\n"), Col.R, Col.G, Col.B);
+		Json += FString::Printf(TEXT("      \"color_key\": %u,\n"), ColKey);
 		Json += FString::Printf(TEXT("      \"area_px\": %lld,\n"), static_cast<long long>(Cnt[f]));
 		Json += FString::Printf(TEXT("      \"normal_world\": [%.5f, %.5f, %.5f],\n"), PlaneN.X, PlaneN.Y, PlaneN.Z);
 		Json += FString::Printf(TEXT("      \"plane_point\": [%.3f, %.3f, %.3f],\n"), PlanePt.X, PlanePt.Y, PlanePt.Z);
@@ -397,15 +468,24 @@ static void SaveNormalFaces(
 	// Save faces PNG (FColor is BGRA in memory).
 	IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 	TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
+	bool bSavedPng = false;
 	if (IW.IsValid())
 	{
 		IW->SetRaw(Out.GetData(), Out.Num() * sizeof(FColor), W, H, ERGBFormat::BGRA, 8);
 		const TArray64<uint8>& Compressed = IW->GetCompressed();
-		FFileHelper::SaveArrayToFile(TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())), *FacesPngPath);
+		bSavedPng = FFileHelper::SaveArrayToFile(TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())), *FacesPngPath);
 	}
-	FFileHelper::SaveStringToFile(Json, *FacesJsonPath);
+	const bool bSavedJson = FFileHelper::SaveStringToFile(Json, *FacesJsonPath);
 
-	UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: %d planar face(s) -> %s"), NumFaces, *FacesJsonPath);
+	if (bSavedPng && bSavedJson)
+	{
+		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: %d planar face(s) with unique colors -> %s"), NumFaces, *FacesJsonPath);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save faces outputs png=%d json=%d (%s / %s)."), bSavedPng ? 1 : 0, bSavedJson ? 1 : 0, *FacesPngPath, *FacesJsonPath);
+	}
+	return bSavedPng && bSavedJson;
 }
 
 namespace FromLZActorMaterialId
@@ -1023,10 +1103,13 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 		if (CaptureDepthNormal(FaceDepth, FaceNormal))
 		{
 			const FString FacesBase = FPaths::Combine(FPaths::GetPath(OutputPath), FPaths::GetBaseFilename(OutputPath));
-			SaveNormalFaces(
+			if (!SaveNormalFaces(
 				FaceDepth, FaceNormal, Size.X, Size.Y, Camera,
 				/*bCaptureOrthographic*/ true, FromLZCaptureOrthoWidth,
-				FacesBase + TEXT("_faces.png"), FacesBase + TEXT("_faces.json"));
+				FacesBase + TEXT("_faces.png"), FacesBase + TEXT("_faces.json")))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save unique-color planar face outputs for %s."), *FacesBase);
+			}
 			FromLZActorMaterialId::SaveActorMaterialIdBuffer(
 				World,
 				Camera,

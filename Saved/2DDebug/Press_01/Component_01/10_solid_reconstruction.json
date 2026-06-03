@@ -1,54 +1,576 @@
 {
 	"component": "Component_01",
-	"action": "excavate",
-	"source_polygon_key": "cap_polygon",
-	"copied_polygon_key": "cap_polygon_translated_opposite",
-	"success": false,
-	"error": "Solid skipped because Step 10 did not select a source face: No 5% mask-overlap candidate passed the 10 degree normal-to-green-line parallel filter",
+	"action": "attach",
+	"source_polygon_key": "cap_polygon_translated",
+	"copied_polygon_key": "cap_polygon",
+	"success": true,
+	"error": "",
 	"warning": "",
 	"actor_name": "FromLZ_ReconstructedSolid_Press_01_Component_01",
-	"cap_width": 1720,
-	"cap_height": 1222,
-	"faces_width": 1720,
-	"faces_height": 1222,
-	"selected_source_face_id": -1,
-	"attach_material_id_lookup_attempted": false,
-	"attach_material_id_found": false,
+	"cap_width": 1716,
+	"cap_height": 1273,
+	"faces_width": 1716,
+	"faces_height": 1273,
+	"selected_source_face_id": 5,
+	"attach_material_id_lookup_attempted": true,
+	"attach_material_id_found": true,
 	"attach_material_id_error": "",
+	"attach_material_id_color_key": 3,
+	"attach_material_actor_name": "StaticMeshActor_2",
+	"attach_material_actor_path": "/Game/UEDPIE_0_Test1.Test1:PersistentLevel.StaticMeshActor_2",
+	"attach_material_component_name": "StaticMeshComponent0",
+	"attach_material_component_path": "/Game/UEDPIE_0_Test1.Test1:PersistentLevel.StaticMeshActor_2.StaticMeshComponent0",
+	"attach_material_slot": 0,
+	"attach_material_name": "BasicShapeMaterial",
+	"attach_material_path": "/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial",
+	"attach_material_vote_pixels": 1358,
+	"attach_material_considered_pixels": 1358,
+	"attach_material_vote_coverage": 1,
 	"source_plane_point": [
-		0,
-		0,
-		0
+		279.86700000000002,
+		-95.167000000000002,
+		310.12900000000002
 	],
 	"source_plane_normal": [
-		0,
-		0,
-		1
+		-0.00097999905880935588,
+		-0.00097999905880935588,
+		0.99999903960138359
 	],
 	"oriented_normal_source_to_copied": [
-		0,
-		0,
-		1
+		-0.00097999905880935588,
+		-0.00097999905880935588,
+		0.99999903960138359
 	],
 	"source_to_copied_vector_2d": [
-		0,
-		0
+		3,
+		-48
 	],
 	"projected_oriented_normal_2d": [
-		0,
-		0
+		0.00038402975674932827,
+		-0.99999992626057033
 	],
-	"extrusion_depth": 0,
-	"max_depth_sample_reprojection_error_pixels": 0,
-	"mean_copied_reprojection_error_pixels": 0,
-	"max_copied_reprojection_error_pixels": 0,
-	"depth_samples": [],
-	"source_loop_2d": [],
-	"copied_target_loop_2d": [],
-	"reprojected_source_loop_2d": [],
-	"reprojected_copied_loop_2d": [],
-	"source_loop_world": [],
-	"copied_loop_world": [],
-	"mesh_vertices_world": [],
-	"mesh_triangles": []
+	"extrusion_depth": 51.272122355613092,
+	"max_depth_sample_reprojection_error_pixels": 36.070243969233147,
+	"mean_copied_reprojection_error_pixels": 2.981566350457634,
+	"max_copied_reprojection_error_pixels": 2.9815663504577103,
+	"depth_samples": [
+		{
+			"index": 0,
+			"valid": true,
+			"error": "",
+			"source_pixel_2d": [
+				305,
+				465
+			],
+			"copied_pixel_2d": [
+				308,
+				417
+			],
+			"source_world": [
+				325.40287903082049,
+				-81.969789210044382,
+				310.18655842802434
+			],
+			"point_on_extrusion": [
+				325.35263239916884,
+				-82.020035841696043,
+				361.45863154196206
+			],
+			"point_on_copied_ray": [
+				325.35263239916884,
+				-82.020035841696043,
+				361.45863154196206
+			],
+			"depth": 51.272122355613092,
+			"closest_world_distance": 0,
+			"reprojection_error_pixels": 2.9815663504575394
+		},
+		{
+			"index": 1,
+			"valid": true,
+			"error": "",
+			"source_pixel_2d": [
+				384,
+				488
+			],
+			"copied_pixel_2d": [
+				387,
+				440
+			],
+			"source_world": [
+				245.42118908829337,
+				-77.059217486176863,
+				310.11298873217015
+			],
+			"point_on_extrusion": [
+				245.37094245664173,
+				-77.109464117828523,
+				361.38506184610787
+			],
+			"point_on_copied_ray": [
+				245.37094245664173,
+				-77.109464117828523,
+				361.38506184610787
+			],
+			"depth": 51.272122355613092,
+			"closest_world_distance": 0,
+			"reprojection_error_pixels": 2.9815663504577103
+		},
+		{
+			"index": 2,
+			"valid": true,
+			"error": "",
+			"source_pixel_2d": [
+				384,
+				482
+			],
+			"copied_pixel_2d": [
+				387,
+				434
+			],
+			"source_world": [
+				250.57447200833218,
+				-68.6738808226429,
+				310.12625657936206
+			],
+			"point_on_extrusion": [
+				250.52422537668053,
+				-68.72412745429456,
+				361.39832969329979
+			],
+			"point_on_copied_ray": [
+				250.52422537668053,
+				-68.72412745429456,
+				361.39832969329979
+			],
+			"depth": 51.272122355613092,
+			"closest_world_distance": 0,
+			"reprojection_error_pixels": 2.9815663504575962
+		},
+		{
+			"index": 3,
+			"valid": true,
+			"error": "",
+			"source_pixel_2d": [
+				366,
+				442
+			],
+			"copied_pixel_2d": [
+				369,
+				394
+			],
+			"source_world": [
+				298.65239903833117,
+				-21.214402485329515,
+				310.21988323662197
+			],
+			"point_on_extrusion": [
+				298.60215240667952,
+				-21.264649116981175,
+				361.49195635055969
+			],
+			"point_on_copied_ray": [
+				298.60215240667952,
+				-21.264649116981175,
+				361.49195635055969
+			],
+			"depth": 51.272122355613092,
+			"closest_world_distance": 0,
+			"reprojection_error_pixels": 2.9815663504576535
+		},
+		{
+			"index": 4,
+			"valid": true,
+			"error": "",
+			"source_pixel_2d": [
+				361,
+				442
+			],
+			"copied_pixel_2d": [
+				364,
+				394
+			],
+			"source_world": [
+				302.46426225029592,
+				-23.55961528706473,
+				310.22132055402415
+			],
+			"point_on_extrusion": [
+				302.41401561864427,
+				-23.609861918716391,
+				361.49339366796187
+			],
+			"point_on_copied_ray": [
+				302.41401561864427,
+				-23.609861918716391,
+				361.49339366796187
+			],
+			"depth": 51.272122355613092,
+			"closest_world_distance": 0,
+			"reprojection_error_pixels": 2.9815663504576535
+		},
+		{
+			"index": 5,
+			"valid": true,
+			"error": "",
+			"source_pixel_2d": [
+				304,
+				460
+			],
+			"copied_pixel_2d": [
+				307,
+				412
+			],
+			"source_world": [
+				330.45965410657914,
+				-75.451051217446548,
+				310.19790243083139
+			],
+			"point_on_extrusion": [
+				330.40940747492749,
+				-75.501297849098208,
+				361.46997554476911
+			],
+			"point_on_copied_ray": [
+				330.40940747492749,
+				-75.501297849098208,
+				361.46997554476911
+			],
+			"depth": 51.272122355613092,
+			"closest_world_distance": 0,
+			"reprojection_error_pixels": 2.9815663504576535
+		}
+	],
+	"source_loop_2d": [
+		[
+			305,
+			465
+		],
+		[
+			384,
+			488
+		],
+		[
+			384,
+			482
+		],
+		[
+			366,
+			442
+		],
+		[
+			361,
+			442
+		],
+		[
+			304,
+			460
+		]
+	],
+	"copied_target_loop_2d": [
+		[
+			308,
+			417
+		],
+		[
+			387,
+			440
+		],
+		[
+			387,
+			434
+		],
+		[
+			369,
+			394
+		],
+		[
+			364,
+			394
+		],
+		[
+			307,
+			412
+		]
+	],
+	"reprojected_source_loop_2d": [
+		[
+			305,
+			465.00000000000006
+		],
+		[
+			384.00000000000017,
+			488.00000000000011
+		],
+		[
+			383.99999999999994,
+			482.00000000000006
+		],
+		[
+			366,
+			442
+		],
+		[
+			361,
+			442
+		],
+		[
+			304,
+			460.00000000000006
+		]
+	],
+	"reprojected_copied_loop_2d": [
+		[
+			305.01843386940146,
+			416.9988549897999
+		],
+		[
+			384.01843386940129,
+			439.99885498979978
+		],
+		[
+			384.01843386940141,
+			433.99885498979984
+		],
+		[
+			366.01843386940135,
+			393.99885498979978
+		],
+		[
+			361.01843386940135,
+			393.99885498979972
+		],
+		[
+			304.01843386940135,
+			411.9988549897999
+		]
+	],
+	"source_loop_world": [
+		[
+			325.40287903082049,
+			-81.969789210044382,
+			310.18655842802434
+		],
+		[
+			245.42118908829337,
+			-77.059217486176863,
+			310.11298873217015
+		],
+		[
+			250.57447200833218,
+			-68.6738808226429,
+			310.12625657936206
+		],
+		[
+			298.65239903833117,
+			-21.214402485329515,
+			310.21988323662197
+		],
+		[
+			302.46426225029592,
+			-23.55961528706473,
+			310.22132055402415
+		],
+		[
+			330.45965410657914,
+			-75.451051217446548,
+			310.19790243083139
+		]
+	],
+	"copied_loop_world": [
+		[
+			325.35263239916884,
+			-82.020035841696043,
+			361.45863154196206
+		],
+		[
+			245.37094245664173,
+			-77.109464117828523,
+			361.38506184610787
+		],
+		[
+			250.52422537668053,
+			-68.72412745429456,
+			361.39832969329979
+		],
+		[
+			298.60215240667952,
+			-21.264649116981175,
+			361.49195635055969
+		],
+		[
+			302.41401561864427,
+			-23.609861918716391,
+			361.49339366796187
+		],
+		[
+			330.40940747492749,
+			-75.501297849098208,
+			361.46997554476911
+		]
+	],
+	"mesh_vertices_world": [
+		[
+			325.40287903082049,
+			-81.969789210044382,
+			310.18655842802434
+		],
+		[
+			245.42118908829337,
+			-77.059217486176863,
+			310.11298873217015
+		],
+		[
+			250.57447200833218,
+			-68.6738808226429,
+			310.12625657936206
+		],
+		[
+			298.65239903833117,
+			-21.214402485329515,
+			310.21988323662197
+		],
+		[
+			302.46426225029592,
+			-23.55961528706473,
+			310.22132055402415
+		],
+		[
+			330.45965410657914,
+			-75.451051217446548,
+			310.19790243083139
+		],
+		[
+			325.35263239916884,
+			-82.020035841696043,
+			361.45863154196206
+		],
+		[
+			245.37094245664173,
+			-77.109464117828523,
+			361.38506184610787
+		],
+		[
+			250.52422537668053,
+			-68.72412745429456,
+			361.39832969329979
+		],
+		[
+			298.60215240667952,
+			-21.264649116981175,
+			361.49195635055969
+		],
+		[
+			302.41401561864427,
+			-23.609861918716391,
+			361.49339366796187
+		],
+		[
+			330.40940747492749,
+			-75.501297849098208,
+			361.46997554476911
+		]
+	],
+	"mesh_triangles": [
+		[
+			5,
+			0,
+			1
+		],
+		[
+			5,
+			1,
+			2
+		],
+		[
+			5,
+			2,
+			3
+		],
+		[
+			3,
+			4,
+			5
+		],
+		[
+			11,
+			7,
+			6
+		],
+		[
+			11,
+			8,
+			7
+		],
+		[
+			11,
+			9,
+			8
+		],
+		[
+			9,
+			11,
+			10
+		],
+		[
+			0,
+			6,
+			7
+		],
+		[
+			0,
+			7,
+			1
+		],
+		[
+			1,
+			7,
+			8
+		],
+		[
+			1,
+			8,
+			2
+		],
+		[
+			2,
+			8,
+			9
+		],
+		[
+			2,
+			9,
+			3
+		],
+		[
+			3,
+			9,
+			10
+		],
+		[
+			3,
+			10,
+			4
+		],
+		[
+			4,
+			10,
+			11
+		],
+		[
+			4,
+			11,
+			5
+		],
+		[
+			5,
+			11,
+			6
+		],
+		[
+			5,
+			6,
+			0
+		]
+	]
 }

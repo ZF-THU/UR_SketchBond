@@ -1,0 +1,94 @@
+{
+	"component": "Component_03",
+	"action": "excavate",
+	"polygon_key": "cap_polygon",
+	"success": true,
+	"error": "",
+	"actor_name": "FromLZ_ReconstructedFace_Press_01_Component_03",
+	"cap_width": 1716,
+	"cap_height": 1273,
+	"faces_width": 1716,
+	"faces_height": 1273,
+	"cap_mask_pixels": 1752,
+	"min_overlap_pixels": 88,
+	"green_line_vector_2d": [
+		-0.93632917756904455,
+		0.3511234415883917
+	],
+	"green_line_vectors_2d": [
+		[
+			-0.93632917756904455,
+			0.3511234415883917
+		],
+		[
+			-0.44721359549995793,
+			0.89442719099991586
+		]
+	],
+	"normal_parallel_threshold_degrees": 30,
+	"selected_face_id": 4,
+	"selected_plane_hit_3d": [
+		287.25919067108447,
+		-140.17443897489125,
+		259.64019187120897
+	],
+	"candidates": [
+		{
+			"face_id": 4,
+			"overlap_pixels": 1752,
+			"overlap_ratio": 1,
+			"mask_centroid_2d": [
+				307.2591324200913,
+				554.68036529680364
+			],
+			"has_plane_hit": true,
+			"plane_hit_3d": [
+				287.25919067108447,
+				-140.17443897489125,
+				259.64019187120897
+			],
+			"distance_to_camera": 1037.3372608237842,
+			"has_projected_normal": true,
+			"projected_normal_2d": [
+				-0.74715006881307944,
+				0.66465538038340655
+			],
+			"normal_green_angle_degrees": 21.099847327565499,
+			"normal_parallel_pass": true
+		}
+	],
+	"mesh_vertices_world": [
+		[
+			230.86199999999999,
+			-140.06999999999999,
+			210.11199999999999
+		],
+		[
+			329.56099999999998,
+			-140.167,
+			210.76499999999999
+		],
+		[
+			329.50099999999998,
+			-140.26400000000001,
+			310.089
+		],
+		[
+			230.80199999999999,
+			-140.167,
+			309.43599999999998
+		]
+	],
+	"mesh_triangles": [
+		[
+			3,
+			0,
+			1
+		],
+		[
+			1,
+			2,
+			3
+		]
+	]
+}

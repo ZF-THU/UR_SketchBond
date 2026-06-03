@@ -37,7 +37,7 @@ namespace
 	const FName Step11ActionAttachTag(TEXT("FromLZ_Action_Attach"));
 	const FName Step11ActionExcavateCutterTag(TEXT("FromLZ_Action_ExcavateCutter"));
 	constexpr double MinOverlapRatio = 0.05;
-	constexpr double NormalParallelThresholdDegrees = 10.0;
+	constexpr double NormalParallelThresholdDegrees = 30.0;
 	constexpr double MinProjectedNormalPixels = 1.0;
 	constexpr double SolidCollinearTolerancePixels = 0.75;
 	constexpr double SolidRdpTolerancePixels = 1.25;
@@ -769,7 +769,7 @@ namespace
 		return !OutInputs.CaptureJsonPath.IsEmpty() && !OutInputs.FacesPngPath.IsEmpty() && !OutInputs.FacesJsonPath.IsEmpty();
 	}
 
-	static void BuildFaceLookups(FCommonInputs& Inputs)
+	static bool BuildFaceLookups(FCommonInputs& Inputs, FString& OutError)
 	{
 		Inputs.FaceIndexById.Reset();
 		Inputs.FaceIdByColorKey.Reset();
@@ -777,8 +777,17 @@ namespace
 		{
 			const FFaceInfo& Face = Inputs.Faces[i];
 			Inputs.FaceIndexById.Add(Face.Id, i);
-			Inputs.FaceIdByColorKey.Add(ColorKey(Face.Color.R, Face.Color.G, Face.Color.B), Face.Id);
+			const uint32 Key = ColorKey(Face.Color.R, Face.Color.G, Face.Color.B);
+			if (const int32* ExistingFaceId = Inputs.FaceIdByColorKey.Find(Key))
+			{
+				OutError = FString::Printf(
+					TEXT("Duplicate face color in faces.json/faces.png; recapture required (color_rgb=[%d,%d,%d], face_id=%d conflicts with face_id=%d)."),
+					Face.Color.R, Face.Color.G, Face.Color.B, Face.Id, *ExistingFaceId);
+				return false;
+			}
+			Inputs.FaceIdByColorKey.Add(Key, Face.Id);
 		}
+		return true;
 	}
 
 	static double PolygonArea2D(const TArray<FVector2D>& Poly)
@@ -2692,7 +2701,9 @@ namespace
 			}
 			else if (ParallelFaceIds.Num() == 0)
 			{
-				Result.Error = TEXT("No 5% mask-overlap candidate passed the 10 degree normal-to-green-line parallel filter");
+				Result.Error = FString::Printf(
+					TEXT("No 5%% mask-overlap candidate passed the %.1f degree normal-to-green-line parallel filter"),
+					NormalParallelThresholdDegrees);
 			}
 			else
 			{
@@ -5657,7 +5668,13 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
 		return;
 	}
-	BuildFaceLookups(Inputs);
+	FString FaceLookupError;
+	if (!BuildFaceLookups(Inputs, FaceLookupError))
+	{
+		SaveCommonFailureForComponents(ComponentNames, PressDir, FaceLookupError);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		return;
+	}
 
 	FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 
