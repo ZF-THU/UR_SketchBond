@@ -1,0 +1,21 @@
+{
+  "candidate_count": 1,
+  "selected_count": 1,
+  "candidates": [
+  {
+    "index": 0,
+    "source": "local_black",
+    "priority": 1,
+    "anchor_stroke_id": 10,
+    "selected": true,
+    "reason": "selected",
+    "edge_count": 12,
+    "used_black": true,
+    "stroke_ids": [2, 3, 4, 6, 9, 10, 11, 14, 15, 16, 42, 47],
+    "red_stroke_ids": [10, 11, 14, 15, 16, 42],
+    "real_red_stroke_ids": [10, 11, 14, 15, 16, 42],
+    "synthetic_stroke_ids": [],
+    "black_stroke_ids": [2, 3, 4, 6, 9, 47]
+  }
+  ]
+}

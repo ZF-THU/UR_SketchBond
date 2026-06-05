@@ -38,6 +38,7 @@ namespace
 	const FName Step11ActionExcavateCutterTag(TEXT("FromLZ_Action_ExcavateCutter"));
 	constexpr double MinOverlapRatio = 0.05;
 	constexpr double NormalParallelThresholdDegrees = 30.0;
+	constexpr double PreferredNormalAngleThresholdDegrees = 10.0;
 	constexpr double MinProjectedNormalPixels = 1.0;
 	constexpr double SolidCollinearTolerancePixels = 0.75;
 	constexpr double SolidRdpTolerancePixels = 1.25;
@@ -1362,26 +1363,6 @@ namespace
 		}
 	}
 
-	static bool BuildOppositeTranslatedPolygon(
-		const TArray<FVector2D>& SourcePolygon,
-		const TArray<FVector2D>& TranslatedPolygon,
-		TArray<FVector2D>& OutOppositePolygon)
-	{
-		OutOppositePolygon.Reset();
-		if (SourcePolygon.Num() != TranslatedPolygon.Num() || SourcePolygon.Num() < 3)
-		{
-			return false;
-		}
-
-		OutOppositePolygon.Reserve(SourcePolygon.Num());
-		for (int32 i = 0; i < SourcePolygon.Num(); ++i)
-		{
-			const FVector2D Offset = TranslatedPolygon[i] - SourcePolygon[i];
-			OutOppositePolygon.Add(SourcePolygon[i] - Offset);
-		}
-		return true;
-	}
-
 	static bool IsNearlyCollinear2D(const FVector2D& Prev, const FVector2D& Cur, const FVector2D& Next)
 	{
 		const FVector2D A = Cur - Prev;
@@ -2033,6 +2014,7 @@ namespace
 			Root->SetArrayField(TEXT("green_line_vectors_2d"), GreenVectors);
 		}
 		Root->SetNumberField(TEXT("normal_parallel_threshold_degrees"), NormalParallelThresholdDegrees);
+		Root->SetNumberField(TEXT("preferred_normal_angle_threshold_degrees"), PreferredNormalAngleThresholdDegrees);
 		Root->SetNumberField(TEXT("selected_face_id"), Result.SelectedFaceId);
 		Root->SetArrayField(TEXT("selected_plane_hit_3d"), JsonVector(Result.SelectedPlaneHit)->AsArray());
 
@@ -2340,6 +2322,7 @@ namespace
 		Result.CopiedLoopWorld.Reserve(Result.SourceLoopWorld.Num());
 		for (const FVector& P : Result.SourceLoopWorld)
 		{
+
 			Result.CopiedLoopWorld.Add(P + Result.OrientedNormal * Result.ExtrusionDepth);
 		}
 
@@ -2457,7 +2440,7 @@ namespace
 		{
 			Result.PolygonKey = TEXT("cap_polygon");
 			Result.Solid.SourcePolygonKey = TEXT("cap_polygon");
-			Result.Solid.CopiedPolygonKey = TEXT("cap_polygon_translated_opposite");
+			Result.Solid.CopiedPolygonKey = TEXT("cap_polygon_translated");
 		}
 		else if (Result.Action == TEXT("attach"))
 		{
@@ -2526,8 +2509,8 @@ namespace
 		}
 		Result.GreenLineVector2D = ScaledSideVector.GetSafeNormal();
 
-		// All green lines connected to this cap (mapped to faces image space). The
-		// parallel filter below passes a face if its normal aligns with ANY of these.
+		// Selected green side vector(s) mapped to faces image space. The parallel
+		// filter below passes a face if its normal aligns with any provided vector.
 		// Scaling is per-axis (ScaleX != ScaleY rotates the vector), so map then normalize.
 		TArray<FVector2D> RawSideVectors;
 		ParseVector2DArray(CapJson, TEXT("side_vectors"), RawSideVectors);
@@ -2658,15 +2641,43 @@ namespace
 			return A.FaceId < B.FaceId;
 		});
 
-		double BestDistance = TNumericLimits<double>::Max();
+		int32 PreferredFaceId = -1;
+		FVector PreferredPlaneHit = FVector::ZeroVector;
+		double BestPreferredDistance = TNumericLimits<double>::Max();
+		int32 FallbackFaceId = -1;
+		FVector FallbackPlaneHit = FVector::ZeroVector;
+		double BestFallbackDistance = TNumericLimits<double>::Max();
 		for (const FFaceCandidate& Candidate : Result.Candidates)
 		{
-			if (Candidate.bHasPlaneHit && Candidate.bNormalParallelPass && Candidate.DistanceToCamera < BestDistance)
+			if (!Candidate.bHasPlaneHit || !Candidate.bNormalParallelPass)
 			{
-				BestDistance = Candidate.DistanceToCamera;
-				Result.SelectedFaceId = Candidate.FaceId;
-				Result.SelectedPlaneHit = Candidate.PlaneHit;
+				continue;
 			}
+
+			if (Candidate.DistanceToCamera < BestFallbackDistance)
+			{
+				BestFallbackDistance = Candidate.DistanceToCamera;
+				FallbackFaceId = Candidate.FaceId;
+				FallbackPlaneHit = Candidate.PlaneHit;
+			}
+
+			if (Candidate.NormalGreenAngleDegrees < PreferredNormalAngleThresholdDegrees &&
+				Candidate.DistanceToCamera < BestPreferredDistance)
+			{
+				BestPreferredDistance = Candidate.DistanceToCamera;
+				PreferredFaceId = Candidate.FaceId;
+				PreferredPlaneHit = Candidate.PlaneHit;
+			}
+		}
+		if (PreferredFaceId >= 0)
+		{
+			Result.SelectedFaceId = PreferredFaceId;
+			Result.SelectedPlaneHit = PreferredPlaneHit;
+		}
+		else if (FallbackFaceId >= 0)
+		{
+			Result.SelectedFaceId = FallbackFaceId;
+			Result.SelectedPlaneHit = FallbackPlaneHit;
 		}
 
 		TSet<int32> CandidateIds;
@@ -2761,24 +2772,8 @@ namespace
 			return Result;
 		}
 
-		TArray<FVector2D> OppositeTranslatedPolygon;
 		const TArray<FVector2D>& SolidSourcePoly = Result.Action == TEXT("excavate") ? RawCapPolygon : RawTranslatedPolygon;
-		const TArray<FVector2D>* SolidCopiedPoly = nullptr;
-		if (Result.Action == TEXT("excavate"))
-		{
-			if (!BuildOppositeTranslatedPolygon(RawCapPolygon, RawTranslatedPolygon, OppositeTranslatedPolygon))
-			{
-				SaveSkippedSolidResult(
-					Result.Solid, SolidJson,
-					TEXT("Solid skipped because cap_polygon and cap_polygon_translated cannot form the inward excavation loop"));
-				return Result;
-			}
-			SolidCopiedPoly = &OppositeTranslatedPolygon;
-		}
-		else
-		{
-			SolidCopiedPoly = &RawCapPolygon;
-		}
+		const TArray<FVector2D>& SolidCopiedPoly = Result.Action == TEXT("excavate") ? RawTranslatedPolygon : RawCapPolygon;
 
 		Result.Solid = BuildSolidReconstruction(
 			ComponentName,
@@ -2791,7 +2786,7 @@ namespace
 			ScaleX,
 			ScaleY,
 			SolidSourcePoly,
-			*SolidCopiedPoly,
+			SolidCopiedPoly,
 			SelectedFace,
 			Inputs);
 		if (Result.Solid.bSuccess && Result.Action.Equals(TEXT("attach"), ESearchCase::IgnoreCase) && HasActorMaterialIdBuffer(Inputs))

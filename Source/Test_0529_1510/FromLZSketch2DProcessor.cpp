@@ -212,12 +212,11 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 	FromLZImageOps::SaveMaskPng(EnclosedMask, Width, Height, PressDir / TEXT("08_enclosed_mask.png"), /*bInvertForDisplay*/ true);
 
 	// ---- Step 9: per-component red cap-loops -> per-component side -> translate-copy --
-	// Each connected red(+nearby black) component is one Component_%%: its cap loop is found
-	// (red-only, or bridged by black), the longest green near it is the extrusion side, and
-	// the cap is translate-copied along the side vector. Components are processed in parallel.
+	// Red-driven cap loops are found with explicit red/black endpoint connector strokes
+	// (20px search radius), then the longest green near each cap gives the copy side.
 	TArray<FromLZImageOps::FCapExtrusionResult> Caps;
 	const int32 NumCaps = FromLZImageOps::RecoverCapExtrusionsPerComponent(
-		Merged, /*NodeTol*/ 20.0f, /*BlackSelectTol*/ 50.0f, Width, Height, PressDir, ActionPressDir, Caps);
+		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 50.0f, Width, Height, PressDir, ActionPressDir, Caps);
 
 	// ---- Step 10: per-component action -> face-mask overlap -> runtime face rebuild --
 	FFromLZFaceReconstructor::ProcessPress(PressDir, ActionPressDir, World);

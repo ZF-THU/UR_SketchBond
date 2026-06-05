@@ -48,7 +48,7 @@ namespace
 		return 0;
 	}
 
-	static FString QuantizedVertexKey(const FVector3d& Position)
+	static FString ManifoldQuantizedVertexKey(const FVector3d& Position)
 	{
 		const int64 X = FMath::RoundToInt64(Position.X / ManifoldWeldToleranceCm);
 		const int64 Y = FMath::RoundToInt64(Position.Y / ManifoldWeldToleranceCm);
@@ -146,7 +146,7 @@ namespace
 				return false;
 			}
 
-			const FString Key = QuantizedVertexKey(V);
+			const FString Key = ManifoldQuantizedVertexKey(V);
 			if (const int32* Existing = WeldedVertexByPosition.Find(Key))
 			{
 				ManifoldToDynamic[int32(VertexIndex)] = *Existing;

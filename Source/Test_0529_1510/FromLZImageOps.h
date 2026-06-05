@@ -136,16 +136,17 @@ namespace FromLZImageOps
 		double InteriorGreenInsideRatio = 0.0;
 		double InteriorGreenInsideLength = 0.0;
 		double InteriorGreenStrokeLength = 0.0;
-		TArray<int32> CapStrokeIds;       // input-stroke indices forming the cap loop
+		TArray<int32> CapStrokeIds;       // source/connector stroke indices forming the cap loop
+		FString CandidateSource;          // red_only, local_black, or fallback_trace
+		int32 CandidateAnchorStrokeId = -1;
 		int32 SideStrokeId = -1;          // longest green stroke used as the extrusion side
-		FVector2D SideVector = FVector2D::ZeroVector; // green chord vector (end - start)
+		FVector2D SideVector = FVector2D::ZeroVector; // selected green chord from cap endpoint to copy endpoint
 		FStroke CapPolygon;               // ordered closed loop points
 		FStroke CapPolygonTranslated;     // CapPolygon + SideVector
 		TArray<FVector2D> CapNodes;       // ordered loop vertices (junction points)
 
-		// Every green stroke connected to this cap (chord vectors + endpoint segments,
-		// each oriented away from the cap centre). Step 10 tests the candidate-face
-		// normal against ALL of these; passing any one is enough.
+		// Selected green side stroke (chord vector + endpoint segment), oriented from
+		// the endpoint closest to the cap boundary toward the copied cap.
 		TArray<FVector2D> SideCandidateVectors;  // chord vectors (end - start)
 		TArray<FVector2D> SideCandidateStarts;   // chord start (near-cap end)
 		TArray<FVector2D> SideCandidateEnds;     // chord end (far-from-cap end)
@@ -153,19 +154,17 @@ namespace FromLZImageOps
 
 	// Step 9: detect every red cap loop in one pipeline run and recover its extrusion.
 	// Strokes are already split at every junction/crossing during step-7 tracing, so loops
-	// close purely through shared endpoints. The candidate graph (all red + black whose
-	// endpoint is within BlackSelectTol of a red vertex) is split into connected components;
-	// each component is one "Component" (red strokes sharing edges are grouped together). For
-	// each component a cap loop is searched (red-only first, else red + surviving black via
-	// smallest red-anchored cycle), the longest green stroke near that component is used as
-	// the extrusion side (falling back to the globally longest green), and the cap is
-	// translate-copied along it. Components are processed in parallel; each writes its
-	// 09a/09b/09 debug into PressDir/Component_%%/. For each cap an Action.json is written to
-	// ActionPressDir/Component_%%/: "excavate" when a non-side green stroke lies inside the cap
-	// polygon (partial green counts), otherwise "attach". Returns the number of caps found and
-	// fills OutResults (one per Component_%%, in folder order). NodeTol clusters endpoints
-	// into shared loop nodes (Python --cap-loop-endpoint-tol).
-	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float NodeTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults);
+	// close purely through shared endpoints. Components are red-driven: red-only loops are
+	// selected first, remaining red candidates trace through all black strokes only to close
+	// their own endpoints, and a final fallback may combine remaining red strokes through the
+	// same all-black endpoint graph. Black strokes never define the initial component split.
+	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
+	// an Action.json is written to ActionPressDir/Component_%%/: "excavate" when one of that
+	// component's local green strokes lies inside the cap polygon, otherwise "attach". Returns
+	// the number of caps found and fills OutResults (one per Component_%%, in folder order). ConnectorTol searches
+	// red/black endpoints for explicit connector strokes; graph nodes then snap only very near
+	// coincident endpoints instead of silently clustering by the full connector radius.
+	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float ConnectorTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults);
 
 	// Debug render of the recovered extrusion: cap loop, translated cap, and side connectors.
 	bool SaveCapExtrusionPng(const TArray<FColoredStroke>& Strokes, const FCapExtrusionResult& Res, int32 Width, int32 Height, const FString& Path, int32 Thickness = 2);

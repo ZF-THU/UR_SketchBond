@@ -1,6 +1,7 @@
 #include "FromLZCaptureUtils.h"
 
 #include "Camera/CameraComponent.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Dom/JsonObject.h"
@@ -880,12 +881,256 @@ namespace FromLZActorMaterialId
 	}
 }
 
+static bool SaveFColorPng(const TArray<FColor>& Pixels, int32 W, int32 H, const FString& OutputPath, const TCHAR* DebugName)
+{
+	if (W <= 0 || H <= 0 || Pixels.Num() != W * H)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: invalid %s debug png buffer (%dx%d, pixels=%d)."), DebugName, W, H, Pixels.Num());
+		return false;
+	}
+
+	IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+	TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
+	if (!IW.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to create image wrapper for %s debug png."), DebugName);
+		return false;
+	}
+
+	IW->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor), W, H, ERGBFormat::BGRA, 8);
+	const TArray64<uint8>& Compressed = IW->GetCompressed();
+	const bool bSaved = FFileHelper::SaveArrayToFile(
+		TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())),
+		*OutputPath);
+
+	if (bSaved)
+	{
+		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: saved %s debug png to %s"), DebugName, *OutputPath);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save %s debug png to %s"), DebugName, *OutputPath);
+	}
+	return bSaved;
+}
+
+static bool CaptureViewportDebugPng(const FString& OutputPath)
+{
+	if (!GEngine || !GEngine->GameViewport || !GEngine->GameViewport->Viewport)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: viewport debug png failed because GameViewport is unavailable."));
+		return false;
+	}
+
+	FViewport* Viewport = GEngine->GameViewport->Viewport;
+	const FIntPoint Size = Viewport->GetSizeXY();
+	if (Size.X <= 0 || Size.Y <= 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: viewport debug png failed because viewport size is invalid (%dx%d)."), Size.X, Size.Y);
+		return false;
+	}
+
+	TArray<FColor> Pixels;
+	FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
+	if (!Viewport->ReadPixels(Pixels, ReadFlags) || Pixels.Num() != Size.X * Size.Y)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: viewport debug png failed to read pixels (%dx%d, pixels=%d)."), Size.X, Size.Y, Pixels.Num());
+		return false;
+	}
+
+	for (FColor& Pixel : Pixels)
+	{
+		Pixel.A = 255;
+	}
+	return SaveFColorPng(Pixels, Size.X, Size.Y, OutputPath, TEXT("viewport"));
+}
+
+static bool CaptureFromLZCameraDebugPng(const APawn* Pawn, const UCameraComponent* Camera, const FString& OutputPath)
+{
+	if (!Pawn || !Camera)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed because pawn or camera is null."));
+		return false;
+	}
+
+	UWorld* World = Pawn->GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed because world is null."));
+		return false;
+	}
+
+	FIntPoint Size(1920, 1080);
+	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
+	{
+		Size = GEngine->GameViewport->Viewport->GetSizeXY();
+	}
+	if (Size.X <= 0 || Size.Y <= 0)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed because capture size is invalid (%dx%d)."), Size.X, Size.Y);
+		return false;
+	}
+
+	UTextureRenderTarget2D* ColorRT = NewObject<UTextureRenderTarget2D>(GetTransientPackage(), NAME_None, RF_Transient);
+	ColorRT->RenderTargetFormat = RTF_RGBA8;
+	ColorRT->ClearColor = FLinearColor::Black;
+	ColorRT->bAutoGenerateMips = false;
+	ColorRT->InitAutoFormat(Size.X, Size.Y);
+	ColorRT->UpdateResourceImmediate(true);
+	ColorRT->AddToRoot();
+
+	USceneCaptureComponent2D* SCC = NewObject<USceneCaptureComponent2D>(const_cast<APawn*>(Pawn), NAME_None, RF_Transient);
+	SCC->bCaptureEveryFrame = false;
+	SCC->bCaptureOnMovement = false;
+	SCC->bAlwaysPersistRenderingState = true;
+	SCC->SetWorldTransform(Camera->GetComponentTransform());
+	SCC->ProjectionType = ECameraProjectionMode::Orthographic;
+	SCC->FOVAngle = Camera->FieldOfView;
+	SCC->OrthoWidth = FromLZCaptureOrthoWidth;
+	SCC->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	SCC->TextureTarget = ColorRT;
+	SCC->RegisterComponentWithWorld(World);
+	SCC->CaptureScene();
+
+	FlushRenderingCommands();
+
+	TArray<FColor> Pixels;
+	FTextureRenderTargetResource* Resource = ColorRT->GameThread_GetRenderTargetResource();
+	const bool bReadOk = Resource && Resource->ReadPixels(Pixels) && Pixels.Num() == Size.X * Size.Y;
+	for (FColor& Pixel : Pixels)
+	{
+		Pixel.A = 255;
+	}
+
+	const bool bSaved = bReadOk && SaveFColorPng(Pixels, Size.X, Size.Y, OutputPath, TEXT("FromLZ camera"));
+	if (!bReadOk)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed to read render target (%dx%d, pixels=%d)."), Size.X, Size.Y, Pixels.Num());
+	}
+
+	SCC->UnregisterComponent();
+	SCC->DestroyComponent();
+	ColorRT->RemoveFromRoot();
+	return bSaved;
+}
+
+static TSharedRef<FJsonObject> SerializeTransformDelta(const FTransform& From, const FTransform& To)
+{
+	TSharedRef<FJsonObject> DeltaObject = MakeShared<FJsonObject>();
+
+	const FVector LocationDelta = To.GetLocation() - From.GetLocation();
+	const FRotator RotationDelta = (To.Rotator() - From.Rotator()).GetNormalized();
+	const FVector ScaleDelta = To.GetScale3D() - From.GetScale3D();
+
+	DeltaObject->SetNumberField(TEXT("location_delta_x"), LocationDelta.X);
+	DeltaObject->SetNumberField(TEXT("location_delta_y"), LocationDelta.Y);
+	DeltaObject->SetNumberField(TEXT("location_delta_z"), LocationDelta.Z);
+	DeltaObject->SetNumberField(TEXT("location_distance"), LocationDelta.Size());
+	DeltaObject->SetNumberField(TEXT("pitch_delta"), RotationDelta.Pitch);
+	DeltaObject->SetNumberField(TEXT("yaw_delta"), RotationDelta.Yaw);
+	DeltaObject->SetNumberField(TEXT("roll_delta"), RotationDelta.Roll);
+	DeltaObject->SetNumberField(TEXT("scale_delta_x"), ScaleDelta.X);
+	DeltaObject->SetNumberField(TEXT("scale_delta_y"), ScaleDelta.Y);
+	DeltaObject->SetNumberField(TEXT("scale_delta_z"), ScaleDelta.Z);
+
+	return DeltaObject;
+}
+
+static bool AreViewPosesNearlyEqual(const FTransform& A, const FTransform& B)
+{
+	const FVector LocationDelta = B.GetLocation() - A.GetLocation();
+	const FRotator RotationDelta = (B.Rotator() - A.Rotator()).GetNormalized();
+	constexpr double LocationTolerance = 0.01;
+	constexpr double RotationToleranceDeg = 0.01;
+
+	return LocationDelta.Size() <= LocationTolerance &&
+		FMath::Abs(RotationDelta.Pitch) <= RotationToleranceDeg &&
+		FMath::Abs(RotationDelta.Yaw) <= RotationToleranceDeg &&
+		FMath::Abs(RotationDelta.Roll) <= RotationToleranceDeg;
+}
+
+static bool TryGetPlayerCameraManagerTransform(const APawn* Pawn, FTransform& OutTransform)
+{
+	if (!Pawn)
+	{
+		return false;
+	}
+
+	const APlayerController* PlayerController = Cast<APlayerController>(Pawn->GetController());
+	if (!PlayerController || !PlayerController->PlayerCameraManager)
+	{
+		return false;
+	}
+
+	OutTransform = FTransform(
+		PlayerController->PlayerCameraManager->GetCameraRotation(),
+		PlayerController->PlayerCameraManager->GetCameraLocation(),
+		FVector::OneVector);
+	return true;
+}
+
+static bool SaveDebugViewTransforms(
+	const APawn* Pawn,
+	const UCameraComponent* Camera,
+	const USceneCaptureComponent2D* SceneCapture,
+	const FString& OutputPath)
+{
+	if (!Pawn || !Camera || !SceneCapture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: debug transform json failed because pawn/camera/scene capture is null."));
+		return false;
+	}
+
+	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	RootObject->SetStringField(TEXT("debug_type"), TEXT("enter_view_transforms"));
+	RootObject->SetStringField(TEXT("json_path"), OutputPath);
+	RootObject->SetStringField(TEXT("scene_capture_context"), TEXT("CaptureLineArtPng"));
+	RootObject->SetStringField(TEXT("player_camera_manager_source"), TEXT("PlayerCameraManager->GetCameraLocation/Rotation"));
+	RootObject->SetStringField(TEXT("fromlz_component_source"), TEXT("FromLZ->GetComponentTransform()"));
+	RootObject->SetStringField(TEXT("scene_capture_source"), TEXT("SceneCapture->GetComponentTransform()"));
+
+	FTransform PlayerCameraManagerTransform;
+	const bool bHasPlayerCameraManager = TryGetPlayerCameraManagerTransform(Pawn, PlayerCameraManagerTransform);
+	const FTransform FromLZTransform = Camera->GetComponentTransform();
+	const FTransform SceneCaptureTransform = SceneCapture->GetComponentTransform();
+
+	RootObject->SetBoolField(TEXT("player_camera_manager_available"), bHasPlayerCameraManager);
+	if (bHasPlayerCameraManager)
+	{
+		RootObject->SetObjectField(TEXT("player_camera_manager_transform"), FFromLZCaptureUtils::SerializeTransform(PlayerCameraManagerTransform));
+	}
+	RootObject->SetObjectField(TEXT("fromlz_component_transform"), FFromLZCaptureUtils::SerializeTransform(FromLZTransform));
+	RootObject->SetObjectField(TEXT("scene_capture_transform"), FFromLZCaptureUtils::SerializeTransform(SceneCaptureTransform));
+
+	RootObject->SetBoolField(TEXT("scene_capture_matches_fromlz_component_pose"), AreViewPosesNearlyEqual(FromLZTransform, SceneCaptureTransform));
+	RootObject->SetObjectField(TEXT("scene_capture_minus_fromlz_component"), SerializeTransformDelta(FromLZTransform, SceneCaptureTransform));
+
+	if (bHasPlayerCameraManager)
+	{
+		RootObject->SetBoolField(TEXT("player_camera_manager_matches_fromlz_component_pose"), AreViewPosesNearlyEqual(PlayerCameraManagerTransform, FromLZTransform));
+		RootObject->SetBoolField(TEXT("scene_capture_matches_player_camera_manager_pose"), AreViewPosesNearlyEqual(PlayerCameraManagerTransform, SceneCaptureTransform));
+		RootObject->SetObjectField(TEXT("fromlz_component_minus_player_camera_manager"), SerializeTransformDelta(PlayerCameraManagerTransform, FromLZTransform));
+		RootObject->SetObjectField(TEXT("scene_capture_minus_player_camera_manager"), SerializeTransformDelta(PlayerCameraManagerTransform, SceneCaptureTransform));
+	}
+
+	const bool bSaved = FFromLZCaptureUtils::SaveJsonToFile(RootObject, OutputPath);
+	if (bSaved)
+	{
+		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: saved debug view transforms to %s"), *OutputPath);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save debug view transforms to %s"), *OutputPath);
+	}
+	return bSaved;
+}
+
 // Renders scene depth and world-normal to off-screen render targets on the GPU,
 // then runs a CPU Sobel edge-detection pass to produce a white background with
 // black contour/crease lines (depth discontinuity = silhouette/occlusion edges,
 // normal discontinuity = surface creases). Occlusion is handled naturally because
 // the detection works in screen space on the rendered buffers.
-static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera, const FString& OutputPath)
+static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera, const FString& OutputPath, const FString& DebugTransformsJsonPath)
 {
 	UWorld* World = Pawn->GetWorld();
 	if (!World)
@@ -928,6 +1173,7 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 	SCC->FOVAngle = Camera->FieldOfView;
 	SCC->OrthoWidth = FromLZCaptureOrthoWidth;
 	SCC->RegisterComponentWithWorld(World);
+	SaveDebugViewTransforms(Pawn, Camera, SCC, DebugTransformsJsonPath);
 
 	// Restrict the capture to actors whose name starts with "Cube" so that the
 	// ground plane, sky and other background geometry never enter the line-art
@@ -1156,6 +1402,9 @@ bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
 	const FString BaseFilename = FString::Printf(TEXT("FromLZ_%s"), *Timestamp);
 	const FString JsonPath = CaptureDirectory / (BaseFilename + TEXT(".json"));
 	const FString PngPath = CaptureDirectory / (BaseFilename + TEXT(".png"));
+	const FString DebugViewportPngPath = CaptureDirectory / (BaseFilename + TEXT("_debug_viewport.png"));
+	const FString DebugFromLZCameraPngPath = CaptureDirectory / (BaseFilename + TEXT("_debug_fromlz_camera.png"));
+	const FString DebugTransformsJsonPath = CaptureDirectory / (BaseFilename + TEXT("_debug_transforms.json"));
 	const FString ActorMaterialPngPath = CaptureDirectory / (BaseFilename + TEXT("_actor_material_id.png"));
 	const FString ActorMaterialJsonPath = CaptureDirectory / (BaseFilename + TEXT("_actor_material_id.json"));
 
@@ -1163,6 +1412,9 @@ bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
 	RootObject->SetStringField(TEXT("capture_timestamp"), Timestamp);
 	RootObject->SetStringField(TEXT("json_path"), JsonPath);
 	RootObject->SetStringField(TEXT("png_path"), PngPath);
+	RootObject->SetStringField(TEXT("debug_viewport_png_path"), DebugViewportPngPath);
+	RootObject->SetStringField(TEXT("debug_fromlz_camera_png_path"), DebugFromLZCameraPngPath);
+	RootObject->SetStringField(TEXT("debug_transforms_json_path"), DebugTransformsJsonPath);
 	RootObject->SetStringField(TEXT("actor_material_png_path"), ActorMaterialPngPath);
 	RootObject->SetStringField(TEXT("actor_material_json_path"), ActorMaterialJsonPath);
 	RootObject->SetObjectField(TEXT("pawn"), SerializeObjectProperties(Pawn));
@@ -1192,7 +1444,10 @@ bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
 		return false;
 	}
 
-	if (CaptureLineArtPng(Pawn, CameraComponent, PngPath))
+	CaptureViewportDebugPng(DebugViewportPngPath);
+	CaptureFromLZCameraDebugPng(Pawn, CameraComponent, DebugFromLZCameraPngPath);
+
+	if (CaptureLineArtPng(Pawn, CameraComponent, PngPath, DebugTransformsJsonPath))
 	{
 		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ saved json to %s and line-art png to %s"), *JsonPath, *PngPath);
 	}

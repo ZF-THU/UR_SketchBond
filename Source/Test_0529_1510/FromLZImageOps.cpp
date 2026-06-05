@@ -2370,13 +2370,15 @@ namespace FromLZImageOps
 	// ====================================================================
 	namespace CapOps
 	{
-		// Union-find clustering of endpoints within NodeTol into shared loop nodes.
+		// Endpoint graph. Real gaps are bridged by explicit connector strokes first;
+		// this snap tolerance is only for nearly coincident endpoints.
 		struct FGraph
 		{
 			TArray<int32> NodeU;   // per edge: start node
 			TArray<int32> NodeV;   // per edge: end node
 			TArray<int32> StrokeId;// per edge: index into the source stroke array
 			TArray<uint8> bBlack;  // per edge: 1 if black, 0 if red
+			TArray<uint8> bSynthetic; // per edge: 1 if generated connector stroke
 			TArray<FVector2D> NodePos; // representative position per node
 			int32 NumNodes = 0;
 		};
@@ -2391,9 +2393,10 @@ namespace FromLZImageOps
 			return X;
 		}
 
-		// Build a graph over the given edge strokes (by index into Strokes), clustering
-		// their endpoints with NodeTol.
-		void BuildGraph(const TArray<FColoredStroke>& Strokes, const TArray<int32>& EdgeStrokes, float NodeTol, FGraph& G)
+		// Build a graph over the given edge strokes (by index into Strokes), snapping
+		// only nearly coincident endpoints. Wider red/black gaps are represented by
+		// explicit connector strokes before this graph is built.
+		void BuildGraph(const TArray<FColoredStroke>& Strokes, const TArray<int32>& EdgeStrokes, float NodeSnapTol, int32 FirstSyntheticStrokeId, FGraph& G)
 		{
 			const int32 E = EdgeStrokes.Num();
 			TArray<FVector2D> Pts; // 2 endpoints per edge
@@ -2412,7 +2415,7 @@ namespace FromLZImageOps
 			{
 				Parent[i] = i;
 			}
-			const double Tol2 = double(NodeTol) * double(NodeTol);
+			const double Tol2 = double(NodeSnapTol) * double(NodeSnapTol);
 			for (int32 i = 0; i < NP; ++i)
 			{
 				for (int32 j = i + 1; j < NP; ++j)
@@ -2453,6 +2456,7 @@ namespace FromLZImageOps
 				G.NodeV.Add(V);
 				G.StrokeId.Add(EdgeStrokes[e]);
 				G.bBlack.Add(Strokes[EdgeStrokes[e]].Color == EStrokeColor::Black ? 1 : 0);
+				G.bSynthetic.Add(EdgeStrokes[e] >= FirstSyntheticStrokeId ? 1 : 0);
 			}
 			G.NumNodes = Accum.Num();
 			G.NodePos.SetNumUninitialized(G.NumNodes);
@@ -2625,7 +2629,8 @@ namespace FromLZImageOps
 			}
 		}
 
-		// Render a graph: red edges in red, black edges in black, nodes as blue squares.
+		// Render a graph: real red/black edges keep their source colors; synthetic
+		// connector edges are orange (red connector) or gray (black connector).
 		// Only edges with Kept[e]!=0 are drawn (pass an all-ones array to draw everything).
 		bool SaveGraphPng(const TArray<FColoredStroke>& Strokes, const FGraph& G, const TArray<uint8>& Kept,
 			int32 Width, int32 Height, const FString& Path)
@@ -2642,9 +2647,10 @@ namespace FromLZImageOps
 			for (int32 e = 0; e < G.StrokeId.Num(); ++e)
 			{
 				if (!Kept.IsValidIndex(e) || !Kept[e]) { continue; }
-				const uint8 r = G.bBlack[e] ? 0 : 220;
-				const uint8 g = G.bBlack[e] ? 0 : 20;
-				const uint8 b = G.bBlack[e] ? 0 : 60;
+				const bool bSynthetic = G.bSynthetic.IsValidIndex(e) && G.bSynthetic[e] != 0;
+				const uint8 r = bSynthetic ? (G.bBlack[e] ? 120 : 255) : (G.bBlack[e] ? 0 : 220);
+				const uint8 g = bSynthetic ? (G.bBlack[e] ? 120 : 140) : (G.bBlack[e] ? 0 : 20);
+				const uint8 b = bSynthetic ? (G.bBlack[e] ? 120 : 0) : (G.bBlack[e] ? 0 : 60);
 				const FStroke& SP = Strokes[G.StrokeId[e]].Points;
 				for (int32 k = 0; k + 1 < SP.Num(); ++k)
 				{
@@ -2688,9 +2694,11 @@ namespace FromLZImageOps
 			for (int32 e = 0; e < E; ++e)
 			{
 				const bool bKept = Kept.IsValidIndex(e) && Kept[e] != 0;
-				Json += FString::Printf(TEXT("    {\"stroke_id\": %d, \"u\": %d, \"v\": %d, \"color\": \"%s\", \"kept\": %s}%s\n"),
+				const bool bSynthetic = G.bSynthetic.IsValidIndex(e) && G.bSynthetic[e] != 0;
+				Json += FString::Printf(TEXT("    {\"stroke_id\": %d, \"u\": %d, \"v\": %d, \"color\": \"%s\", \"synthetic\": %s, \"kept\": %s}%s\n"),
 					G.StrokeId[e], G.NodeU[e], G.NodeV[e],
 					G.bBlack[e] ? TEXT("black") : TEXT("red"),
+					bSynthetic ? TEXT("true") : TEXT("false"),
 					bKept ? TEXT("true") : TEXT("false"),
 					(e + 1 < E ? TEXT(",") : TEXT("")));
 			}
@@ -2699,125 +2707,524 @@ namespace FromLZImageOps
 		}
 	} // namespace CapOps
 
-	// Detect a single cap loop within a subset of strokes (one connected component).
-	// Phase 1 tries a red-only loop; phase 2 prunes dangling black branches and takes the
-	// smallest red-anchored cycle over red + surviving black. Writes 09a/09b graph debug into
-	// CompDir when non-empty. Does NOT compute the green side / translation.
-	static bool DetectCapLoopOnSubset(
+	static constexpr float CapLoopGraphNodeSnapTol = 3.0f;
+
+	struct FCapEndpointRef
+	{
+		int32 StrokeId = -1;
+		int32 EndpointIndex = 0;
+		FVector2D Pos = FVector2D::ZeroVector;
+		EStrokeColor Color = EStrokeColor::None;
+	};
+
+	static uint64 EndpointPairKey(const FCapEndpointRef& A, const FCapEndpointRef& B)
+	{
+		const uint32 AKey = static_cast<uint32>(A.StrokeId * 2 + A.EndpointIndex);
+		const uint32 BKey = static_cast<uint32>(B.StrokeId * 2 + B.EndpointIndex);
+		const uint32 Lo = FMath::Min(AKey, BKey);
+		const uint32 Hi = FMath::Max(AKey, BKey);
+		return (static_cast<uint64>(Lo) << 32) | static_cast<uint64>(Hi);
+	}
+
+	static void BuildEndpointConnectorAugmentedStrokes(
+		const TArray<FColoredStroke>& SourceStrokes,
+		const TArray<int32>& RedIdx,
+		const TArray<int32>& BlackIdx,
+		float ConnectorTol,
+		TArray<FColoredStroke>& OutStrokes,
+		int32& OutFirstSyntheticStrokeId)
+	{
+		OutStrokes = SourceStrokes;
+		OutFirstSyntheticStrokeId = OutStrokes.Num();
+
+		TArray<FCapEndpointRef> Endpoints;
+		Endpoints.Reserve((RedIdx.Num() + BlackIdx.Num()) * 2);
+		auto AddStrokeEndpoints = [&](int32 StrokeId)
+		{
+			if (!SourceStrokes.IsValidIndex(StrokeId))
+			{
+				return;
+			}
+			const FColoredStroke& S = SourceStrokes[StrokeId];
+			if (S.Points.Num() < 2)
+			{
+				return;
+			}
+			FCapEndpointRef Start;
+			Start.StrokeId = StrokeId;
+			Start.EndpointIndex = 0;
+			Start.Pos = S.Points[0];
+			Start.Color = S.Color;
+			Endpoints.Add(Start);
+
+			FCapEndpointRef End;
+			End.StrokeId = StrokeId;
+			End.EndpointIndex = 1;
+			End.Pos = S.Points.Last();
+			End.Color = S.Color;
+			Endpoints.Add(End);
+		};
+		for (int32 r : RedIdx) { AddStrokeEndpoints(r); }
+		for (int32 b : BlackIdx) { AddStrokeEndpoints(b); }
+
+		const double Tol2 = double(ConnectorTol) * double(ConnectorTol);
+		const double SnapTol2 = double(CapLoopGraphNodeSnapTol) * double(CapLoopGraphNodeSnapTol);
+		TSet<uint64> AddedPairs;
+		for (int32 i = 0; i < Endpoints.Num(); ++i)
+		{
+			int32 Best = INDEX_NONE;
+			double BestD2 = TNumericLimits<double>::Max();
+			for (int32 j = 0; j < Endpoints.Num(); ++j)
+			{
+				if (i == j || Endpoints[i].StrokeId == Endpoints[j].StrokeId)
+				{
+					continue;
+				}
+				const double D2 = FVector2D::DistSquared(Endpoints[i].Pos, Endpoints[j].Pos);
+				if (D2 <= Tol2 && D2 < BestD2)
+				{
+					BestD2 = D2;
+					Best = j;
+				}
+			}
+			if (Best == INDEX_NONE || BestD2 <= SnapTol2)
+			{
+				continue;
+			}
+
+			const uint64 PairKey = EndpointPairKey(Endpoints[i], Endpoints[Best]);
+			if (AddedPairs.Contains(PairKey))
+			{
+				continue;
+			}
+			AddedPairs.Add(PairKey);
+
+			const FVector2D A = Endpoints[i].Pos;
+			const FVector2D B = Endpoints[Best].Pos;
+			const double Dist = FMath::Sqrt(BestD2);
+			FColoredStroke Connector;
+			Connector.Points.Add(A);
+			Connector.Points.Add(B);
+			Connector.Color = (Endpoints[i].Color == EStrokeColor::Black && Endpoints[Best].Color == EStrokeColor::Black)
+				? EStrokeColor::Black
+				: EStrokeColor::Red;
+			Connector.ConnectionPointCount = Connector.Points.Num();
+			Connector.bHasMetrics = true;
+			Connector.Arc = Dist;
+			Connector.Chord = Dist;
+			Connector.Straightness = 1.0;
+			Connector.P90PcaError = 0.0;
+			Connector.PcaRmsError = 0.0;
+			Connector.P90ChordDev = 0.0;
+			Connector.ChordDevRatio = 0.0;
+			Connector.Direction = Dist > KINDA_SMALL_NUMBER ? (B - A) / Dist : FVector2D::ZeroVector;
+			OutStrokes.Add(Connector);
+		}
+	}
+
+	struct FLoopCandidate
+	{
+		FString Source;
+		FString Key;
+		FString RejectReason;
+		int32 Priority = 0;
+		int32 AnchorStrokeId = -1;
+		int32 EdgeCount = 0;
+		TArray<int32> StrokeIds;
+		TArray<int32> RedStrokeIds;
+		TArray<int32> RealRedStrokeIds;
+		TArray<int32> BlackStrokeIds;
+		TArray<int32> SyntheticStrokeIds;
+		FCapExtrusionResult Result;
+		bool bSelected = false;
+	};
+
+	static void SortUniqueInts(TArray<int32>& Values)
+	{
+		Values.Sort();
+		for (int32 i = Values.Num() - 1; i > 0; --i)
+		{
+			if (Values[i] == Values[i - 1])
+			{
+				Values.RemoveAt(i);
+			}
+		}
+	}
+
+	static FString JoinInts(const TArray<int32>& Values)
+	{
+		FString Out;
+		for (int32 i = 0; i < Values.Num(); ++i)
+		{
+			Out += FString::Printf(TEXT("%s%d"), (i == 0 ? TEXT("") : TEXT(",")), Values[i]);
+		}
+		return Out;
+	}
+
+	static FString StrokeSetKey(TArray<int32> StrokeIds)
+	{
+		SortUniqueInts(StrokeIds);
+		return JoinInts(StrokeIds);
+	}
+
+	static double PolygonAbsArea(const FStroke& Poly)
+	{
+		if (Poly.Num() < 3)
+		{
+			return 0.0;
+		}
+		double Sum = 0.0;
+		for (int32 i = 0; i < Poly.Num(); ++i)
+		{
+			const FVector2D& A = Poly[i];
+			const FVector2D& B = Poly[(i + 1) % Poly.Num()];
+			Sum += A.X * B.Y - B.X * A.Y;
+		}
+		return FMath::Abs(0.5 * Sum);
+	}
+
+	static bool IsValidLoopPolygon(const FStroke& Poly)
+	{
+		return Poly.Num() >= 4 && PolygonAbsArea(Poly) > 1.0;
+	}
+
+	static bool MakeLoopCandidateFromCycle(
 		const TArray<FColoredStroke>& Strokes,
-		const TArray<int32>& RedSub, const TArray<int32>& BlackSub,
-		float NodeTol, int32 Width, int32 Height,
-		const FString& CompDir, FCapExtrusionResult& Out)
+		const CapOps::FGraph& G,
+		const TArray<int32>& Cycle,
+		const TCHAR* Source,
+		int32 Priority,
+		int32 AnchorStrokeId,
+		FLoopCandidate& Out)
 	{
 		using namespace CapOps;
-		Out = FCapExtrusionResult();
-		if (RedSub.Num() == 0)
+		Out = FLoopCandidate();
+		if (Cycle.Num() < 2)
 		{
 			return false;
 		}
 
-		// ============================ Phase 1: red only ============================
+		Out.Source = Source;
+		Out.Priority = Priority;
+		Out.AnchorStrokeId = AnchorStrokeId;
+		Out.EdgeCount = Cycle.Num();
+		Out.Result = FCapExtrusionResult();
+		Out.Result.bFound = true;
+		Out.Result.CandidateSource = Source;
+		Out.Result.CandidateAnchorStrokeId = AnchorStrokeId;
+
+		for (int32 e : Cycle)
 		{
-			FGraph Gr;
-			BuildGraph(Strokes, RedSub, NodeTol, Gr);
-			TArray<uint8> AllUsable;  AllUsable.Init(1, Gr.StrokeId.Num());
-			TArray<uint8> AllRed;     AllRed.Init(1, Gr.StrokeId.Num());
-			TArray<int32> Cycle;
-			if (FindRedCycle(Gr, AllRed, AllUsable, Cycle))
+			if (!G.StrokeId.IsValidIndex(e))
 			{
-				Out.bFound = true;
-				Out.bUsedBlack = false;
-				for (int32 e : Cycle) { Out.CapStrokeIds.Add(Gr.StrokeId[e]); }
-				BuildPolygon(Strokes.GetData(), Gr, Cycle, Out.CapPolygon, Out.CapNodes);
-				if (!CompDir.IsEmpty())
-				{
-					TArray<uint8> All; All.Init(1, Gr.StrokeId.Num());
-					SaveGraphPng(Strokes, Gr, All, Width, Height, CompDir / TEXT("09a_caploop_candidate.png"));
-					SaveGraphJson(Strokes, Gr, All, CompDir / TEXT("09a_caploop_candidate_graph.json"));
-					SaveGraphPng(Strokes, Gr, All, Width, Height, CompDir / TEXT("09b_caploop_pruned.png"));
-					SaveGraphJson(Strokes, Gr, All, CompDir / TEXT("09b_caploop_pruned_graph.json"));
-				}
-				return true;
+				return false;
 			}
-		}
-
-		// ================== Phase 2: red + this component's black ==================
-		// Build the candidate graph over all red + this component's black, mark red edges.
-		TArray<int32> Edges2 = RedSub;
-		Edges2.Append(BlackSub);
-		FGraph G2;
-		BuildGraph(Strokes, Edges2, NodeTol, G2);
-		const int32 E2 = G2.StrokeId.Num();
-
-		TArray<uint8> bRed2; bRed2.Init(0, E2);
-		for (int32 e = 0; e < E2; ++e)
-		{
-			bRed2[e] = G2.bBlack[e] ? 0 : 1;
-		}
-
-		if (!CompDir.IsEmpty())
-		{
-			TArray<uint8> All; All.Init(1, E2);
-			SaveGraphPng(Strokes, G2, All, Width, Height, CompDir / TEXT("09a_caploop_candidate.png"));
-			SaveGraphJson(Strokes, G2, All, CompDir / TEXT("09a_caploop_candidate_graph.json"));
-		}
-
-		// 2d. iteratively prune dangling black branches (degree-1 black edges). Red is kept.
-		TArray<uint8> Kept; Kept.Init(1, E2);
-		for (;;)
-		{
-			TArray<int32> Deg; Deg.Init(0, G2.NumNodes);
-			for (int32 e = 0; e < E2; ++e)
+			const int32 StrokeId = G.StrokeId[e];
+			const bool bSynthetic = G.bSynthetic.IsValidIndex(e) && G.bSynthetic[e] != 0;
+			Out.StrokeIds.Add(StrokeId);
+			Out.Result.CapStrokeIds.Add(StrokeId);
+			if (bSynthetic)
 			{
-				if (!Kept[e]) { continue; }
-				Deg[G2.NodeU[e]] += 1;
-				Deg[G2.NodeV[e]] += 1;
+				Out.SyntheticStrokeIds.Add(StrokeId);
 			}
-			bool bChanged = false;
-			for (int32 e = 0; e < E2; ++e)
+			if (G.bBlack[e])
 			{
-				if (!Kept[e] || !G2.bBlack[e]) { continue; }
-				if (Deg[G2.NodeU[e]] <= 1 || Deg[G2.NodeV[e]] <= 1)
+				Out.BlackStrokeIds.Add(StrokeId);
+			}
+			else
+			{
+				Out.RedStrokeIds.Add(StrokeId);
+				if (!bSynthetic)
 				{
-					Kept[e] = 0;
-					bChanged = true;
+					Out.RealRedStrokeIds.Add(StrokeId);
 				}
 			}
-			if (!bChanged) { break; }
+		}
+		SortUniqueInts(Out.StrokeIds);
+		SortUniqueInts(Out.RedStrokeIds);
+		SortUniqueInts(Out.RealRedStrokeIds);
+		SortUniqueInts(Out.BlackStrokeIds);
+		SortUniqueInts(Out.SyntheticStrokeIds);
+		if (Out.RealRedStrokeIds.Num() == 0)
+		{
+			return false;
 		}
 
-		if (!CompDir.IsEmpty())
+		Out.Result.bUsedBlack = Out.BlackStrokeIds.Num() > 0;
+		BuildPolygon(Strokes.GetData(), G, Cycle, Out.Result.CapPolygon, Out.Result.CapNodes);
+		if (!IsValidLoopPolygon(Out.Result.CapPolygon))
 		{
-			SaveGraphPng(Strokes, G2, Kept, Width, Height, CompDir / TEXT("09b_caploop_pruned.png"));
-			SaveGraphJson(Strokes, G2, Kept, CompDir / TEXT("09b_caploop_pruned_graph.json"));
+			return false;
 		}
+		Out.Key = StrokeSetKey(Out.StrokeIds);
+		return !Out.Key.IsEmpty();
+	}
 
-		// 2e. find the smallest cycle anchored on a red edge, traversing red strokes plus
-		// the surviving (non-spur) black strokes. Red tails/spurs hang off the loop and are
-		// simply not part of the smallest cycle, so they are ignored automatically.
-		// Step-7 strokes are already split at every junction/crossing during tracing, so the
-		// loop closes purely through shared endpoints (no mid-segment intersection needed).
-		TArray<uint8> Usable; Usable.Init(0, E2);
-		for (int32 e = 0; e < E2; ++e)
+	static void AddUniqueCandidate(TArray<FLoopCandidate>& Candidates, TSet<FString>& SeenKeys, const FLoopCandidate& Candidate)
+	{
+		if (SeenKeys.Contains(Candidate.Key))
 		{
-			Usable[e] = (bRed2[e] || Kept[e]) ? 1 : 0; // all red + surviving black
+			return;
 		}
+		SeenKeys.Add(Candidate.Key);
+		Candidates.Add(Candidate);
+	}
 
-		TArray<int32> Cycle;
-		if (FindRedCycle(G2, bRed2, Usable, Cycle))
+	static void CollectCycleCandidatesFromGraph(
+		const TArray<FColoredStroke>& Strokes,
+		const CapOps::FGraph& G,
+		const TCHAR* Source,
+		int32 Priority,
+		bool bRequireBlack,
+		TArray<FLoopCandidate>& Candidates,
+		TSet<FString>& SeenKeys)
+	{
+		using namespace CapOps;
+		TArray<uint8> EdgeUsable;
+		EdgeUsable.Init(1, G.StrokeId.Num());
+		for (int32 e = 0; e < G.StrokeId.Num(); ++e)
 		{
-			Out.bFound = true;
-			Out.bUsedBlack = false;
-			for (int32 e : Cycle)
+			if (G.bBlack[e])
 			{
-				Out.CapStrokeIds.Add(G2.StrokeId[e]);
-				if (G2.bBlack[e]) { Out.bUsedBlack = true; }
+				continue;
 			}
-			BuildPolygon(Strokes.GetData(), G2, Cycle, Out.CapPolygon, Out.CapNodes);
-			return true;
+			if (G.NodeU[e] == G.NodeV[e])
+			{
+				continue;
+			}
+
+			TArray<int32> Path;
+			if (!BfsPath(G, G.NodeU[e], G.NodeV[e], /*ExcludeEdge*/ e, EdgeUsable, Path))
+			{
+				continue;
+			}
+			TArray<int32> Cycle = Path;
+			Cycle.Add(e);
+
+			FLoopCandidate Candidate;
+			if (!MakeLoopCandidateFromCycle(Strokes, G, Cycle, Source, Priority, G.StrokeId[e], Candidate))
+			{
+				continue;
+			}
+			if (bRequireBlack && Candidate.BlackStrokeIds.Num() == 0)
+			{
+				continue;
+			}
+			AddUniqueCandidate(Candidates, SeenKeys, Candidate);
+		}
+	}
+
+	static void GroupRedStrokeComponents(
+		const TArray<FColoredStroke>& Strokes,
+		const TArray<int32>& RedIdx,
+		float NodeSnapTol,
+		int32 FirstSyntheticStrokeId,
+		TArray<TArray<int32>>& OutGroups)
+	{
+		using namespace CapOps;
+		OutGroups.Reset();
+		if (RedIdx.Num() == 0)
+		{
+			return;
 		}
 
-		return false;
+		FGraph G;
+		BuildGraph(Strokes, RedIdx, NodeSnapTol, FirstSyntheticStrokeId, G);
+		if (G.NumNodes <= 0)
+		{
+			return;
+		}
+
+		TArray<int32> Parent;
+		Parent.SetNumUninitialized(G.NumNodes);
+		for (int32 n = 0; n < G.NumNodes; ++n)
+		{
+			Parent[n] = n;
+		}
+		for (int32 e = 0; e < G.StrokeId.Num(); ++e)
+		{
+			Parent[Find(Parent, G.NodeV[e])] = Find(Parent, G.NodeU[e]);
+		}
+
+		TMap<int32, int32> GroupByRoot;
+		for (int32 e = 0; e < G.StrokeId.Num(); ++e)
+		{
+			const int32 Root = Find(Parent, G.NodeU[e]);
+			int32 GroupIndex = INDEX_NONE;
+			if (int32* Existing = GroupByRoot.Find(Root))
+			{
+				GroupIndex = *Existing;
+			}
+			else
+			{
+				GroupIndex = OutGroups.Num();
+				GroupByRoot.Add(Root, GroupIndex);
+				OutGroups.AddDefaulted();
+			}
+			OutGroups[GroupIndex].Add(G.StrokeId[e]);
+		}
+
+		for (TArray<int32>& Group : OutGroups)
+		{
+			SortUniqueInts(Group);
+		}
+	}
+
+	static void CollectRedFirstLoopCandidates(
+		const TArray<FColoredStroke>& Strokes,
+		const TArray<int32>& RedIdx,
+		const TArray<int32>& BlackIdx,
+		float NodeSnapTol,
+		int32 FirstSyntheticStrokeId,
+		TArray<FLoopCandidate>& OutCandidates)
+	{
+		using namespace CapOps;
+		OutCandidates.Reset();
+		TSet<FString> SeenKeys;
+
+		// Phase 1: all red-only endpoint cycles. These get first selection priority.
+		{
+			FGraph RedGraph;
+			BuildGraph(Strokes, RedIdx, NodeSnapTol, FirstSyntheticStrokeId, RedGraph);
+			CollectCycleCandidatesFromGraph(
+				Strokes, RedGraph, TEXT("red_only"), /*Priority*/ 0, /*bRequireBlack*/ false,
+				OutCandidates, SeenKeys);
+		}
+
+		// Phase 2: each red-only component closes its own endpoints through the global black pool.
+		TArray<TArray<int32>> RedGroups;
+		GroupRedStrokeComponents(Strokes, RedIdx, NodeSnapTol, FirstSyntheticStrokeId, RedGroups);
+		for (const TArray<int32>& RedGroup : RedGroups)
+		{
+			TArray<int32> EdgeIds = RedGroup;
+			EdgeIds.Append(BlackIdx);
+			FGraph LocalGraph;
+			BuildGraph(Strokes, EdgeIds, NodeSnapTol, FirstSyntheticStrokeId, LocalGraph);
+			CollectCycleCandidatesFromGraph(
+				Strokes, LocalGraph, TEXT("local_black"), /*Priority*/ 1, /*bRequireBlack*/ true,
+				OutCandidates, SeenKeys);
+		}
+
+		// Phase 3: fallback trace over all remaining-style red combinations plus all black.
+		// Selection happens later, so red conflicts with stronger candidates will be rejected.
+		{
+			TArray<int32> EdgeIds = RedIdx;
+			EdgeIds.Append(BlackIdx);
+			FGraph FallbackGraph;
+			BuildGraph(Strokes, EdgeIds, NodeSnapTol, FirstSyntheticStrokeId, FallbackGraph);
+			CollectCycleCandidatesFromGraph(
+				Strokes, FallbackGraph, TEXT("fallback_trace"), /*Priority*/ 2, /*bRequireBlack*/ false,
+				OutCandidates, SeenKeys);
+		}
+	}
+
+	static void SelectLoopCandidates(TArray<FLoopCandidate>& Candidates, TArray<int32>& OutSelectedIndices)
+	{
+		OutSelectedIndices.Reset();
+		TArray<int32> Order;
+		Order.Reserve(Candidates.Num());
+		for (int32 i = 0; i < Candidates.Num(); ++i)
+		{
+			Order.Add(i);
+			Candidates[i].bSelected = false;
+			Candidates[i].RejectReason.Reset();
+		}
+
+		Order.Sort([&Candidates](int32 AIndex, int32 BIndex)
+		{
+			const FLoopCandidate& A = Candidates[AIndex];
+			const FLoopCandidate& B = Candidates[BIndex];
+			if (A.Priority != B.Priority) { return A.Priority < B.Priority; }
+			if (A.BlackStrokeIds.Num() != B.BlackStrokeIds.Num()) { return A.BlackStrokeIds.Num() < B.BlackStrokeIds.Num(); }
+			if (A.EdgeCount != B.EdgeCount) { return A.EdgeCount < B.EdgeCount; }
+			if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
+			if (A.AnchorStrokeId != B.AnchorStrokeId) { return A.AnchorStrokeId < B.AnchorStrokeId; }
+			return FCString::Strcmp(*A.Key, *B.Key) < 0;
+		});
+
+		TSet<int32> ConsumedRedStrokes;
+		for (int32 CandidateIndex : Order)
+		{
+			FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			int32 ConflictingRed = -1;
+			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+			{
+				if (ConsumedRedStrokes.Contains(RedStrokeId))
+				{
+					ConflictingRed = RedStrokeId;
+					break;
+				}
+			}
+			if (ConflictingRed >= 0)
+			{
+				Candidate.RejectReason = FString::Printf(TEXT("red stroke %d already selected by a stronger loop"), ConflictingRed);
+				continue;
+			}
+
+			Candidate.bSelected = true;
+			Candidate.RejectReason = TEXT("selected");
+			OutSelectedIndices.Add(CandidateIndex);
+			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+			{
+				ConsumedRedStrokes.Add(RedStrokeId);
+			}
+		}
+	}
+
+	static FString JsonEscaped(FString Text)
+	{
+		Text.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+		Text.ReplaceInline(TEXT("\""), TEXT("\\\""));
+		return Text;
+	}
+
+	static void AppendIntArrayJson(FString& Json, const TCHAR* Key, const TArray<int32>& Values, bool bTrailingComma)
+	{
+		Json += FString::Printf(TEXT("    \"%s\": ["), Key);
+		for (int32 i = 0; i < Values.Num(); ++i)
+		{
+			Json += FString::Printf(TEXT("%s%d"), (i == 0 ? TEXT("") : TEXT(", ")), Values[i]);
+		}
+		Json += bTrailingComma ? TEXT("],\n") : TEXT("]\n");
+	}
+
+	static bool SaveLoopCandidatesJson(const TArray<FLoopCandidate>& Candidates, const FString& Path)
+	{
+		FString Json;
+		Json += TEXT("{\n");
+		Json += FString::Printf(TEXT("  \"candidate_count\": %d,\n"), Candidates.Num());
+		int32 SelectedCount = 0;
+		for (const FLoopCandidate& Candidate : Candidates)
+		{
+			if (Candidate.bSelected)
+			{
+				++SelectedCount;
+			}
+		}
+		Json += FString::Printf(TEXT("  \"selected_count\": %d,\n"), SelectedCount);
+		Json += TEXT("  \"candidates\": [\n");
+		for (int32 i = 0; i < Candidates.Num(); ++i)
+		{
+			const FLoopCandidate& C = Candidates[i];
+			Json += TEXT("  {\n");
+			Json += FString::Printf(TEXT("    \"index\": %d,\n"), i);
+			Json += FString::Printf(TEXT("    \"source\": \"%s\",\n"), *JsonEscaped(C.Source));
+			Json += FString::Printf(TEXT("    \"priority\": %d,\n"), C.Priority);
+			Json += FString::Printf(TEXT("    \"anchor_stroke_id\": %d,\n"), C.AnchorStrokeId);
+			Json += FString::Printf(TEXT("    \"selected\": %s,\n"), C.bSelected ? TEXT("true") : TEXT("false"));
+			Json += FString::Printf(TEXT("    \"reason\": \"%s\",\n"), *JsonEscaped(C.RejectReason));
+			Json += FString::Printf(TEXT("    \"edge_count\": %d,\n"), C.EdgeCount);
+			Json += FString::Printf(TEXT("    \"used_black\": %s,\n"), C.BlackStrokeIds.Num() > 0 ? TEXT("true") : TEXT("false"));
+			AppendIntArrayJson(Json, TEXT("stroke_ids"), C.StrokeIds, true);
+			AppendIntArrayJson(Json, TEXT("red_stroke_ids"), C.RedStrokeIds, true);
+			AppendIntArrayJson(Json, TEXT("real_red_stroke_ids"), C.RealRedStrokeIds, true);
+			AppendIntArrayJson(Json, TEXT("synthetic_stroke_ids"), C.SyntheticStrokeIds, true);
+			AppendIntArrayJson(Json, TEXT("black_stroke_ids"), C.BlackStrokeIds, false);
+			Json += FString::Printf(TEXT("  }%s\n"), (i + 1 < Candidates.Num() ? TEXT(",") : TEXT("")));
+		}
+		Json += TEXT("  ]\n");
+		Json += TEXT("}\n");
+		return FFileHelper::SaveStringToFile(Json, *Path);
 	}
 
 	// Even-odd ray-cast point-in-polygon test (polygon is the closed cap loop).
@@ -2917,28 +3324,60 @@ namespace FromLZImageOps
 		return Stats.InsideLength >= InteriorGreenMinInsideLengthPx;
 	}
 
-	// Pick the longest green among GreenCandidates as the extrusion side and translate-copy
-	// the cap along it (away from the cap centre).
-	static void ApplyGreenSideForCap(const TArray<FColoredStroke>& Strokes, const TArray<int32>& GreenCandidates, FCapExtrusionResult& Out)
+	static double DistancePointToSegmentSquared2D(const FVector2D& P, const FVector2D& A, const FVector2D& B)
 	{
-		// Cap centre, used to orient every green chord away from the cap.
-		FVector2D CapCenter = FVector2D::ZeroVector;
+		const FVector2D AB = B - A;
+		const double LenSq = AB.SizeSquared();
+		if (LenSq <= 1e-12)
 		{
-			const TArray<FVector2D>& Ref = (Out.CapNodes.Num() > 0) ? Out.CapNodes : Out.CapPolygon;
-			for (const FVector2D& P : Ref) { CapCenter += P; }
-			if (Ref.Num() > 0) { CapCenter /= double(Ref.Num()); }
+			return (P - A).SizeSquared();
 		}
 
+		const double T = FMath::Clamp(FVector2D::DotProduct(P - A, AB) / LenSq, 0.0, 1.0);
+		return (P - (A + AB * T)).SizeSquared();
+	}
+
+	static double DistancePointToPolylineSquared(const FVector2D& P, const FStroke& Poly)
+	{
+		if (Poly.Num() == 0)
+		{
+			return TNumericLimits<double>::Max();
+		}
+		if (Poly.Num() == 1)
+		{
+			return (P - Poly[0]).SizeSquared();
+		}
+
+		double Best = TNumericLimits<double>::Max();
+		for (int32 i = 0; i + 1 < Poly.Num(); ++i)
+		{
+			Best = FMath::Min(Best, DistancePointToSegmentSquared2D(P, Poly[i], Poly[i + 1]));
+		}
+		if (Poly.Num() > 2 && (Poly[0] - Poly.Last()).SizeSquared() > 1e-6)
+		{
+			Best = FMath::Min(Best, DistancePointToSegmentSquared2D(P, Poly.Last(), Poly[0]));
+		}
+		return Best;
+	}
+
+	// Pick the longest green among GreenCandidates as the extrusion side and
+	// translate-copy the cap from the green endpoint closest to the cap boundary.
+	static void ApplyGreenSideForCap(const TArray<FColoredStroke>& Strokes, const TArray<int32>& GreenCandidates, FCapExtrusionResult& Out)
+	{
 		Out.SideCandidateVectors.Reset();
 		Out.SideCandidateStarts.Reset();
 		Out.SideCandidateEnds.Reset();
+		Out.SideStrokeId = -1;
+		Out.SideVector = FVector2D::ZeroVector;
 
 		int32 BestGreen = -1;
+		double BestChordSq = -1.0;
 		double BestArc = -1.0;
 		for (int32 g : GreenCandidates)
 		{
 			const FStroke& P = Strokes[g].Points;
 			if (P.Num() < 2) { continue; }
+			const double ChordSq = (P.Last() - P[0]).SizeSquared();
 			double Arc = Strokes[g].Arc;
 			if (!Strokes[g].bHasMetrics)
 			{
@@ -2946,40 +3385,57 @@ namespace FromLZImageOps
 				for (int32 k = 1; k < P.Num(); ++k) { Arc += (P[k] - P[k - 1]).Size(); }
 			}
 
-			// Record this connected green's chord (oriented away from the cap centre)
-			// so step 10 can test the face normal against every green, not just the longest.
-			const double DistToStart = FVector2D::DistSquared(P[0], CapCenter);
-			const double DistToEnd = FVector2D::DistSquared(P.Last(), CapCenter);
-			const FVector2D Start = (DistToStart <= DistToEnd) ? P[0] : P.Last();
-			const FVector2D End = (DistToStart <= DistToEnd) ? P.Last() : P[0];
-			Out.SideCandidateStarts.Add(Start);
-			Out.SideCandidateEnds.Add(End);
-			Out.SideCandidateVectors.Add(End - Start);
-
-			if (Arc > BestArc) { BestArc = Arc; BestGreen = g; }
+			if (ChordSq > BestChordSq || (FMath::IsNearlyEqual(ChordSq, BestChordSq) && Arc > BestArc))
+			{
+				BestChordSq = ChordSq;
+				BestArc = Arc;
+				BestGreen = g;
+			}
 		}
 		if (BestGreen >= 0 && Strokes[BestGreen].Points.Num() >= 2)
 		{
 			const FStroke& GP = Strokes[BestGreen].Points;
 			Out.SideStrokeId = BestGreen;
-			const double DistToStart = FVector2D::DistSquared(GP[0], CapCenter);
-			const double DistToEnd = FVector2D::DistSquared(GP.Last(), CapCenter);
-			Out.SideVector = (DistToStart <= DistToEnd) ? (GP.Last() - GP[0]) : (GP[0] - GP.Last());
+			const double DistToStart = DistancePointToPolylineSquared(GP[0], Out.CapPolygon);
+			const double DistToEnd = DistancePointToPolylineSquared(GP.Last(), Out.CapPolygon);
+			const FVector2D CapEndpoint = (DistToStart <= DistToEnd) ? GP[0] : GP.Last();
+			const FVector2D CopyEndpoint = (DistToStart <= DistToEnd) ? GP.Last() : GP[0];
+			Out.SideVector = CopyEndpoint - CapEndpoint;
+			Out.SideCandidateStarts.Add(CapEndpoint);
+			Out.SideCandidateEnds.Add(CopyEndpoint);
+			Out.SideCandidateVectors.Add(Out.SideVector);
 		}
 		Out.CapPolygonTranslated.Reset();
 		Out.CapPolygonTranslated.Reserve(Out.CapPolygon.Num());
 		for (const FVector2D& P : Out.CapPolygon) { Out.CapPolygonTranslated.Add(P + Out.SideVector); }
 	}
 
-	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float NodeTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults)
+	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float ConnectorTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults)
 	{
 		using namespace CapOps;
 		OutResults.Reset();
 
-		TArray<int32> RedIdx, BlackIdx, GreenIdx;
+		TArray<int32> SourceRedIdx, SourceBlackIdx;
 		for (int32 i = 0; i < Strokes.Num(); ++i)
 		{
 			switch (Strokes[i].Color)
+			{
+			case EStrokeColor::Red:   SourceRedIdx.Add(i); break;
+			case EStrokeColor::Black: SourceBlackIdx.Add(i); break;
+			default: break;
+			}
+		}
+
+		TArray<FColoredStroke> TraceStrokes;
+		int32 FirstSyntheticStrokeId = Strokes.Num();
+		BuildEndpointConnectorAugmentedStrokes(
+			Strokes, SourceRedIdx, SourceBlackIdx, ConnectorTol,
+			TraceStrokes, FirstSyntheticStrokeId);
+
+		TArray<int32> RedIdx, BlackIdx, GreenIdx;
+		for (int32 i = 0; i < TraceStrokes.Num(); ++i)
+		{
+			switch (TraceStrokes[i].Color)
 			{
 			case EStrokeColor::Red:   RedIdx.Add(i); break;
 			case EStrokeColor::Black: BlackIdx.Add(i); break;
@@ -2987,71 +3443,36 @@ namespace FromLZImageOps
 			default: break;
 			}
 		}
+
+		{
+			TArray<int32> AllRedBlackIdx = RedIdx;
+			AllRedBlackIdx.Append(BlackIdx);
+			if (AllRedBlackIdx.Num() > 0)
+			{
+				FGraph AllRedBlackGraph;
+				BuildGraph(TraceStrokes, AllRedBlackIdx, CapLoopGraphNodeSnapTol, FirstSyntheticStrokeId, AllRedBlackGraph);
+				TArray<uint8> AllEdges;
+				AllEdges.Init(1, AllRedBlackGraph.StrokeId.Num());
+				SaveGraphPng(TraceStrokes, AllRedBlackGraph, AllEdges, Width, Height, PressDir / TEXT("09_all_red_black_graph.png"));
+				SaveGraphJson(TraceStrokes, AllRedBlackGraph, AllEdges, PressDir / TEXT("09_all_red_black_graph.json"));
+			}
+		}
+
 		if (RedIdx.Num() == 0)
 		{
 			return 0;
 		}
 
-		// Candidate connectivity graph: all red + black whose endpoint is within
-		// BlackSelectTol of any red vertex. Connected components separate distinct objects.
-		TArray<FVector2D> RedPts;
-		for (int32 r : RedIdx) { RedPts.Append(Strokes[r].Points); }
 		const double SelTol2 = double(BlackSelectTol) * double(BlackSelectTol);
 
-		TArray<int32> SelBlack;
-		for (int32 b : BlackIdx)
-		{
-			const FStroke& BP = Strokes[b].Points;
-			if (BP.Num() == 0) { continue; }
-			bool bNear = false;
-			for (const FVector2D& RP : RedPts)
-			{
-				if (FVector2D::DistSquared(RP, BP[0]) <= SelTol2 || FVector2D::DistSquared(RP, BP.Last()) <= SelTol2)
-				{
-					bNear = true; break;
-				}
-			}
-			if (bNear) { SelBlack.Add(b); }
-		}
+		TArray<FLoopCandidate> Candidates;
+		CollectRedFirstLoopCandidates(TraceStrokes, RedIdx, BlackIdx, CapLoopGraphNodeSnapTol, FirstSyntheticStrokeId, Candidates);
 
-		TArray<int32> Edges = RedIdx;
-		Edges.Append(SelBlack);
-		FGraph G;
-		BuildGraph(Strokes, Edges, NodeTol, G);
+		TArray<int32> SelectedCandidateIndices;
+		SelectLoopCandidates(Candidates, SelectedCandidateIndices);
+		SaveLoopCandidatesJson(Candidates, PressDir / TEXT("09_loop_candidates.json"));
 
-		// Union-find connected components over the candidate graph nodes.
-		TArray<int32> Parent; Parent.SetNumUninitialized(G.NumNodes);
-		for (int32 n = 0; n < G.NumNodes; ++n) { Parent[n] = n; }
-		for (int32 e = 0; e < G.StrokeId.Num(); ++e)
-		{
-			Parent[Find(Parent, G.NodeV[e])] = Find(Parent, G.NodeU[e]);
-		}
-
-		// Group stroke indices per component (in discovery order).
-		TMap<int32, int32> CompOf;
-		TArray<TArray<int32>> CompRed, CompBlack;
-		for (int32 e = 0; e < G.StrokeId.Num(); ++e)
-		{
-			const int32 Root = Find(Parent, G.NodeU[e]);
-			int32 Idx;
-			if (int32* Found = CompOf.Find(Root)) { Idx = *Found; }
-			else { Idx = CompRed.Num(); CompOf.Add(Root, Idx); CompRed.AddDefaulted(); CompBlack.AddDefaulted(); }
-			if (G.bBlack[e]) { CompBlack[Idx].Add(G.StrokeId[e]); }
-			else { CompRed[Idx].Add(G.StrokeId[e]); }
-		}
-
-		// Pass 1 (sequential, cheap): which red-bearing components actually close a loop?
-		TArray<int32> SuccessComps;
-		for (int32 c = 0; c < CompRed.Num(); ++c)
-		{
-			if (CompRed[c].Num() == 0) { continue; }
-			FCapExtrusionResult Tmp;
-			if (DetectCapLoopOnSubset(Strokes, CompRed[c], CompBlack[c], NodeTol, Width, Height, FString(), Tmp))
-			{
-				SuccessComps.Add(c);
-			}
-		}
-		if (SuccessComps.Num() == 0)
+		if (SelectedCandidateIndices.Num() == 0)
 		{
 			return 0;
 		}
@@ -3059,25 +3480,35 @@ namespace FromLZImageOps
 		// Pre-warm the image-wrapper module on this thread before parallel writes.
 		FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
 
-		// Pass 2 (parallel): each component writes into its own Component_%% folder.
-		OutResults.SetNum(SuccessComps.Num());
-		ParallelFor(SuccessComps.Num(), [&](int32 i)
+		// Each selected red-driven loop writes into its own Component_%% folder.
+		OutResults.SetNum(SelectedCandidateIndices.Num());
+		ParallelFor(SelectedCandidateIndices.Num(), [&](int32 i)
 		{
-			const int32 c = SuccessComps[i];
+			const FLoopCandidate Candidate = Candidates[SelectedCandidateIndices[i]];
 			const FString CompDir = PressDir / FString::Printf(TEXT("Component_%02d"), i + 1);
 			IFileManager::Get().MakeDirectory(*CompDir, /*Tree*/ true);
 
-			FCapExtrusionResult R;
-			DetectCapLoopOnSubset(Strokes, CompRed[c], CompBlack[c], NodeTol, Width, Height, CompDir, R);
+			FCapExtrusionResult R = Candidate.Result;
+
+			{
+				FGraph SelectedGraph;
+				BuildGraph(TraceStrokes, R.CapStrokeIds, CapLoopGraphNodeSnapTol, FirstSyntheticStrokeId, SelectedGraph);
+				TArray<uint8> All;
+				All.Init(1, SelectedGraph.StrokeId.Num());
+				SaveGraphPng(TraceStrokes, SelectedGraph, All, Width, Height, CompDir / TEXT("09a_caploop_candidate.png"));
+				SaveGraphJson(TraceStrokes, SelectedGraph, All, CompDir / TEXT("09a_caploop_candidate_graph.json"));
+				SaveGraphPng(TraceStrokes, SelectedGraph, All, Width, Height, CompDir / TEXT("09b_caploop_pruned.png"));
+				SaveGraphJson(TraceStrokes, SelectedGraph, All, CompDir / TEXT("09b_caploop_pruned_graph.json"));
+			}
 
 			// Local side: longest green whose endpoint is near this component's red vertices;
 			// fall back to the globally longest green if none is nearby.
 			TArray<FVector2D> CompRedPts;
-			for (int32 r : CompRed[c]) { CompRedPts.Append(Strokes[r].Points); }
+			for (int32 r : Candidate.RealRedStrokeIds) { CompRedPts.Append(TraceStrokes[r].Points); }
 			TArray<int32> LocalGreen;
 			for (int32 g : GreenIdx)
 			{
-				const FStroke& GP = Strokes[g].Points;
+				const FStroke& GP = TraceStrokes[g].Points;
 				if (GP.Num() == 0) { continue; }
 				bool bNear = false;
 				for (const FVector2D& RP : CompRedPts)
@@ -3089,17 +3520,17 @@ namespace FromLZImageOps
 				}
 				if (bNear) { LocalGreen.Add(g); }
 			}
-			ApplyGreenSideForCap(Strokes, LocalGreen.Num() > 0 ? LocalGreen : GreenIdx, R);
+			ApplyGreenSideForCap(TraceStrokes, LocalGreen.Num() > 0 ? LocalGreen : GreenIdx, R);
 
-			SaveCapExtrusionPng(Strokes, R, Width, Height, CompDir / TEXT("09_cap_extrusion.png"));
+			SaveCapExtrusionPng(TraceStrokes, R, Width, Height, CompDir / TEXT("09_cap_extrusion.png"));
 
-			// Interior-green test: any green stroke with at least 50px of accumulated
-			// inside length within the cap polygon means excavate.
+			// Interior-green test: only this component's local green strokes can
+			// classify the cap as an excavation.
 			bool bInteriorGreen = false;
 			FInteriorGreenStats BestInterior;
-			for (int32 g : GreenIdx)
+			for (int32 g : LocalGreen)
 			{
-				const FInteriorGreenStats Stats = MeasureInteriorGreen(R.CapPolygon, Strokes, g);
+				const FInteriorGreenStats Stats = MeasureInteriorGreen(R.CapPolygon, TraceStrokes, g);
 				if (!PassesInteriorGreenThresholds(Stats))
 				{
 					continue;
@@ -3142,7 +3573,7 @@ namespace FromLZImageOps
 			OutResults[i] = R;
 		});
 
-		return SuccessComps.Num();
+		return SelectedCandidateIndices.Num();
 	}
 
 	bool SaveCapExtrusionPng(const TArray<FColoredStroke>& Strokes, const FCapExtrusionResult& Res, int32 Width, int32 Height, const FString& Path, int32 Thickness)
@@ -3227,8 +3658,10 @@ namespace FromLZImageOps
 		Json += FString::Printf(TEXT("  \"interior_green_inside_length\": %.3f,\n"), Res.InteriorGreenInsideLength);
 		Json += FString::Printf(TEXT("  \"interior_green_stroke_length\": %.3f,\n"), Res.InteriorGreenStrokeLength);
 		Json += FString::Printf(TEXT("  \"interior_green_min_inside_length\": %.3f,\n"), InteriorGreenMinInsideLengthPx);
+		Json += FString::Printf(TEXT("  \"candidate_source\": \"%s\",\n"), *Res.CandidateSource);
+		Json += FString::Printf(TEXT("  \"candidate_anchor_stroke_id\": %d,\n"), Res.CandidateAnchorStrokeId);
 
-		// All green strokes connected to this cap (chord vectors + endpoint segments).
+		// Selected green side stroke (chord vector + endpoint segment).
 		Json += TEXT("  \"side_vectors\": [");
 		for (int32 i = 0; i < Res.SideCandidateVectors.Num(); ++i)
 		{
