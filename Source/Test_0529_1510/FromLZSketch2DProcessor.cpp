@@ -212,8 +212,8 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 	FromLZImageOps::SaveMaskPng(EnclosedMask, Width, Height, PressDir / TEXT("08_enclosed_mask.png"), /*bInvertForDisplay*/ true);
 
 	// ---- Step 9: per-component red cap-loops -> per-component side -> translate-copy --
-	// Red-driven cap loops are found with explicit red/black endpoint connector strokes
-	// (20px search radius), then the longest green near each cap gives the copy side.
+	// Red-driven cap loops planarize real red/black intersections, then connect only red
+	// topology nodes with degree 1 forward to black polyline segments within 20px.
 	TArray<FromLZImageOps::FCapExtrusionResult> Caps;
 	const int32 NumCaps = FromLZImageOps::RecoverCapExtrusionsPerComponent(
 		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 50.0f, Width, Height, PressDir, ActionPressDir, Caps);

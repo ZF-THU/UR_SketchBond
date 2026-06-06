@@ -84,6 +84,16 @@ namespace
 		double Coverage = 0.0;
 	};
 
+	struct FOrthographicProjectionMetadata
+	{
+		bool bAvailable = false;
+		FString Source;
+		double M00 = 0.0;
+		double M11 = 0.0;
+		double M30 = 0.0;
+		double M31 = 0.0;
+	};
+
 	struct FCameraInfo
 	{
 		FVector Location = FVector::ZeroVector;
@@ -93,6 +103,11 @@ namespace
 		double Fov = 90.0;
 		double OrthoWidth = 1536.0;
 		bool bOrthographic = false;
+		bool bHasProjectionMatrix = false;
+		FMatrix ProjectionMatrix = FMatrix::Identity;
+		FString ProjectionMatrixSource;
+		int32 ViewportWidth = 0;
+		int32 ViewportHeight = 0;
 	};
 
 	struct FOverlapAccum
@@ -175,8 +190,21 @@ namespace
 		FVector2D ProjectedNormal2D = FVector2D::ZeroVector;
 		double ExtrusionDepth = 0.0;
 		double MaxDepthSampleReprojectionErrorPixels = 0.0;
+		double MeanSourceReprojectionErrorPixels = 0.0;
+		double MaxSourceReprojectionErrorPixels = 0.0;
 		double MeanCopiedReprojectionErrorPixels = 0.0;
 		double MaxCopiedReprojectionErrorPixels = 0.0;
+		FString ProjectionMatrixSource;
+		FString ProjectionValidation;
+		bool bHasProjectionMatrix = false;
+		int32 ProjectionViewportWidth = 0;
+		int32 ProjectionViewportHeight = 0;
+		double ProjectionM00 = 0.0;
+		double ProjectionM11 = 0.0;
+		double ProjectionM30 = 0.0;
+		double ProjectionM31 = 0.0;
+		double ProjectionHorizontalSpan = 0.0;
+		double ProjectionVerticalSpan = 0.0;
 		TArray<FSolidDepthSample> DepthSamples;
 		TArray<FVector2D> SourceLoop2D;
 		TArray<FVector2D> CopiedTargetLoop2D;
@@ -241,6 +269,9 @@ namespace
 		int32 ActorMaterialWidth = 0;
 		int32 ActorMaterialHeight = 0;
 		TMap<uint32, FActorMaterialIdEntry> ActorMaterialEntryByColorKey;
+		FOrthographicProjectionMetadata FacesProjection;
+		FOrthographicProjectionMetadata ActorMaterialProjection;
+		FString ProjectionValidation;
 	};
 
 	struct FStep11MeshDiagnostics
@@ -579,15 +610,105 @@ namespace
 		return true;
 	}
 
-	static bool LoadFacesJson(const FString& Path, TArray<FFaceInfo>& OutFaces)
+	static bool ParseMatrixObject(const TSharedPtr<FJsonObject>& Object, FMatrix& OutMatrix)
+	{
+		if (!Object.IsValid())
+		{
+			return false;
+		}
+
+		FMatrix Matrix = FMatrix::Identity;
+		for (int32 Row = 0; Row < 4; ++Row)
+		{
+			const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+			if (!Object->TryGetArrayField(FString::Printf(TEXT("row_%d"), Row), Values) || Values->Num() < 4)
+			{
+				return false;
+			}
+			for (int32 Column = 0; Column < 4; ++Column)
+			{
+				const double Value = (*Values)[Column]->AsNumber();
+				if (!FMath::IsFinite(Value))
+				{
+					return false;
+				}
+				Matrix.M[Row][Column] = Value;
+			}
+		}
+
+		OutMatrix = Matrix;
+		return true;
+	}
+
+	static bool IsUsableOrthographicProjectionMatrix(const FMatrix& Matrix)
+	{
+		return FMath::IsFinite(Matrix.M[0][0]) &&
+			FMath::IsFinite(Matrix.M[1][1]) &&
+			FMath::IsFinite(Matrix.M[3][0]) &&
+			FMath::IsFinite(Matrix.M[3][1]) &&
+			FMath::Abs(Matrix.M[0][0]) > 1e-12 &&
+			FMath::Abs(Matrix.M[1][1]) > 1e-12;
+	}
+
+	static FOrthographicProjectionMetadata MakeProjectionMetadata(
+		const FMatrix& Matrix, const FString& Source)
+	{
+		FOrthographicProjectionMetadata Metadata;
+		Metadata.bAvailable = IsUsableOrthographicProjectionMatrix(Matrix);
+		Metadata.Source = Source;
+		Metadata.M00 = Matrix.M[0][0];
+		Metadata.M11 = Matrix.M[1][1];
+		Metadata.M30 = Matrix.M[3][0];
+		Metadata.M31 = Matrix.M[3][1];
+		return Metadata;
+	}
+
+	static bool ParseProjectionScaleMetadata(
+		const TSharedPtr<FJsonObject>& Root,
+		FOrthographicProjectionMetadata& OutMetadata)
+	{
+		OutMetadata = FOrthographicProjectionMetadata();
+		if (!Root.IsValid())
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* ScaleObject = nullptr;
+		if (!Root->TryGetObjectField(TEXT("projection_scale"), ScaleObject) ||
+			!ScaleObject || !ScaleObject->IsValid())
+		{
+			return false;
+		}
+
+		(*ScaleObject)->TryGetNumberField(TEXT("m00"), OutMetadata.M00);
+		(*ScaleObject)->TryGetNumberField(TEXT("m11"), OutMetadata.M11);
+		(*ScaleObject)->TryGetNumberField(TEXT("m30"), OutMetadata.M30);
+		(*ScaleObject)->TryGetNumberField(TEXT("m31"), OutMetadata.M31);
+		Root->TryGetStringField(TEXT("projection_source"), OutMetadata.Source);
+		OutMetadata.bAvailable =
+			FMath::IsFinite(OutMetadata.M00) &&
+			FMath::IsFinite(OutMetadata.M11) &&
+			FMath::IsFinite(OutMetadata.M30) &&
+			FMath::IsFinite(OutMetadata.M31) &&
+			FMath::Abs(OutMetadata.M00) > 1e-12 &&
+			FMath::Abs(OutMetadata.M11) > 1e-12;
+		return OutMetadata.bAvailable;
+	}
+
+	static bool LoadFacesJson(
+		const FString& Path,
+		TArray<FFaceInfo>& OutFaces,
+		FOrthographicProjectionMetadata& OutProjection)
 	{
 		OutFaces.Reset();
+		OutProjection = FOrthographicProjectionMetadata();
 
 		TSharedPtr<FJsonObject> Root;
 		if (!LoadJsonObject(Path, Root))
 		{
 			return false;
 		}
+		ParseProjectionScaleMetadata(Root, OutProjection);
 
 		const TArray<TSharedPtr<FJsonValue>>* FacesArray = nullptr;
 		if (!Root->TryGetArrayField(TEXT("faces"), FacesArray))
@@ -623,14 +744,29 @@ namespace
 		return OutFaces.Num() > 0;
 	}
 
-	static bool LoadActorMaterialIdJson(const FString& Path, TMap<uint32, FActorMaterialIdEntry>& OutEntriesByColorKey)
+	static bool LoadActorMaterialIdJson(
+		const FString& Path,
+		TMap<uint32, FActorMaterialIdEntry>& OutEntriesByColorKey,
+		FOrthographicProjectionMetadata& OutProjection)
 	{
 		OutEntriesByColorKey.Reset();
+		OutProjection = FOrthographicProjectionMetadata();
 
 		TSharedPtr<FJsonObject> Root;
 		if (!LoadJsonObject(Path, Root))
 		{
 			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* ProjectionObject = nullptr;
+		FMatrix ProjectionMatrix = FMatrix::Identity;
+		if (Root->TryGetObjectField(TEXT("projection_matrix"), ProjectionObject) &&
+			ProjectionObject && ProjectionObject->IsValid() &&
+			ParseMatrixObject(*ProjectionObject, ProjectionMatrix))
+		{
+			FString ProjectionSource;
+			Root->TryGetStringField(TEXT("projection_source"), ProjectionSource);
+			OutProjection = MakeProjectionMetadata(ProjectionMatrix, ProjectionSource);
 		}
 
 		const TArray<TSharedPtr<FJsonValue>>* EntriesArray = nullptr;
@@ -674,18 +810,26 @@ namespace
 		return OutEntriesByColorKey.Num() > 0;
 	}
 
-	static bool LoadCameraJson(const FString& Path, FCameraInfo& OutCamera)
+	static bool LoadCameraJson(const FString& Path, FCameraInfo& OutCamera, FString& OutError)
 	{
+		OutCamera = FCameraInfo();
+		OutError.Reset();
+
 		TSharedPtr<FJsonObject> Root;
 		if (!LoadJsonObject(Path, Root))
 		{
+			OutError = FString::Printf(TEXT("Failed to parse capture camera json: %s"), *Path);
 			return false;
 		}
 
 		const TSharedPtr<FJsonObject>* TransformObject = nullptr;
-		if (!Root->TryGetObjectField(TEXT("camera_component_transform"), TransformObject) || !TransformObject || !TransformObject->IsValid())
+		if (!Root->TryGetObjectField(TEXT("capture_view_transform"), TransformObject) || !TransformObject || !TransformObject->IsValid())
 		{
-			return false;
+			if (!Root->TryGetObjectField(TEXT("camera_component_transform"), TransformObject) || !TransformObject || !TransformObject->IsValid())
+			{
+				OutError = TEXT("capture json has no valid capture_view_transform or camera_component_transform");
+				return false;
+			}
 		}
 
 		double X = 0.0, Y = 0.0, Z = 0.0;
@@ -705,18 +849,109 @@ namespace
 		OutCamera.Up = RotMatrix.GetScaledAxis(EAxis::Z).GetSafeNormal();
 
 		const TSharedPtr<FJsonObject>* ViewObject = nullptr;
-		if (Root->TryGetObjectField(TEXT("camera_view"), ViewObject) && ViewObject && ViewObject->IsValid())
+		if (!Root->TryGetObjectField(TEXT("camera_view"), ViewObject) || !ViewObject || !ViewObject->IsValid())
 		{
-			(*ViewObject)->TryGetNumberField(TEXT("fov"), OutCamera.Fov);
-			(*ViewObject)->TryGetNumberField(TEXT("ortho_width"), OutCamera.OrthoWidth);
-			FString ProjectionMode;
-			if ((*ViewObject)->TryGetStringField(TEXT("projection_mode"), ProjectionMode))
+			OutError = TEXT("capture json has no valid camera_view");
+			return false;
+		}
+
+		(*ViewObject)->TryGetNumberField(TEXT("fov"), OutCamera.Fov);
+		(*ViewObject)->TryGetNumberField(TEXT("ortho_width"), OutCamera.OrthoWidth);
+		double ViewportWidth = 0.0;
+		double ViewportHeight = 0.0;
+		(*ViewObject)->TryGetNumberField(TEXT("viewport_width"), ViewportWidth);
+		(*ViewObject)->TryGetNumberField(TEXT("viewport_height"), ViewportHeight);
+		OutCamera.ViewportWidth = FMath::RoundToInt(ViewportWidth);
+		OutCamera.ViewportHeight = FMath::RoundToInt(ViewportHeight);
+
+		FString ProjectionMode;
+		if ((*ViewObject)->TryGetStringField(TEXT("projection_mode"), ProjectionMode))
+		{
+			OutCamera.bOrthographic = ProjectionMode.Contains(TEXT("Orthographic"));
+		}
+		(*ViewObject)->TryGetStringField(TEXT("projection_matrix_source"), OutCamera.ProjectionMatrixSource);
+
+		const TSharedPtr<FJsonObject>* ProjectionObject = nullptr;
+		OutCamera.bHasProjectionMatrix =
+			(*ViewObject)->TryGetObjectField(TEXT("projection_matrix"), ProjectionObject) &&
+			ProjectionObject && ProjectionObject->IsValid() &&
+			ParseMatrixObject(*ProjectionObject, OutCamera.ProjectionMatrix) &&
+			IsUsableOrthographicProjectionMatrix(OutCamera.ProjectionMatrix);
+
+		if (OutCamera.Forward.IsNearlyZero())
+		{
+			OutError = TEXT("capture camera forward vector is invalid");
+			return false;
+		}
+		if (!OutCamera.bOrthographic)
+		{
+			OutError = TEXT("Step 10 requires an orthographic capture camera");
+			return false;
+		}
+		if (!OutCamera.bHasProjectionMatrix)
+		{
+			OutError = TEXT("camera_view.projection_matrix is missing or unusable; Step 10 will not fall back to ortho_width");
+			return false;
+		}
+		return true;
+	}
+
+	static bool ProjectionTermsNearlyEqual(double A, double B)
+	{
+		const double Scale = FMath::Max3(1.0, FMath::Abs(A), FMath::Abs(B));
+		return FMath::Abs(A - B) <= Scale * 1e-8;
+	}
+
+	static bool ProjectionMetadataMatches(
+		const FOrthographicProjectionMetadata& A,
+		const FOrthographicProjectionMetadata& B)
+	{
+		return A.bAvailable && B.bAvailable &&
+			ProjectionTermsNearlyEqual(A.M00, B.M00) &&
+			ProjectionTermsNearlyEqual(A.M11, B.M11) &&
+			ProjectionTermsNearlyEqual(A.M30, B.M30) &&
+			ProjectionTermsNearlyEqual(A.M31, B.M31);
+	}
+
+	static bool ValidateProjectionMetadata(FCommonInputs& Inputs, FString& OutError)
+	{
+		OutError.Reset();
+		const FOrthographicProjectionMetadata CaptureProjection =
+			MakeProjectionMetadata(Inputs.Camera.ProjectionMatrix, Inputs.Camera.ProjectionMatrixSource);
+
+		if (!Inputs.FacesProjection.bAvailable)
+		{
+			OutError = TEXT("faces json is missing usable projection_scale metadata");
+			return false;
+		}
+		if (!ProjectionMetadataMatches(CaptureProjection, Inputs.FacesProjection))
+		{
+			OutError = FString::Printf(
+				TEXT("capture/faces projection mismatch: capture=(%.17g, %.17g, %.17g, %.17g) faces=(%.17g, %.17g, %.17g, %.17g)"),
+				CaptureProjection.M00, CaptureProjection.M11, CaptureProjection.M30, CaptureProjection.M31,
+				Inputs.FacesProjection.M00, Inputs.FacesProjection.M11,
+				Inputs.FacesProjection.M30, Inputs.FacesProjection.M31);
+			return false;
+		}
+
+		if (Inputs.ActorMaterialEntryByColorKey.Num() > 0)
+		{
+			if (!Inputs.ActorMaterialProjection.bAvailable)
 			{
-				OutCamera.bOrthographic = ProjectionMode.Contains(TEXT("Orthographic"));
+				OutError = TEXT("actor/material id json is missing a usable projection_matrix");
+				return false;
+			}
+			if (!ProjectionMetadataMatches(CaptureProjection, Inputs.ActorMaterialProjection))
+			{
+				OutError = TEXT("capture and actor/material id projection matrices do not match");
+				return false;
 			}
 		}
 
-		return !OutCamera.Forward.IsNearlyZero();
+		Inputs.ProjectionValidation = Inputs.ActorMaterialEntryByColorKey.Num() > 0
+			? TEXT("capture camera, faces, and actor/material projection metadata match")
+			: TEXT("capture camera and faces projection metadata match; actor/material buffer unavailable");
+		return true;
 	}
 
 	static bool LoadCaptureRef(const FString& PressDir, FCommonInputs& OutInputs)
@@ -1078,52 +1313,60 @@ namespace
 		return (Camera.Forward + Camera.Right * (NdcX * TanX) + Camera.Up * (NdcY * TanY)).GetSafeNormal();
 	}
 
-	static FVector CameraOrthoRayOrigin(const FCameraInfo& Camera, int32 Width, int32 Height, const FVector2D& Pixel)
+	static bool TryGetOrthographicViewPlanePosition(
+		const FCameraInfo& Camera,
+		double NdcX,
+		double NdcY,
+		double& OutRight,
+		double& OutUp)
 	{
-		const double NdcX = 2.0 * ((Pixel.X + 0.5) / double(Width)) - 1.0;
-		const double NdcY = 1.0 - 2.0 * ((Pixel.Y + 0.5) / double(Height));
-		return Camera.Location
-			+ Camera.Right * (NdcX * Camera.OrthoWidth * 0.5)
-			+ Camera.Up * (NdcY * Camera.OrthoWidth * 0.5 * (double(Height) / double(Width)));
-	}
-
-	static double ResolveStep10OrthoWidth(const FCameraInfo& Camera, const FVector& AnchorWorld)
-	{
-		if (FMath::IsFinite(Camera.OrthoWidth) && Camera.OrthoWidth > 1e-6)
-		{
-			return Camera.OrthoWidth;
-		}
-
-		const double Depth = FVector::DotProduct(AnchorWorld - Camera.Location, Camera.Forward);
-		const double TanX = FMath::Tan(FMath::DegreesToRadians(Camera.Fov * 0.5));
-		if (Depth > 1e-6 && FMath::IsFinite(TanX) && FMath::Abs(TanX) > 1e-8)
-		{
-			return 2.0 * Depth * TanX;
-		}
-		return 0.0;
-	}
-
-	static FVector CameraOrthoRayOriginWithWidth(
-		const FCameraInfo& Camera, int32 Width, int32 Height, const FVector2D& Pixel, double OrthoWidth)
-	{
-		const double NdcX = 2.0 * ((Pixel.X + 0.5) / double(Width)) - 1.0;
-		const double NdcY = 1.0 - 2.0 * ((Pixel.Y + 0.5) / double(Height));
-		return Camera.Location
-			+ Camera.Right * (NdcX * OrthoWidth * 0.5)
-			+ Camera.Up * (NdcY * OrthoWidth * 0.5 * (double(Height) / double(Width)));
-	}
-
-	static bool IntersectPixelWithPlaneOrthographic(
-		const FCameraInfo& Camera, int32 Width, int32 Height, const FVector2D& Pixel,
-		const FVector& PlanePoint, const FVector& PlaneNormal, double OrthoWidth,
-		FVector& OutHit, double* OutDistance = nullptr)
-	{
-		if (Width <= 0 || Height <= 0 || OrthoWidth <= 1e-6)
+		if (!Camera.bHasProjectionMatrix ||
+			!IsUsableOrthographicProjectionMatrix(Camera.ProjectionMatrix))
 		{
 			return false;
 		}
 
-		const FVector RayOrigin = CameraOrthoRayOriginWithWidth(Camera, Width, Height, Pixel, OrthoWidth);
+		OutRight = (NdcX - Camera.ProjectionMatrix.M[3][0]) / Camera.ProjectionMatrix.M[0][0];
+		OutUp = (NdcY - Camera.ProjectionMatrix.M[3][1]) / Camera.ProjectionMatrix.M[1][1];
+		return FMath::IsFinite(OutRight) && FMath::IsFinite(OutUp);
+	}
+
+	static bool CameraOrthoRayOrigin(
+		const FCameraInfo& Camera,
+		int32 Width,
+		int32 Height,
+		const FVector2D& Pixel,
+		FVector& OutOrigin)
+	{
+		if (Width <= 0 || Height <= 0)
+		{
+			return false;
+		}
+
+		const double NdcX = 2.0 * ((Pixel.X + 0.5) / double(Width)) - 1.0;
+		const double NdcY = 1.0 - 2.0 * ((Pixel.Y + 0.5) / double(Height));
+		double ViewRight = 0.0;
+		double ViewUp = 0.0;
+		if (!TryGetOrthographicViewPlanePosition(Camera, NdcX, NdcY, ViewRight, ViewUp))
+		{
+			return false;
+		}
+
+		OutOrigin = Camera.Location + Camera.Right * ViewRight + Camera.Up * ViewUp;
+		return FMath::IsFinite(OutOrigin.X) && FMath::IsFinite(OutOrigin.Y) && FMath::IsFinite(OutOrigin.Z);
+	}
+
+	static bool IntersectPixelWithPlaneOrthographic(
+		const FCameraInfo& Camera, int32 Width, int32 Height, const FVector2D& Pixel,
+		const FVector& PlanePoint, const FVector& PlaneNormal,
+		FVector& OutHit, double* OutDistance = nullptr)
+	{
+		FVector RayOrigin;
+		if (!CameraOrthoRayOrigin(Camera, Width, Height, Pixel, RayOrigin))
+		{
+			return false;
+		}
+
 		const FVector RayDir = Camera.Forward.GetSafeNormal();
 		const FVector Normal = PlaneNormal.GetSafeNormal();
 		const double Denom = FVector::DotProduct(RayDir, Normal);
@@ -1148,23 +1391,30 @@ namespace
 
 	static bool ProjectWorldToImageOrthographic(
 		const FCameraInfo& Camera, int32 Width, int32 Height, const FVector& World,
-		double OrthoWidth, FVector2D& OutPixel)
+		FVector2D& OutPixel)
 	{
-		if (Width <= 0 || Height <= 0 || OrthoWidth <= 1e-6)
+		if (Width <= 0 || Height <= 0 ||
+			!Camera.bHasProjectionMatrix ||
+			!IsUsableOrthographicProjectionMatrix(Camera.ProjectionMatrix))
 		{
 			return false;
 		}
 
 		const FVector Delta = World - Camera.Location;
-		const double HalfWidth = OrthoWidth * 0.5;
-		const double HalfHeight = HalfWidth * (double(Height) / double(Width));
-		if (FMath::Abs(HalfWidth) < 1e-8 || FMath::Abs(HalfHeight) < 1e-8)
+		const double Depth = FVector::DotProduct(Delta, Camera.Forward);
+		if (!FMath::IsFinite(Depth) || Depth <= 0.0)
 		{
 			return false;
 		}
 
-		const double NdcX = FVector::DotProduct(Delta, Camera.Right) / HalfWidth;
-		const double NdcY = FVector::DotProduct(Delta, Camera.Up) / HalfHeight;
+		const double ViewRight = FVector::DotProduct(Delta, Camera.Right);
+		const double ViewUp = FVector::DotProduct(Delta, Camera.Up);
+		const double NdcX =
+			ViewRight * Camera.ProjectionMatrix.M[0][0] +
+			Camera.ProjectionMatrix.M[3][0];
+		const double NdcY =
+			ViewUp * Camera.ProjectionMatrix.M[1][1] +
+			Camera.ProjectionMatrix.M[3][1];
 		OutPixel = FVector2D(
 			((NdcX + 1.0) * 0.5 * double(Width)) - 0.5,
 			((1.0 - NdcY) * 0.5 * double(Height)) - 0.5);
@@ -1172,10 +1422,12 @@ namespace
 	}
 
 	static bool OrthographicPixelsPerWorldAlongDirection(
-		const FCameraInfo& Camera, int32 Width, double OrthoWidth,
+		const FCameraInfo& Camera, int32 Width, int32 Height,
 		const FVector& DirectionWorld, FVector2D& OutPixelsPerWorld)
 	{
-		if (Width <= 0 || OrthoWidth <= 1e-6)
+		if (Width <= 0 || Height <= 0 ||
+			!Camera.bHasProjectionMatrix ||
+			!IsUsableOrthographicProjectionMatrix(Camera.ProjectionMatrix))
 		{
 			return false;
 		}
@@ -1186,21 +1438,22 @@ namespace
 			return false;
 		}
 
-		const double Scale = double(Width) / OrthoWidth;
 		OutPixelsPerWorld = FVector2D(
-			FVector::DotProduct(Direction, Camera.Right) * Scale,
-			-FVector::DotProduct(Direction, Camera.Up) * Scale);
+			FVector::DotProduct(Direction, Camera.Right) *
+				(0.5 * double(Width) * Camera.ProjectionMatrix.M[0][0]),
+			-FVector::DotProduct(Direction, Camera.Up) *
+				(0.5 * double(Height) * Camera.ProjectionMatrix.M[1][1]));
 		return OutPixelsPerWorld.SizeSquared() > 1e-12 &&
 			FMath::IsFinite(OutPixelsPerWorld.X) &&
 			FMath::IsFinite(OutPixelsPerWorld.Y);
 	}
 
 	static bool ProjectWorldDirectionToImageOrthographic(
-		const FCameraInfo& Camera, int32 Width, const FVector& DirectionWorld,
-		double OrthoWidth, FVector2D& OutDirection)
+		const FCameraInfo& Camera, int32 Width, int32 Height,
+		const FVector& DirectionWorld, FVector2D& OutDirection)
 	{
 		FVector2D PixelsPerWorld;
-		if (!OrthographicPixelsPerWorldAlongDirection(Camera, Width, OrthoWidth, DirectionWorld, PixelsPerWorld))
+		if (!OrthographicPixelsPerWorldAlongDirection(Camera, Width, Height, DirectionWorld, PixelsPerWorld))
 		{
 			return false;
 		}
@@ -1208,13 +1461,24 @@ namespace
 		return true;
 	}
 
-	static void CameraRayForPixel(
+	static bool CameraRayForPixel(
 		const FCameraInfo& Camera, int32 Width, int32 Height, const FVector2D& Pixel,
 		FVector& OutOrigin, FVector& OutDirection)
 	{
-		OutOrigin = Camera.bOrthographic ? CameraOrthoRayOrigin(Camera, Width, Height, Pixel) : Camera.Location;
+		if (Camera.bOrthographic)
+		{
+			if (!CameraOrthoRayOrigin(Camera, Width, Height, Pixel, OutOrigin))
+			{
+				return false;
+			}
+		}
+		else
+		{
+			OutOrigin = Camera.Location;
+		}
 		OutDirection = Camera.bOrthographic ? Camera.Forward : CameraRayDirection(Camera, Width, Height, Pixel);
 		OutDirection = OutDirection.GetSafeNormal();
+		return !OutDirection.IsNearlyZero();
 	}
 
 	static bool IntersectPixelWithPlane(
@@ -1224,7 +1488,10 @@ namespace
 	{
 		FVector RayOrigin;
 		FVector RayDir;
-		CameraRayForPixel(Camera, Width, Height, Pixel, RayOrigin, RayDir);
+		if (!CameraRayForPixel(Camera, Width, Height, Pixel, RayOrigin, RayDir))
+		{
+			return false;
+		}
 		const FVector Normal = PlaneNormal.GetSafeNormal();
 		const double Denom = FVector::DotProduct(RayDir, Normal);
 		if (FMath::Abs(Denom) < 1e-8)
@@ -1257,14 +1524,7 @@ namespace
 		double NdcY = 0.0;
 		if (Camera.bOrthographic)
 		{
-			const double HalfWidth = Camera.OrthoWidth * 0.5;
-			const double HalfHeight = HalfWidth * (double(Height) / double(Width));
-			if (FMath::Abs(HalfWidth) < 1e-8 || FMath::Abs(HalfHeight) < 1e-8)
-			{
-				return false;
-			}
-			NdcX = FVector::DotProduct(Delta, Camera.Right) / HalfWidth;
-			NdcY = FVector::DotProduct(Delta, Camera.Up) / HalfHeight;
+			return ProjectWorldToImageOrthographic(Camera, Width, Height, World, OutPixel);
 		}
 		else
 		{
@@ -1295,47 +1555,22 @@ namespace
 		const FCameraInfo& Camera, int32 Width, int32 Height,
 		const FVector2D& Pixel, const FFaceInfo& Face, FVector& OutHit, double& OutDistance)
 	{
-		const double OrthoWidth = ResolveStep10OrthoWidth(Camera, Face.PlanePoint);
 		return IntersectPixelWithPlaneOrthographic(
-			Camera, Width, Height, Pixel, Face.PlanePoint, Face.Normal, OrthoWidth, OutHit, &OutDistance);
-	}
-
-	static double FaceWorldExtent(const FFaceInfo& Face)
-	{
-		if (Face.KeyPoints3D.Num() == 0)
-		{
-			return 0.0;
-		}
-
-		FVector Min = Face.KeyPoints3D[0];
-		FVector Max = Face.KeyPoints3D[0];
-		for (const FVector& P : Face.KeyPoints3D)
-		{
-			Min.X = FMath::Min(Min.X, P.X);
-			Min.Y = FMath::Min(Min.Y, P.Y);
-			Min.Z = FMath::Min(Min.Z, P.Z);
-			Max.X = FMath::Max(Max.X, P.X);
-			Max.Y = FMath::Max(Max.Y, P.Y);
-			Max.Z = FMath::Max(Max.Z, P.Z);
-		}
-		return (Max - Min).Size();
+			Camera, Width, Height, Pixel, Face.PlanePoint, Face.Normal, OutHit, &OutDistance);
 	}
 
 	static bool ProjectFaceNormalToImage(
 		const FCameraInfo& Camera, int32 Width, int32 Height,
-		const FFaceInfo& Face, const FVector& AnchorWorld, FVector2D& OutDirection)
+		const FFaceInfo& Face, FVector2D& OutDirection)
 	{
-		const double OrthoWidth = ResolveStep10OrthoWidth(Camera, AnchorWorld);
-		return ProjectWorldDirectionToImageOrthographic(Camera, Width, Face.Normal, OrthoWidth, OutDirection);
+		return ProjectWorldDirectionToImageOrthographic(Camera, Width, Height, Face.Normal, OutDirection);
 	}
 
 	static bool ProjectSignedWorldDirectionToImage(
 		const FCameraInfo& Camera, int32 Width, int32 Height,
-		const FVector& AnchorWorld, const FVector& DirectionWorld, double ProbeLength,
-		FVector2D& OutDirection)
+		const FVector& DirectionWorld, FVector2D& OutDirection)
 	{
-		const double OrthoWidth = ResolveStep10OrthoWidth(Camera, AnchorWorld);
-		return ProjectWorldDirectionToImageOrthographic(Camera, Width, DirectionWorld, OrthoWidth, OutDirection);
+		return ProjectWorldDirectionToImageOrthographic(Camera, Width, Height, DirectionWorld, OutDirection);
 	}
 
 	static void MapPolygonToFacesSpace(
@@ -1551,16 +1786,14 @@ namespace
 	// Orthographic closed-form extrusion depth:
 	// source_to_copied_2d = depth * projected_normal_pixels_per_world.
 	static bool SolveExtrusionDepthOrthographic(
-		const FCameraInfo& Camera, int32 Width,
+		const FCameraInfo& Camera, int32 Width, int32 Height,
 		const FVector& OrientedNormal,
-		const FVector& AnchorWorld,
 		const FVector2D& SourceToCopiedVector2D,
 		double& OutDepth,
 		FString& OutError)
 	{
-		const double OrthoWidth = ResolveStep10OrthoWidth(Camera, AnchorWorld);
 		FVector2D PixelsPerWorld;
-		if (!OrthographicPixelsPerWorldAlongDirection(Camera, Width, OrthoWidth, OrientedNormal, PixelsPerWorld))
+		if (!OrthographicPixelsPerWorldAlongDirection(Camera, Width, Height, OrientedNormal, PixelsPerWorld))
 		{
 			OutError = TEXT("base face normal has near-zero orthographic image projection; extrusion depth is not observable");
 			return false;
@@ -1856,6 +2089,17 @@ namespace
 		Root->SetNumberField(TEXT("faces_width"), Result.FacesWidth);
 		Root->SetNumberField(TEXT("faces_height"), Result.FacesHeight);
 		Root->SetNumberField(TEXT("selected_source_face_id"), Result.SelectedFaceId);
+		Root->SetBoolField(TEXT("projection_matrix_available"), Result.bHasProjectionMatrix);
+		Root->SetStringField(TEXT("projection_matrix_source"), Result.ProjectionMatrixSource);
+		Root->SetStringField(TEXT("projection_validation"), Result.ProjectionValidation);
+		Root->SetNumberField(TEXT("projection_viewport_width"), Result.ProjectionViewportWidth);
+		Root->SetNumberField(TEXT("projection_viewport_height"), Result.ProjectionViewportHeight);
+		Root->SetNumberField(TEXT("projection_m00"), Result.ProjectionM00);
+		Root->SetNumberField(TEXT("projection_m11"), Result.ProjectionM11);
+		Root->SetNumberField(TEXT("projection_m30"), Result.ProjectionM30);
+		Root->SetNumberField(TEXT("projection_m31"), Result.ProjectionM31);
+		Root->SetNumberField(TEXT("projection_horizontal_span"), Result.ProjectionHorizontalSpan);
+		Root->SetNumberField(TEXT("projection_vertical_span"), Result.ProjectionVerticalSpan);
 		Root->SetBoolField(TEXT("attach_material_id_lookup_attempted"), Result.AttachMaterialId.bLookupAttempted);
 		Root->SetBoolField(TEXT("attach_material_id_found"), Result.AttachMaterialId.bFound);
 		Root->SetStringField(TEXT("attach_material_id_error"), Result.AttachMaterialId.Error);
@@ -1880,6 +2124,8 @@ namespace
 		Root->SetArrayField(TEXT("projected_oriented_normal_2d"), JsonVector2D(Result.ProjectedNormal2D)->AsArray());
 		Root->SetNumberField(TEXT("extrusion_depth"), Result.ExtrusionDepth);
 		Root->SetNumberField(TEXT("max_depth_sample_reprojection_error_pixels"), Result.MaxDepthSampleReprojectionErrorPixels);
+		Root->SetNumberField(TEXT("mean_source_reprojection_error_pixels"), Result.MeanSourceReprojectionErrorPixels);
+		Root->SetNumberField(TEXT("max_source_reprojection_error_pixels"), Result.MaxSourceReprojectionErrorPixels);
 		Root->SetNumberField(TEXT("mean_copied_reprojection_error_pixels"), Result.MeanCopiedReprojectionErrorPixels);
 		Root->SetNumberField(TEXT("max_copied_reprojection_error_pixels"), Result.MaxCopiedReprojectionErrorPixels);
 
@@ -2081,6 +2327,20 @@ namespace
 		Solid.FacesWidth = Inputs.FacesWidth;
 		Solid.FacesHeight = Inputs.FacesHeight;
 		Solid.ActorName = FString::Printf(TEXT("FromLZ_ReconstructedSolid_%s_%s"), *FPaths::GetCleanFilename(PressDir), *ComponentName);
+		Solid.bHasProjectionMatrix = Inputs.Camera.bHasProjectionMatrix;
+		Solid.ProjectionMatrixSource = Inputs.Camera.ProjectionMatrixSource;
+		Solid.ProjectionValidation = Inputs.ProjectionValidation;
+		Solid.ProjectionViewportWidth = Inputs.Camera.ViewportWidth;
+		Solid.ProjectionViewportHeight = Inputs.Camera.ViewportHeight;
+		Solid.ProjectionM00 = Inputs.Camera.ProjectionMatrix.M[0][0];
+		Solid.ProjectionM11 = Inputs.Camera.ProjectionMatrix.M[1][1];
+		Solid.ProjectionM30 = Inputs.Camera.ProjectionMatrix.M[3][0];
+		Solid.ProjectionM31 = Inputs.Camera.ProjectionMatrix.M[3][1];
+		if (Inputs.Camera.bHasProjectionMatrix)
+		{
+			Solid.ProjectionHorizontalSpan = 2.0 / FMath::Abs(Solid.ProjectionM00);
+			Solid.ProjectionVerticalSpan = 2.0 / FMath::Abs(Solid.ProjectionM11);
+		}
 	}
 
 	static void SaveSkippedSolidResult(
@@ -2227,10 +2487,10 @@ namespace
 			return Result;
 		}
 
-		const double Step10OrthoWidth = ResolveStep10OrthoWidth(Inputs.Camera, SelectedFace.PlanePoint);
-		if (Step10OrthoWidth <= 1e-6)
+		if (!Inputs.Camera.bHasProjectionMatrix ||
+			!IsUsableOrthographicProjectionMatrix(Inputs.Camera.ProjectionMatrix))
 		{
-			Result.Error = TEXT("failed to resolve orthographic width for Step 10 solid reconstruction");
+			Result.Error = TEXT("Step 10 has no usable capture projection matrix");
 			return Result;
 		}
 
@@ -2240,7 +2500,7 @@ namespace
 			FVector Hit;
 			if (!IntersectPixelWithPlaneOrthographic(
 				Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
-				P, SelectedFace.PlanePoint, SelectedFace.Normal, Step10OrthoWidth, Hit))
+				P, SelectedFace.PlanePoint, SelectedFace.Normal, Hit))
 			{
 				Result.Error = TEXT("failed to project a source cap point onto the selected source face plane");
 				return Result;
@@ -2250,11 +2510,9 @@ namespace
 		Result.SourceMaterialProbePointsWorld = Result.SourceLoopWorld;
 		Result.SourceMaterialProbePointsWorld.Add(AverageVector(Result.SourceLoopWorld));
 
-		const FVector SourceAnchor = AverageVector(Result.SourceLoopWorld);
-		const double ProbeLength = FMath::Clamp(FaceWorldExtent(SelectedFace) * 0.25, 10.0, 250.0);
 		if (!ProjectSignedWorldDirectionToImage(
 			Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
-			SourceAnchor, Result.OrientedNormal, ProbeLength, Result.ProjectedNormal2D))
+			Result.OrientedNormal, Result.ProjectedNormal2D))
 		{
 			Result.Error = TEXT("source face normal projects to a near-zero image direction; cannot orient extrusion");
 			return Result;
@@ -2268,8 +2526,8 @@ namespace
 
 		Result.MaxDepthSampleReprojectionErrorPixels = FMath::Max(25.0, Result.SourceToCopiedVector2D.Size() * 0.75);
 		if (!SolveExtrusionDepthOrthographic(
-			Inputs.Camera, Inputs.FacesWidth,
-			Result.OrientedNormal, SourceAnchor, Result.SourceToCopiedVector2D,
+			Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
+			Result.OrientedNormal, Result.SourceToCopiedVector2D,
 			Result.ExtrusionDepth, Result.Error))
 		{
 			return Result;
@@ -2292,7 +2550,7 @@ namespace
 			FVector2D Reprojected;
 			if (!ProjectWorldToImageOrthographic(
 				Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
-				Sample.PointOnExtrusion, Step10OrthoWidth, Reprojected))
+				Sample.PointOnExtrusion, Reprojected))
 			{
 				Sample.Error = TEXT("extruded vertex failed to reproject");
 				Result.DepthSamples.Add(Sample);
@@ -2328,13 +2586,14 @@ namespace
 
 		Result.ReprojectedSourceLoop2D.Reserve(Result.SourceLoopWorld.Num());
 		Result.ReprojectedCopiedLoop2D.Reserve(Result.CopiedLoopWorld.Num());
+		double SourceErrorSum = 0.0;
 		double CopiedErrorSum = 0.0;
 		for (int32 i = 0; i < Result.SourceLoopWorld.Num(); ++i)
 		{
 			FVector2D SourceProj;
 			FVector2D CopiedProj;
-			if (!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.SourceLoopWorld[i], Step10OrthoWidth, SourceProj) ||
-				!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.CopiedLoopWorld[i], Step10OrthoWidth, CopiedProj))
+			if (!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.SourceLoopWorld[i], SourceProj) ||
+				!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.CopiedLoopWorld[i], CopiedProj))
 			{
 				Result.Error = TEXT("failed to reproject generated source/copied solid loop");
 				return Result;
@@ -2342,10 +2601,14 @@ namespace
 			Result.ReprojectedSourceLoop2D.Add(SourceProj);
 			Result.ReprojectedCopiedLoop2D.Add(CopiedProj);
 
+			const double SourceError = FVector2D::Distance(SourceProj, Result.SourceLoop2D[i]);
+			SourceErrorSum += SourceError;
+			Result.MaxSourceReprojectionErrorPixels = FMath::Max(Result.MaxSourceReprojectionErrorPixels, SourceError);
 			const double CopiedError = FVector2D::Distance(CopiedProj, Result.CopiedTargetLoop2D[i]);
 			CopiedErrorSum += CopiedError;
 			Result.MaxCopiedReprojectionErrorPixels = FMath::Max(Result.MaxCopiedReprojectionErrorPixels, CopiedError);
 		}
+		Result.MeanSourceReprojectionErrorPixels = SourceErrorSum / double(FMath::Max(1, Result.ReprojectedSourceLoop2D.Num()));
 		Result.MeanCopiedReprojectionErrorPixels = CopiedErrorSum / double(FMath::Max(1, Result.ReprojectedCopiedLoop2D.Num()));
 		if (Result.MaxCopiedReprojectionErrorPixels > Result.MaxDepthSampleReprojectionErrorPixels)
 		{
@@ -2367,15 +2630,18 @@ namespace
 		Result.ReprojectedCopiedLoop2D.Reset();
 		Result.ReprojectedSourceLoop2D.Reserve(Result.SourceLoopWorld.Num());
 		Result.ReprojectedCopiedLoop2D.Reserve(Result.CopiedLoopWorld.Num());
+		Result.MeanSourceReprojectionErrorPixels = 0.0;
+		Result.MaxSourceReprojectionErrorPixels = 0.0;
 		Result.MeanCopiedReprojectionErrorPixels = 0.0;
 		Result.MaxCopiedReprojectionErrorPixels = 0.0;
+		double FinalSourceErrorSum = 0.0;
 		double FinalCopiedErrorSum = 0.0;
 		for (int32 i = 0; i < Result.SourceLoopWorld.Num(); ++i)
 		{
 			FVector2D SourceProj;
 			FVector2D CopiedProj;
-			if (!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.SourceLoopWorld[i], Step10OrthoWidth, SourceProj) ||
-				!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.CopiedLoopWorld[i], Step10OrthoWidth, CopiedProj))
+			if (!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.SourceLoopWorld[i], SourceProj) ||
+				!ProjectWorldToImageOrthographic(Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, Result.CopiedLoopWorld[i], CopiedProj))
 			{
 				Result.Error = TEXT("failed to reproject final solid loop");
 				Result.bSuccess = false;
@@ -2383,10 +2649,14 @@ namespace
 			}
 			Result.ReprojectedSourceLoop2D.Add(SourceProj);
 			Result.ReprojectedCopiedLoop2D.Add(CopiedProj);
+			const double SourceError = FVector2D::Distance(SourceProj, Result.SourceLoop2D[i]);
+			FinalSourceErrorSum += SourceError;
+			Result.MaxSourceReprojectionErrorPixels = FMath::Max(Result.MaxSourceReprojectionErrorPixels, SourceError);
 			const double CopiedError = FVector2D::Distance(CopiedProj, Result.CopiedTargetLoop2D[i]);
 			FinalCopiedErrorSum += CopiedError;
 			Result.MaxCopiedReprojectionErrorPixels = FMath::Max(Result.MaxCopiedReprojectionErrorPixels, CopiedError);
 		}
+		Result.MeanSourceReprojectionErrorPixels = FinalSourceErrorSum / double(FMath::Max(1, Result.ReprojectedSourceLoop2D.Num()));
 		Result.MeanCopiedReprojectionErrorPixels = FinalCopiedErrorSum / double(FMath::Max(1, Result.ReprojectedCopiedLoop2D.Num()));
 		Result.Warning.Reset();
 		if (Result.MaxCopiedReprojectionErrorPixels > Result.MaxDepthSampleReprojectionErrorPixels)
@@ -2604,7 +2874,7 @@ namespace
 			{
 				Candidate.bHasProjectedNormal = ProjectFaceNormalToImage(
 					Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
-					Face, Candidate.PlaneHit, Candidate.ProjectedNormal2D);
+					Face, Candidate.ProjectedNormal2D);
 				if (Candidate.bHasProjectedNormal)
 				{
 					// Test the projected normal against every cap-connected green line;
@@ -5624,7 +5894,7 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
 		return;
 	}
-	if (!LoadFacesJson(Inputs.FacesJsonPath, Inputs.Faces))
+	if (!LoadFacesJson(Inputs.FacesJsonPath, Inputs.Faces, Inputs.FacesProjection))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to read faces json: %s"), *Inputs.FacesJsonPath));
 		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
@@ -5639,13 +5909,15 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 			Inputs.ActorMaterialHeight);
 		const bool bLoadedActorMaterialJson = LoadActorMaterialIdJson(
 			Inputs.ActorMaterialJsonPath,
-			Inputs.ActorMaterialEntryByColorKey);
+			Inputs.ActorMaterialEntryByColorKey,
+			Inputs.ActorMaterialProjection);
 		if (!bLoadedActorMaterialPng || !bLoadedActorMaterialJson)
 		{
 			Inputs.ActorMaterialRGBA.Reset();
 			Inputs.ActorMaterialWidth = 0;
 			Inputs.ActorMaterialHeight = 0;
 			Inputs.ActorMaterialEntryByColorKey.Reset();
+			Inputs.ActorMaterialProjection = FOrthographicProjectionMetadata();
 			UE_LOG(
 				LogTemp,
 				Warning,
@@ -5657,12 +5929,32 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 				*Inputs.ActorMaterialJsonPath);
 		}
 	}
-	if (!LoadCameraJson(Inputs.CaptureJsonPath, Inputs.Camera))
+	FString CameraLoadError;
+	if (!LoadCameraJson(Inputs.CaptureJsonPath, Inputs.Camera, CameraLoadError))
 	{
-		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to read capture camera json: %s"), *Inputs.CaptureJsonPath));
+		SaveCommonFailureForComponents(ComponentNames, PressDir, CameraLoadError);
 		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
 		return;
 	}
+	FString ProjectionValidationError;
+	if (!ValidateProjectionMetadata(Inputs, ProjectionValidationError))
+	{
+		SaveCommonFailureForComponents(ComponentNames, PressDir, ProjectionValidationError);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		return;
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("FaceReconstruct: projection validated press=%s source=%s matrix=(%.17g, %.17g, %.17g, %.17g) span=(%.6f, %.6f)"),
+		*PressId,
+		*Inputs.Camera.ProjectionMatrixSource,
+		Inputs.Camera.ProjectionMatrix.M[0][0],
+		Inputs.Camera.ProjectionMatrix.M[1][1],
+		Inputs.Camera.ProjectionMatrix.M[3][0],
+		Inputs.Camera.ProjectionMatrix.M[3][1],
+		2.0 / FMath::Abs(Inputs.Camera.ProjectionMatrix.M[0][0]),
+		2.0 / FMath::Abs(Inputs.Camera.ProjectionMatrix.M[1][1]));
 	FString FaceLookupError;
 	if (!BuildFaceLookups(Inputs, FaceLookupError))
 	{

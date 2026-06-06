@@ -2707,26 +2707,409 @@ namespace FromLZImageOps
 		}
 	} // namespace CapOps
 
-	static constexpr float CapLoopGraphNodeSnapTol = 3.0f;
+	// After real intersections and synthetic endpoint connectors are added, merge
+	// the blue graph endpoints in 09_all_red_black_graph.png within this radius.
+	static constexpr float CapLoopGraphNodeSnapTol = 5.0f;
+	static constexpr double CapGeometryEpsilon = 1e-6;
+	static constexpr double CapEndpointDirectionArc = 5.0;
 
-	struct FCapEndpointRef
+	struct FCapStrokeSplit
 	{
-		int32 StrokeId = -1;
-		int32 EndpointIndex = 0;
+		int32 SegmentIndex = -1;
+		double T = 0.0;
 		FVector2D Pos = FVector2D::ZeroVector;
-		EStrokeColor Color = EStrokeColor::None;
 	};
 
-	static uint64 EndpointPairKey(const FCapEndpointRef& A, const FCapEndpointRef& B)
+	struct FCapSegmentHit
 	{
-		const uint32 AKey = static_cast<uint32>(A.StrokeId * 2 + A.EndpointIndex);
-		const uint32 BKey = static_cast<uint32>(B.StrokeId * 2 + B.EndpointIndex);
-		const uint32 Lo = FMath::Min(AKey, BKey);
-		const uint32 Hi = FMath::Max(AKey, BKey);
-		return (static_cast<uint64>(Lo) << 32) | static_cast<uint64>(Hi);
+		double T = 0.0;
+		double U = 0.0;
+		FVector2D Pos = FVector2D::ZeroVector;
+	};
+
+	static double Cross2D(const FVector2D& A, const FVector2D& B)
+	{
+		return A.X * B.Y - A.Y * B.X;
 	}
 
-	static void BuildEndpointConnectorAugmentedStrokes(
+	static void AddSegmentHit(
+		TArray<FCapSegmentHit>& OutHits,
+		double T,
+		double U,
+		const FVector2D& Pos)
+	{
+		for (const FCapSegmentHit& Existing : OutHits)
+		{
+			if (FVector2D::DistSquared(Existing.Pos, Pos) <= CapGeometryEpsilon * CapGeometryEpsilon)
+			{
+				return;
+			}
+		}
+
+		FCapSegmentHit Hit;
+		Hit.T = FMath::Clamp(T, 0.0, 1.0);
+		Hit.U = FMath::Clamp(U, 0.0, 1.0);
+		Hit.Pos = Pos;
+		OutHits.Add(Hit);
+	}
+
+	static void FindSegmentIntersections(
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C,
+		const FVector2D& D,
+		TArray<FCapSegmentHit>& OutHits)
+	{
+		OutHits.Reset();
+		const FVector2D R = B - A;
+		const FVector2D S = D - C;
+		const double RLen2 = R.SizeSquared();
+		const double SLen2 = S.SizeSquared();
+		if (RLen2 <= CapGeometryEpsilon || SLen2 <= CapGeometryEpsilon)
+		{
+			return;
+		}
+
+		const FVector2D CA = C - A;
+		const double RCrossS = Cross2D(R, S);
+		const double CACrossR = Cross2D(CA, R);
+		if (FMath::Abs(RCrossS) > CapGeometryEpsilon)
+		{
+			const double T = Cross2D(CA, S) / RCrossS;
+			const double U = CACrossR / RCrossS;
+			if (T >= -CapGeometryEpsilon && T <= 1.0 + CapGeometryEpsilon &&
+				U >= -CapGeometryEpsilon && U <= 1.0 + CapGeometryEpsilon)
+			{
+				const double ClampedT = FMath::Clamp(T, 0.0, 1.0);
+				AddSegmentHit(OutHits, ClampedT, U, A + R * ClampedT);
+			}
+			return;
+		}
+
+		if (FMath::Abs(CACrossR) > CapGeometryEpsilon)
+		{
+			return;
+		}
+
+		// Collinear overlap: its boundaries are sufficient to planarize both polylines.
+		const double T0 = FVector2D::DotProduct(C - A, R) / RLen2;
+		const double T1 = FVector2D::DotProduct(D - A, R) / RLen2;
+		const double Lo = FMath::Max(0.0, FMath::Min(T0, T1));
+		const double Hi = FMath::Min(1.0, FMath::Max(T0, T1));
+		if (Lo > Hi + CapGeometryEpsilon)
+		{
+			return;
+		}
+
+		auto AddCollinearBoundary = [&](double T)
+		{
+			const FVector2D Pos = A + R * T;
+			const double U = FVector2D::DotProduct(Pos - C, S) / SLen2;
+			AddSegmentHit(OutHits, T, U, Pos);
+		};
+		AddCollinearBoundary(Lo);
+		if (Hi - Lo > CapGeometryEpsilon)
+		{
+			AddCollinearBoundary(Hi);
+		}
+	}
+
+	static void AddStrokeSplit(
+		TArray<TArray<FCapStrokeSplit>>& SplitsByStroke,
+		int32 StrokeId,
+		int32 SegmentIndex,
+		double T,
+		const FVector2D& Pos)
+	{
+		if (!SplitsByStroke.IsValidIndex(StrokeId))
+		{
+			return;
+		}
+		TArray<FCapStrokeSplit>& Splits = SplitsByStroke[StrokeId];
+		for (const FCapStrokeSplit& Existing : Splits)
+		{
+			if (FVector2D::DistSquared(Existing.Pos, Pos) <= CapGeometryEpsilon * CapGeometryEpsilon)
+			{
+				return;
+			}
+		}
+
+		FCapStrokeSplit Split;
+		Split.SegmentIndex = SegmentIndex;
+		Split.T = FMath::Clamp(T, 0.0, 1.0);
+		Split.Pos = Pos;
+		Splits.Add(Split);
+	}
+
+	static void AppendPlanarStrokeFragments(
+		const FColoredStroke& Source,
+		const TArray<FCapStrokeSplit>& SourceSplits,
+		TArray<FColoredStroke>& OutStrokes)
+	{
+		if (Source.Points.Num() < 2 || SourceSplits.Num() == 0)
+		{
+			OutStrokes.Add(Source);
+			return;
+		}
+
+		TArray<FCapStrokeSplit> Splits = SourceSplits;
+		Splits.Sort([](const FCapStrokeSplit& A, const FCapStrokeSplit& B)
+		{
+			const double AKey = double(A.SegmentIndex) + A.T;
+			const double BKey = double(B.SegmentIndex) + B.T;
+			return AKey < BKey;
+		});
+
+		TArray<TArray<FCapStrokeSplit>> SegmentSplits;
+		SegmentSplits.SetNum(Source.Points.Num() - 1);
+		for (const FCapStrokeSplit& Split : Splits)
+		{
+			if (SegmentSplits.IsValidIndex(Split.SegmentIndex))
+			{
+				SegmentSplits[Split.SegmentIndex].Add(Split);
+			}
+		}
+
+		auto AppendFragment = [&](const FStroke& Points)
+		{
+			if (Points.Num() < 2)
+			{
+				return;
+			}
+			double Arc = 0.0;
+			for (int32 i = 1; i < Points.Num(); ++i)
+			{
+				Arc += (Points[i] - Points[i - 1]).Size();
+			}
+			if (Arc <= CapGeometryEpsilon)
+			{
+				return;
+			}
+
+			FColoredStroke Fragment = Source;
+			Fragment.Points = Points;
+			Fragment.ConnectionPointCount = 0;
+			Fragment.bHasMetrics = false;
+			OutStrokes.Add(MoveTemp(Fragment));
+		};
+
+		FStroke Current;
+		Current.Add(Source.Points[0]);
+		for (int32 SegmentIndex = 0; SegmentIndex + 1 < Source.Points.Num(); ++SegmentIndex)
+		{
+			for (const FCapStrokeSplit& Split : SegmentSplits[SegmentIndex])
+			{
+				if (FVector2D::DistSquared(Current.Last(), Split.Pos) > CapGeometryEpsilon * CapGeometryEpsilon)
+				{
+					Current.Add(Split.Pos);
+				}
+				AppendFragment(Current);
+				Current.Reset();
+				Current.Add(Split.Pos);
+			}
+
+			const FVector2D& SegmentEnd = Source.Points[SegmentIndex + 1];
+			if (FVector2D::DistSquared(Current.Last(), SegmentEnd) > CapGeometryEpsilon * CapGeometryEpsilon)
+			{
+				Current.Add(SegmentEnd);
+			}
+		}
+		AppendFragment(Current);
+	}
+
+	static FVector2D GetEndpointOutwardDirection(const FStroke& Points, int32 EndpointIndex)
+	{
+		if (Points.Num() < 2)
+		{
+			return FVector2D::ZeroVector;
+		}
+
+		const bool bStart = EndpointIndex == 0;
+		const int32 EndpointPointIndex = bStart ? 0 : Points.Num() - 1;
+		const int32 Step = bStart ? 1 : -1;
+		FVector2D Interior = Points[EndpointPointIndex];
+		double Arc = 0.0;
+		for (int32 i = EndpointPointIndex + Step; i >= 0 && i < Points.Num(); i += Step)
+		{
+			Arc += (Points[i] - Interior).Size();
+			Interior = Points[i];
+			if (Arc >= CapEndpointDirectionArc)
+			{
+				break;
+			}
+		}
+		return (Points[EndpointPointIndex] - Interior).GetSafeNormal();
+	}
+
+	struct FCapRedDeadEnd
+	{
+		FVector2D Pos = FVector2D::ZeroVector;
+		FVector2D Forward = FVector2D::ZeroVector;
+	};
+
+	struct FCapRedTopologyNode
+	{
+		FVector2D Pos = FVector2D::ZeroVector;
+		int32 Degree = 0;
+		int32 IncidentStrokeId = INDEX_NONE;
+		int32 IncidentEndpointIndex = 0;
+	};
+
+	static void CollectPlanarRedDeadEnds(
+		const TArray<FColoredStroke>& SourceStrokes,
+		const TArray<int32>& RedIdx,
+		const TArray<TArray<FCapStrokeSplit>>& SplitsByStroke,
+		TArray<FCapRedDeadEnd>& OutDeadEnds)
+	{
+		OutDeadEnds.Reset();
+
+		TArray<FColoredStroke> PlanarRedStrokes;
+		for (int32 RedStrokeId : RedIdx)
+		{
+			if (SourceStrokes.IsValidIndex(RedStrokeId) && SplitsByStroke.IsValidIndex(RedStrokeId))
+			{
+				AppendPlanarStrokeFragments(
+					SourceStrokes[RedStrokeId],
+					SplitsByStroke[RedStrokeId],
+					PlanarRedStrokes);
+			}
+		}
+
+		TArray<FCapRedTopologyNode> Nodes;
+		const double TopologyTol2 = CapGeometryEpsilon * CapGeometryEpsilon;
+		for (int32 StrokeId = 0; StrokeId < PlanarRedStrokes.Num(); ++StrokeId)
+		{
+			const FStroke& Points = PlanarRedStrokes[StrokeId].Points;
+			if (Points.Num() < 2)
+			{
+				continue;
+			}
+
+			for (int32 EndpointIndex = 0; EndpointIndex < 2; ++EndpointIndex)
+			{
+				const FVector2D Endpoint = EndpointIndex == 0 ? Points[0] : Points.Last();
+				int32 NodeId = INDEX_NONE;
+				for (int32 CandidateNodeId = 0; CandidateNodeId < Nodes.Num(); ++CandidateNodeId)
+				{
+					if (FVector2D::DistSquared(Endpoint, Nodes[CandidateNodeId].Pos) <= TopologyTol2)
+					{
+						NodeId = CandidateNodeId;
+						break;
+					}
+				}
+
+				if (NodeId == INDEX_NONE)
+				{
+					NodeId = Nodes.AddDefaulted();
+					Nodes[NodeId].Pos = Endpoint;
+				}
+
+				FCapRedTopologyNode& Node = Nodes[NodeId];
+				++Node.Degree;
+				Node.IncidentStrokeId = StrokeId;
+				Node.IncidentEndpointIndex = EndpointIndex;
+			}
+		}
+
+		for (const FCapRedTopologyNode& Node : Nodes)
+		{
+			if (Node.Degree != 1 || !PlanarRedStrokes.IsValidIndex(Node.IncidentStrokeId))
+			{
+				continue;
+			}
+
+			const FVector2D Forward = GetEndpointOutwardDirection(
+				PlanarRedStrokes[Node.IncidentStrokeId].Points,
+				Node.IncidentEndpointIndex);
+			if (Forward.IsNearlyZero())
+			{
+				continue;
+			}
+
+			FCapRedDeadEnd DeadEnd;
+			DeadEnd.Pos = Node.Pos;
+			DeadEnd.Forward = Forward;
+			OutDeadEnds.Add(DeadEnd);
+		}
+	}
+
+	static bool ClosestPointOnSegmentInForwardHalfPlane(
+		const FVector2D& Endpoint,
+		const FVector2D& Forward,
+		const FVector2D& A,
+		const FVector2D& B,
+		double& OutT,
+		FVector2D& OutPoint)
+	{
+		const FVector2D Segment = B - A;
+		const double SegmentLen2 = Segment.SizeSquared();
+		if (SegmentLen2 <= CapGeometryEpsilon)
+		{
+			return false;
+		}
+
+		const double DA = FVector2D::DotProduct(A - Endpoint, Forward);
+		const double DB = FVector2D::DotProduct(B - Endpoint, Forward);
+		if (DA < -CapGeometryEpsilon && DB < -CapGeometryEpsilon)
+		{
+			return false;
+		}
+
+		double MinT = 0.0;
+		double MaxT = 1.0;
+		if (DA < -CapGeometryEpsilon)
+		{
+			MinT = FMath::Clamp(-DA / (DB - DA), 0.0, 1.0);
+		}
+		else if (DB < -CapGeometryEpsilon)
+		{
+			MaxT = FMath::Clamp(-DA / (DB - DA), 0.0, 1.0);
+		}
+		if (MinT > MaxT + CapGeometryEpsilon)
+		{
+			return false;
+		}
+
+		const double ProjectionT = FVector2D::DotProduct(Endpoint - A, Segment) / SegmentLen2;
+		OutT = FMath::Clamp(ProjectionT, MinT, MaxT);
+		OutPoint = A + Segment * OutT;
+		return FVector2D::DotProduct(OutPoint - Endpoint, Forward) >= -CapGeometryEpsilon;
+	}
+
+	static bool EndpointTouchesAnyBlackStroke(
+		const FVector2D& Endpoint,
+		const TArray<FColoredStroke>& SourceStrokes,
+		const TArray<int32>& BlackIdx)
+	{
+		for (int32 BlackStrokeId : BlackIdx)
+		{
+			if (!SourceStrokes.IsValidIndex(BlackStrokeId))
+			{
+				continue;
+			}
+			const FStroke& Points = SourceStrokes[BlackStrokeId].Points;
+			for (int32 SegmentIndex = 0; SegmentIndex + 1 < Points.Num(); ++SegmentIndex)
+			{
+				const FVector2D Segment = Points[SegmentIndex + 1] - Points[SegmentIndex];
+				const double SegmentLen2 = Segment.SizeSquared();
+				if (SegmentLen2 <= CapGeometryEpsilon)
+				{
+					continue;
+				}
+				const double T = FMath::Clamp(
+					FVector2D::DotProduct(Endpoint - Points[SegmentIndex], Segment) / SegmentLen2,
+					0.0, 1.0);
+				const FVector2D Closest = Points[SegmentIndex] + Segment * T;
+				if (FVector2D::DistSquared(Endpoint, Closest) <= CapGeometryEpsilon * CapGeometryEpsilon)
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	static void BuildPlanarEndpointConnectorStrokes(
 		const TArray<FColoredStroke>& SourceStrokes,
 		const TArray<int32>& RedIdx,
 		const TArray<int32>& BlackIdx,
@@ -2734,92 +3117,134 @@ namespace FromLZImageOps
 		TArray<FColoredStroke>& OutStrokes,
 		int32& OutFirstSyntheticStrokeId)
 	{
-		OutStrokes = SourceStrokes;
-		OutFirstSyntheticStrokeId = OutStrokes.Num();
+		TArray<TArray<FCapStrokeSplit>> SplitsByStroke;
+		SplitsByStroke.SetNum(SourceStrokes.Num());
+		int32 TrueIntersectionCount = 0;
 
-		TArray<FCapEndpointRef> Endpoints;
-		Endpoints.Reserve((RedIdx.Num() + BlackIdx.Num()) * 2);
-		auto AddStrokeEndpoints = [&](int32 StrokeId)
+		// First planarize every real red/black polyline intersection.
+		TArray<FCapSegmentHit> Hits;
+		for (int32 RedStrokeId : RedIdx)
 		{
-			if (!SourceStrokes.IsValidIndex(StrokeId))
+			if (!SourceStrokes.IsValidIndex(RedStrokeId))
 			{
-				return;
+				continue;
 			}
-			const FColoredStroke& S = SourceStrokes[StrokeId];
-			if (S.Points.Num() < 2)
+			const FStroke& RedPoints = SourceStrokes[RedStrokeId].Points;
+			for (int32 BlackStrokeId : BlackIdx)
 			{
-				return;
-			}
-			FCapEndpointRef Start;
-			Start.StrokeId = StrokeId;
-			Start.EndpointIndex = 0;
-			Start.Pos = S.Points[0];
-			Start.Color = S.Color;
-			Endpoints.Add(Start);
-
-			FCapEndpointRef End;
-			End.StrokeId = StrokeId;
-			End.EndpointIndex = 1;
-			End.Pos = S.Points.Last();
-			End.Color = S.Color;
-			Endpoints.Add(End);
-		};
-		for (int32 r : RedIdx) { AddStrokeEndpoints(r); }
-		for (int32 b : BlackIdx) { AddStrokeEndpoints(b); }
-
-		const double Tol2 = double(ConnectorTol) * double(ConnectorTol);
-		const double SnapTol2 = double(CapLoopGraphNodeSnapTol) * double(CapLoopGraphNodeSnapTol);
-		TSet<uint64> AddedPairs;
-		for (int32 i = 0; i < Endpoints.Num(); ++i)
-		{
-			int32 Best = INDEX_NONE;
-			double BestD2 = TNumericLimits<double>::Max();
-			for (int32 j = 0; j < Endpoints.Num(); ++j)
-			{
-				if (i == j || Endpoints[i].StrokeId == Endpoints[j].StrokeId)
+				if (!SourceStrokes.IsValidIndex(BlackStrokeId))
 				{
 					continue;
 				}
-				const double D2 = FVector2D::DistSquared(Endpoints[i].Pos, Endpoints[j].Pos);
-				if (D2 <= Tol2 && D2 < BestD2)
+				const FStroke& BlackPoints = SourceStrokes[BlackStrokeId].Points;
+				for (int32 RedSegment = 0; RedSegment + 1 < RedPoints.Num(); ++RedSegment)
 				{
-					BestD2 = D2;
-					Best = j;
+					for (int32 BlackSegment = 0; BlackSegment + 1 < BlackPoints.Num(); ++BlackSegment)
+					{
+						FindSegmentIntersections(
+							RedPoints[RedSegment], RedPoints[RedSegment + 1],
+							BlackPoints[BlackSegment], BlackPoints[BlackSegment + 1],
+							Hits);
+						for (const FCapSegmentHit& Hit : Hits)
+						{
+							const int32 BeforeRed = SplitsByStroke[RedStrokeId].Num();
+							AddStrokeSplit(SplitsByStroke, RedStrokeId, RedSegment, Hit.T, Hit.Pos);
+							AddStrokeSplit(SplitsByStroke, BlackStrokeId, BlackSegment, Hit.U, Hit.Pos);
+							if (SplitsByStroke[RedStrokeId].Num() > BeforeRed)
+							{
+								++TrueIntersectionCount;
+							}
+						}
+					}
 				}
 			}
-			if (Best == INDEX_NONE || BestD2 <= SnapTol2)
-			{
-				continue;
-			}
-
-			const uint64 PairKey = EndpointPairKey(Endpoints[i], Endpoints[Best]);
-			if (AddedPairs.Contains(PairKey))
-			{
-				continue;
-			}
-			AddedPairs.Add(PairKey);
-
-			const FVector2D A = Endpoints[i].Pos;
-			const FVector2D B = Endpoints[Best].Pos;
-			const double Dist = FMath::Sqrt(BestD2);
-			FColoredStroke Connector;
-			Connector.Points.Add(A);
-			Connector.Points.Add(B);
-			Connector.Color = (Endpoints[i].Color == EStrokeColor::Black && Endpoints[Best].Color == EStrokeColor::Black)
-				? EStrokeColor::Black
-				: EStrokeColor::Red;
-			Connector.ConnectionPointCount = Connector.Points.Num();
-			Connector.bHasMetrics = true;
-			Connector.Arc = Dist;
-			Connector.Chord = Dist;
-			Connector.Straightness = 1.0;
-			Connector.P90PcaError = 0.0;
-			Connector.PcaRmsError = 0.0;
-			Connector.P90ChordDev = 0.0;
-			Connector.ChordDevRatio = 0.0;
-			Connector.Direction = Dist > KINDA_SMALL_NUMBER ? (B - A) / Dist : FVector2D::ZeroVector;
-			OutStrokes.Add(Connector);
 		}
+
+		// Build the red topology after real intersection splitting. Only nodes with one
+		// incident red fragment are dead ends; shared red endpoints, loops, and branches
+		// must not initiate connectors. This uses only geometric equality, not the final
+		// 5px graph-node snap.
+		TArray<FColoredStroke> SyntheticConnectors;
+		TArray<FCapRedDeadEnd> RedDeadEnds;
+		CollectPlanarRedDeadEnds(SourceStrokes, RedIdx, SplitsByStroke, RedDeadEnds);
+		const double ConnectorTol2 = double(ConnectorTol) * double(ConnectorTol);
+		for (const FCapRedDeadEnd& DeadEnd : RedDeadEnds)
+		{
+			const FVector2D Endpoint = DeadEnd.Pos;
+			if (EndpointTouchesAnyBlackStroke(Endpoint, SourceStrokes, BlackIdx))
+			{
+				continue;
+			}
+
+			int32 BestBlackStrokeId = INDEX_NONE;
+			int32 BestBlackSegment = INDEX_NONE;
+			double BestBlackT = 0.0;
+			double BestD2 = TNumericLimits<double>::Max();
+			FVector2D BestPoint = FVector2D::ZeroVector;
+			for (int32 BlackStrokeId : BlackIdx)
+			{
+				if (!SourceStrokes.IsValidIndex(BlackStrokeId))
+				{
+					continue;
+				}
+				const FStroke& BlackPoints = SourceStrokes[BlackStrokeId].Points;
+				for (int32 SegmentIndex = 0; SegmentIndex + 1 < BlackPoints.Num(); ++SegmentIndex)
+				{
+					double SegmentT = 0.0;
+					FVector2D CandidatePoint;
+					if (!ClosestPointOnSegmentInForwardHalfPlane(
+						Endpoint, DeadEnd.Forward,
+						BlackPoints[SegmentIndex], BlackPoints[SegmentIndex + 1],
+						SegmentT, CandidatePoint))
+					{
+						continue;
+					}
+					const double D2 = FVector2D::DistSquared(Endpoint, CandidatePoint);
+					if (D2 <= ConnectorTol2 && D2 < BestD2)
+					{
+						BestBlackStrokeId = BlackStrokeId;
+						BestBlackSegment = SegmentIndex;
+						BestBlackT = SegmentT;
+						BestD2 = D2;
+						BestPoint = CandidatePoint;
+					}
+				}
+			}
+			if (BestBlackStrokeId == INDEX_NONE || BestD2 <= CapGeometryEpsilon * CapGeometryEpsilon)
+			{
+				continue;
+			}
+
+			AddStrokeSplit(
+				SplitsByStroke,
+				BestBlackStrokeId,
+				BestBlackSegment,
+				BestBlackT,
+				BestPoint);
+
+			FColoredStroke Connector;
+			Connector.Points.Add(Endpoint);
+			Connector.Points.Add(BestPoint);
+			Connector.Color = EStrokeColor::Red;
+			Connector.ConnectionPointCount = Connector.Points.Num();
+			SyntheticConnectors.Add(MoveTemp(Connector));
+		}
+
+		OutStrokes.Reset();
+		for (int32 StrokeId = 0; StrokeId < SourceStrokes.Num(); ++StrokeId)
+		{
+			AppendPlanarStrokeFragments(SourceStrokes[StrokeId], SplitsByStroke[StrokeId], OutStrokes);
+		}
+		OutFirstSyntheticStrokeId = OutStrokes.Num();
+		OutStrokes.Append(MoveTemp(SyntheticConnectors));
+		ComputeStrokeMetrics(OutStrokes);
+
+		UE_LOG(LogTemp, Log,
+			TEXT("Sketch2D Step 9 topology: %d red/black intersection(s), %d red dead-end(s), %d forward connector(s), %d planar stroke(s)"),
+			TrueIntersectionCount,
+			RedDeadEnds.Num(),
+			OutStrokes.Num() - OutFirstSyntheticStrokeId,
+			OutStrokes.Num());
 	}
 
 	struct FLoopCandidate
@@ -3428,7 +3853,7 @@ namespace FromLZImageOps
 
 		TArray<FColoredStroke> TraceStrokes;
 		int32 FirstSyntheticStrokeId = Strokes.Num();
-		BuildEndpointConnectorAugmentedStrokes(
+		BuildPlanarEndpointConnectorStrokes(
 			Strokes, SourceRedIdx, SourceBlackIdx, ConnectorTol,
 			TraceStrokes, FirstSyntheticStrokeId);
 

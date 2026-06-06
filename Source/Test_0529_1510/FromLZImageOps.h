@@ -153,17 +153,22 @@ namespace FromLZImageOps
 	};
 
 	// Step 9: detect every red cap loop in one pipeline run and recover its extrusion.
-	// Strokes are already split at every junction/crossing during step-7 tracing, so loops
-	// close purely through shared endpoints. Components are red-driven: red-only loops are
+	// Real red/black polyline intersections are planarized into shared endpoints first.
+	// The planarized red strokes then form an exact-coordinate topology; only red nodes with
+	// degree 1 search their outward 180-degree half-plane for the nearest black polyline
+	// segment within ConnectorTol. The black stroke is split at the projection and an explicit
+	// red connector is added. Degree-2 loop/chain nodes, branches, and red interior vertices
+	// never initiate this search.
+	// Components are red-driven: red-only loops are
 	// selected first, remaining red candidates trace through all black strokes only to close
 	// their own endpoints, and a final fallback may combine remaining red strokes through the
 	// same all-black endpoint graph. Black strokes never define the initial component split.
 	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
 	// an Action.json is written to ActionPressDir/Component_%%/: "excavate" when one of that
 	// component's local green strokes lies inside the cap polygon, otherwise "attach". Returns
-	// the number of caps found and fills OutResults (one per Component_%%, in folder order). ConnectorTol searches
-	// red/black endpoints for explicit connector strokes; graph nodes then snap only very near
-	// coincident endpoints instead of silently clustering by the full connector radius.
+	// the number of caps found and fills OutResults (one per Component_%%, in folder order).
+	// After planarization and connector insertion, graph endpoints within 5px are
+	// merged into shared nodes before the existing component extraction begins.
 	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float ConnectorTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults);
 
 	// Debug render of the recovered extrusion: cap loop, translated cap, and side connectors.

@@ -7,6 +7,7 @@
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/Engine.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/Scene.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -17,6 +18,7 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Materials/MaterialInterface.h"
@@ -26,6 +28,7 @@
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
 #include "RenderingThread.h"
+#include "SceneView.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "ProceduralMeshComponent.h"
@@ -35,7 +38,301 @@
 #include "UObject/FieldIterator.h"
 #include "UObject/UnrealType.h"
 
-static constexpr double FromLZCaptureOrthoWidth = 1536.0;
+static constexpr double FromLZDefaultOrthoWidth = 1536.0;
+static constexpr float FromLZCaptureOrthoNearPlane = 0.0f;
+static constexpr float FromLZCaptureOrthoFarPlane = 2097152.0f;
+static constexpr double FromLZOrthographicSettleSeconds = 2.0;
+static constexpr double FromLZMaxPendingCaptureSeconds = 10.0;
+
+struct FFromLZCaptureView
+{
+	FTransform SourceViewTransform = FTransform::Identity;
+	FTransform Transform = FTransform::Identity;
+	FVector FocusPoint = FVector::ZeroVector;
+	FVector ReferencePoint = FVector::ZeroVector;
+	FString FocusSource;
+	FString ReferenceSource;
+	FString SourceViewTransformSource;
+	FString TransformSource;
+	FString OrthoWidthMode;
+	FString FramingMode;
+	FIntPoint ViewportSize = FIntPoint(1920, 1080);
+	double ViewportAspectRatio = 16.0 / 9.0;
+	double Fov = 90.0;
+	double FocusDepth = 0.0;
+	double ReferenceDepth = 0.0;
+	double OrthoWidth = FromLZDefaultOrthoWidth;
+	double OrthoBackoff = FromLZDefaultOrthoWidth;
+	FMatrix ProjectionMatrix = FMatrix::Identity;
+	bool bHasPlayerCameraManager = false;
+	bool bUseViewportProjectionMatrix = false;
+	bool bUsedDeprojectWidth = false;
+	bool bUsedFormulaFallback = false;
+	bool bUsedDepthFallback = false;
+	bool bUsedFocusTrace = false;
+};
+
+struct FFromLZCameraProjectionSnapshot
+{
+	ECameraProjectionMode::Type ProjectionMode = ECameraProjectionMode::Perspective;
+	float FieldOfView = 90.0f;
+	float OrthoWidth = static_cast<float>(FromLZDefaultOrthoWidth);
+	float OrthoNearClipPlane = FromLZCaptureOrthoNearPlane;
+	float OrthoFarClipPlane = FromLZCaptureOrthoFarPlane;
+	float AutoPlaneShift = 0.0f;
+	float AspectRatio = 16.0f / 9.0f;
+	bool bAutoCalculateOrthoPlanes = false;
+	bool bUpdateOrthoPlanes = false;
+	bool bUseCameraHeightAsViewTarget = false;
+	bool bConstrainAspectRatio = false;
+};
+
+struct FFromLZViewDebugSnapshot
+{
+	FString Stage;
+	FTransform PawnTransform = FTransform::Identity;
+	FTransform CameraComponentTransform = FTransform::Identity;
+	FTransform CameraBoomTransform = FTransform::Identity;
+	FFromLZCameraProjectionSnapshot CameraProjection;
+	FMinimalViewInfo PlayerCameraView;
+	FVector FinalViewOrigin = FVector::ZeroVector;
+	FVector CameraToViewTarget = FVector::ZeroVector;
+	FMatrix FinalViewRotationMatrix = FMatrix::Identity;
+	FMatrix FinalProjectionMatrix = FMatrix::Identity;
+	FIntRect ViewRect;
+	FIntRect ConstrainedViewRect;
+	bool bHasCameraBoom = false;
+	bool bHasPlayerCameraManager = false;
+	bool bHasProjectionData = false;
+};
+
+static bool IsUsableOrthographicProjectionMatrix(const FMatrix& Matrix)
+{
+	return
+		FMath::IsFinite(Matrix.M[0][0]) &&
+		FMath::IsFinite(Matrix.M[1][1]) &&
+		FMath::Abs(Matrix.M[0][0]) > UE_SMALL_NUMBER &&
+		FMath::Abs(Matrix.M[1][1]) > UE_SMALL_NUMBER &&
+		FMath::IsNearlyZero(Matrix.M[2][3]) &&
+		FMath::IsNearlyEqual(Matrix.M[3][3], 1.0);
+}
+
+static bool AreProjectionMatricesNearlyEqual(
+	const FMatrix& A,
+	const FMatrix& B,
+	double Tolerance = 1e-9)
+{
+	for (int32 Row = 0; Row < 4; ++Row)
+	{
+		for (int32 Column = 0; Column < 4; ++Column)
+		{
+			if (!FMath::IsNearlyEqual(A.M[Row][Column], B.M[Row][Column], Tolerance))
+			{
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
+static bool TryGetOrthographicViewPlanePosition(
+	const FMatrix& ProjectionMatrix,
+	double NdcX,
+	double NdcY,
+	double& OutRight,
+	double& OutUp)
+{
+	if (!IsUsableOrthographicProjectionMatrix(ProjectionMatrix))
+	{
+		return false;
+	}
+
+	OutRight = (NdcX - ProjectionMatrix.M[3][0]) / ProjectionMatrix.M[0][0];
+	OutUp = (NdcY - ProjectionMatrix.M[3][1]) / ProjectionMatrix.M[1][1];
+	return FMath::IsFinite(OutRight) && FMath::IsFinite(OutUp);
+}
+
+static TSharedRef<FJsonObject> SerializeMatrix(const FMatrix& Matrix);
+
+static FFromLZCameraProjectionSnapshot MakeCameraProjectionSnapshot(const UCameraComponent* Camera)
+{
+	FFromLZCameraProjectionSnapshot Snapshot;
+	if (!Camera)
+	{
+		return Snapshot;
+	}
+
+	Snapshot.ProjectionMode = Camera->ProjectionMode;
+	Snapshot.FieldOfView = Camera->FieldOfView;
+	Snapshot.OrthoWidth = Camera->OrthoWidth;
+	Snapshot.OrthoNearClipPlane = Camera->OrthoNearClipPlane;
+	Snapshot.OrthoFarClipPlane = Camera->OrthoFarClipPlane;
+	Snapshot.AutoPlaneShift = Camera->AutoPlaneShift;
+	Snapshot.AspectRatio = Camera->AspectRatio;
+	Snapshot.bAutoCalculateOrthoPlanes = Camera->bAutoCalculateOrthoPlanes;
+	Snapshot.bUpdateOrthoPlanes = Camera->bUpdateOrthoPlanes;
+	Snapshot.bUseCameraHeightAsViewTarget = Camera->bUseCameraHeightAsViewTarget;
+	Snapshot.bConstrainAspectRatio = Camera->bConstrainAspectRatio;
+	return Snapshot;
+}
+
+static FString ProjectionModeToString(ECameraProjectionMode::Type ProjectionMode)
+{
+	if (const UEnum* Enum = StaticEnum<ECameraProjectionMode::Type>())
+	{
+		return Enum->GetValueAsString(ProjectionMode);
+	}
+	return ProjectionMode == ECameraProjectionMode::Orthographic ? TEXT("Orthographic") : TEXT("Perspective");
+}
+
+static TSharedRef<FJsonObject> SerializeCameraProjectionSnapshot(const FFromLZCameraProjectionSnapshot& Snapshot)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("projection_mode"), ProjectionModeToString(Snapshot.ProjectionMode));
+	Object->SetNumberField(TEXT("field_of_view"), Snapshot.FieldOfView);
+	Object->SetNumberField(TEXT("ortho_width"), Snapshot.OrthoWidth);
+	Object->SetNumberField(TEXT("ortho_near_clip_plane"), Snapshot.OrthoNearClipPlane);
+	Object->SetNumberField(TEXT("ortho_far_clip_plane"), Snapshot.OrthoFarClipPlane);
+	Object->SetNumberField(TEXT("auto_plane_shift"), Snapshot.AutoPlaneShift);
+	Object->SetNumberField(TEXT("aspect_ratio"), Snapshot.AspectRatio);
+	Object->SetBoolField(TEXT("auto_calculate_ortho_planes"), Snapshot.bAutoCalculateOrthoPlanes);
+	Object->SetBoolField(TEXT("update_ortho_planes"), Snapshot.bUpdateOrthoPlanes);
+	Object->SetBoolField(TEXT("use_camera_height_as_view_target"), Snapshot.bUseCameraHeightAsViewTarget);
+	Object->SetBoolField(TEXT("constrain_aspect_ratio"), Snapshot.bConstrainAspectRatio);
+	return Object;
+}
+
+static double ResolveCameraOrthoWidthOrDefault(const UCameraComponent* Camera)
+{
+	const double CameraOrthoWidth = Camera ? static_cast<double>(Camera->OrthoWidth) : 0.0;
+	if (FMath::IsFinite(CameraOrthoWidth) && CameraOrthoWidth > 1e-6)
+	{
+		return CameraOrthoWidth;
+	}
+	return FromLZDefaultOrthoWidth;
+}
+
+struct FScopedFromLZCameraProjectionOverride
+{
+	explicit FScopedFromLZCameraProjectionOverride(UCameraComponent* InCamera)
+		: Camera(InCamera)
+	{
+		if (!InCamera)
+		{
+			return;
+		}
+
+		Original = MakeCameraProjectionSnapshot(InCamera);
+		CaptureOrthoWidth = ResolveCameraOrthoWidthOrDefault(InCamera);
+		bUsedDefaultOrthoWidth = !(FMath::IsFinite(static_cast<double>(Original.OrthoWidth)) && static_cast<double>(Original.OrthoWidth) > 1e-6);
+		InCamera->ProjectionMode = ECameraProjectionMode::Orthographic;
+		InCamera->OrthoWidth = static_cast<float>(CaptureOrthoWidth);
+		InCamera->bAutoCalculateOrthoPlanes = false;
+		InCamera->AutoPlaneShift = 0.0f;
+		InCamera->bUpdateOrthoPlanes = false;
+		InCamera->bUseCameraHeightAsViewTarget = false;
+		InCamera->OrthoNearClipPlane = FromLZCaptureOrthoNearPlane;
+		InCamera->OrthoFarClipPlane = FromLZCaptureOrthoFarPlane;
+		InCamera->MarkRenderStateDirty();
+		bActive = true;
+	}
+
+	~FScopedFromLZCameraProjectionOverride()
+	{
+		Restore();
+	}
+
+	void Restore()
+	{
+		UCameraComponent* CameraComponent = Camera.Get();
+		if (!bActive || !CameraComponent)
+		{
+			bActive = false;
+			return;
+		}
+
+		CameraComponent->ProjectionMode = Original.ProjectionMode;
+		CameraComponent->FieldOfView = Original.FieldOfView;
+		CameraComponent->OrthoWidth = Original.OrthoWidth;
+		CameraComponent->OrthoNearClipPlane = Original.OrthoNearClipPlane;
+		CameraComponent->OrthoFarClipPlane = Original.OrthoFarClipPlane;
+		CameraComponent->AutoPlaneShift = Original.AutoPlaneShift;
+		CameraComponent->AspectRatio = Original.AspectRatio;
+		CameraComponent->bAutoCalculateOrthoPlanes = Original.bAutoCalculateOrthoPlanes;
+		CameraComponent->bUpdateOrthoPlanes = Original.bUpdateOrthoPlanes;
+		CameraComponent->bUseCameraHeightAsViewTarget = Original.bUseCameraHeightAsViewTarget;
+		CameraComponent->bConstrainAspectRatio = Original.bConstrainAspectRatio;
+		CameraComponent->MarkRenderStateDirty();
+		bActive = false;
+	}
+
+	TWeakObjectPtr<UCameraComponent> Camera;
+	FFromLZCameraProjectionSnapshot Original;
+	double CaptureOrthoWidth = FromLZDefaultOrthoWidth;
+	bool bUsedDefaultOrthoWidth = false;
+	bool bActive = false;
+};
+
+struct FPendingFromLZCapture
+{
+	struct FOutputPaths
+	{
+		FString Timestamp;
+		FString CaptureDirectory;
+		FString BaseFilename;
+		FString JsonPath;
+		FString PngPath;
+		FString DebugViewportPerspectivePngPath;
+		FString DebugViewportOrthographicPngPath;
+		FString DebugFromLZCameraPngPath;
+		FString DebugTransformsJsonPath;
+		FString ActorMaterialPngPath;
+		FString ActorMaterialJsonPath;
+	};
+
+	TWeakObjectPtr<APawn> Pawn;
+	TWeakObjectPtr<UCameraComponent> Camera;
+	TWeakObjectPtr<UWorld> World;
+	TUniquePtr<FScopedFromLZCameraProjectionOverride> ProjectionOverride;
+	FOutputPaths OutputPaths;
+	FFromLZViewDebugSnapshot PerspectiveBefore;
+	FFromLZViewDebugSnapshot OrthographicFirstRendered;
+	FFromLZViewDebugSnapshot OrthographicStable;
+	FFromLZViewDebugSnapshot PerspectiveRestored;
+	double OrthographicStartTimeSeconds = 0.0;
+	double StableFrameElapsedSeconds = 0.0;
+	double RestoreStartTimeSeconds = 0.0;
+	int32 OrthographicFramesRendered = 0;
+	int32 RestoredPerspectiveFramesRendered = 0;
+	bool bOutputsGenerated = false;
+	bool bCaptureSucceeded = false;
+	bool bFirstOrthographicFrameRecorded = false;
+	bool bStableOrthographicFrameRendered = false;
+	bool bWaitingForRestoredPerspective = false;
+	bool bRestoredPerspectiveFrameRendered = false;
+	bool bCompleting = false;
+};
+
+static TUniquePtr<FPendingFromLZCapture> GPendingFromLZCapture;
+
+static FPendingFromLZCapture::FOutputPaths MakeCaptureOutputPaths()
+{
+	FPendingFromLZCapture::FOutputPaths Paths;
+	Paths.CaptureDirectory = FPaths::ProjectSavedDir() / TEXT("FromLZCaptures");
+	IFileManager::Get().MakeDirectory(*Paths.CaptureDirectory, true);
+
+	Paths.Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
+	Paths.BaseFilename = FString::Printf(TEXT("FromLZ_%s"), *Paths.Timestamp);
+	Paths.JsonPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT(".json"));
+	Paths.PngPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT(".png"));
+	Paths.DebugViewportPerspectivePngPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT("_debug_viewport_perspective.png"));
+	Paths.DebugViewportOrthographicPngPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT("_debug_viewport_orthographic.png"));
+	Paths.DebugFromLZCameraPngPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT("_debug_fromlz_camera.png"));
+	Paths.DebugTransformsJsonPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT("_debug_transforms.json"));
+	Paths.ActorMaterialPngPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT("_actor_material_id.png"));
+	Paths.ActorMaterialJsonPath = Paths.CaptureDirectory / (Paths.BaseFilename + TEXT("_actor_material_id.json"));
+	return Paths;
+}
 
 // ===================================================================
 // Normal-based planar face segmentation (Enter-key capture).
@@ -188,11 +485,18 @@ namespace FromLZFaces
 // color-coded faces PNG plus a faces JSON. Reuses the already-read-back buffers.
 static bool SaveNormalFaces(
 	const TArray<float>& Depth, const TArray<FVector3f>& Normal,
-	int32 W, int32 H, const UCameraComponent* Camera,
+	int32 W, int32 H, const FTransform& CameraTransform, double CameraFov,
 	bool bCaptureOrthographic, double CaptureOrthoWidth,
+	const FMatrix& CaptureProjectionMatrix,
 	const FString& FacesPngPath, const FString& FacesJsonPath)
 {
 	using namespace FromLZFaces;
+
+	if (bCaptureOrthographic && !IsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: faces output requires a valid stable viewport orthographic projection matrix."));
+		return false;
+	}
 
 	// --- tunables ---
 	const float NormalAngleTolDeg = 12.0f;
@@ -300,15 +604,14 @@ static bool SaveNormalFaces(
 	}
 
 	// Camera basis + projection for unprojection.
-	const FTransform CamT = Camera->GetComponentTransform();
+	const FTransform CamT = CameraTransform;
 	const FVector Loc = CamT.GetLocation();
 	const FVector Fwd = CamT.GetUnitAxis(EAxis::X);
 	const FVector Rgt = CamT.GetUnitAxis(EAxis::Y);
 	const FVector Up = CamT.GetUnitAxis(EAxis::Z);
-	const float TanX = FMath::Tan(FMath::DegreesToRadians(Camera->FieldOfView * 0.5f));
+	const float TanX = FMath::Tan(FMath::DegreesToRadians(CameraFov * 0.5));
 	const float TanY = TanX * (static_cast<float>(H) / static_cast<float>(W));
 	const bool bOrtho = bCaptureOrthographic;
-	const double OrthoW = CaptureOrthoWidth;
 
 	auto CamRayDir = [&](double px, double py) -> FVector
 	{
@@ -320,7 +623,18 @@ static bool SaveNormalFaces(
 	{
 		const double ndcX = 2.0 * ((px + 0.5) / W) - 1.0;
 		const double ndcY = 1.0 - 2.0 * ((py + 0.5) / H);
-		return Loc + Rgt * (ndcX * OrthoW * 0.5) + Up * (ndcY * OrthoW * 0.5 * (static_cast<double>(H) / W));
+		double ViewRight = 0.0;
+		double ViewUp = 0.0;
+		if (!TryGetOrthographicViewPlanePosition(
+			CaptureProjectionMatrix,
+			ndcX,
+			ndcY,
+			ViewRight,
+			ViewUp))
+		{
+			return Loc;
+		}
+		return Loc + Rgt * ViewRight + Up * ViewUp;
 	};
 	auto Unproject = [&](int32 px, int32 py, float depth) -> FVector
 	{
@@ -362,6 +676,14 @@ static bool SaveNormalFaces(
 	Json += FString::Printf(TEXT("  \"num_faces\": %d,\n"), NumFaces);
 	Json += TEXT("  \"palette_version\": 2,\n");
 	Json += TEXT("  \"unique_face_colors\": true,\n");
+	Json += TEXT("  \"projection_source\": \"stable_orthographic_viewport_final_projection_matrix\",\n");
+	Json += FString::Printf(TEXT("  \"ortho_width_metadata\": %.17g,\n"), CaptureOrthoWidth);
+	Json += FString::Printf(
+		TEXT("  \"projection_scale\": { \"m00\": %.17g, \"m11\": %.17g, \"m30\": %.17g, \"m31\": %.17g },\n"),
+		CaptureProjectionMatrix.M[0][0],
+		CaptureProjectionMatrix.M[1][1],
+		CaptureProjectionMatrix.M[3][0],
+		CaptureProjectionMatrix.M[3][1]);
 	Json += TEXT("  \"faces\": [\n");
 
 	for (int32 f = 0; f < NumFaces; ++f)
@@ -521,11 +843,11 @@ namespace FromLZActorMaterialId
 		const FTransform& CameraTransform,
 		int32 W,
 		int32 H,
-		double CaptureOrthoWidth,
+		const FMatrix& CaptureProjectionMatrix,
 		FProjectedVertex& Out)
 	{
 		Out = FProjectedVertex();
-		if (W <= 0 || H <= 0 || CaptureOrthoWidth <= 1e-6)
+		if (W <= 0 || H <= 0 || !IsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
 		{
 			return false;
 		}
@@ -541,10 +863,14 @@ namespace FromLZActorMaterialId
 			return false;
 		}
 
-		const double HalfW = CaptureOrthoWidth * 0.5;
-		const double HalfH = HalfW * (double(H) / double(W));
-		const double NdcX = FVector::DotProduct(Delta, Rgt) / HalfW;
-		const double NdcY = FVector::DotProduct(Delta, Up) / HalfH;
+		const double ViewRight = FVector::DotProduct(Delta, Rgt);
+		const double ViewUp = FVector::DotProduct(Delta, Up);
+		const double NdcX =
+			ViewRight * CaptureProjectionMatrix.M[0][0] +
+			CaptureProjectionMatrix.M[3][0];
+		const double NdcY =
+			ViewUp * CaptureProjectionMatrix.M[1][1] +
+			CaptureProjectionMatrix.M[3][1];
 		Out.Pixel.X = ((NdcX + 1.0) * 0.5 * double(W)) - 0.5;
 		Out.Pixel.Y = ((1.0 - NdcY) * 0.5 * double(H)) - 0.5;
 		Out.Depth = Depth;
@@ -684,6 +1010,7 @@ namespace FromLZActorMaterialId
 	static void RasterizeStaticMeshComponent(
 		UStaticMeshComponent* Component,
 		const FTransform& CameraTransform,
+		const FMatrix& CaptureProjectionMatrix,
 		int32 W,
 		int32 H,
 		TMap<FString, int32>& EntryIdByKey,
@@ -718,7 +1045,7 @@ namespace FromLZActorMaterialId
 		{
 			const FVector3f Local = PositionBuffer.VertexPosition(VertexIndex);
 			const FVector World = ComponentTransform.TransformPosition(FVector(Local.X, Local.Y, Local.Z));
-			ProjectWorldToCapturePixel(World, CameraTransform, W, H, FromLZCaptureOrthoWidth, Projected[VertexIndex]);
+			ProjectWorldToCapturePixel(World, CameraTransform, W, H, CaptureProjectionMatrix, Projected[VertexIndex]);
 		}
 
 		for (const FStaticMeshSection& Section : LOD.Sections)
@@ -747,6 +1074,7 @@ namespace FromLZActorMaterialId
 	static void RasterizeProceduralMeshComponent(
 		UProceduralMeshComponent* Component,
 		const FTransform& CameraTransform,
+		const FMatrix& CaptureProjectionMatrix,
 		int32 W,
 		int32 H,
 		TMap<FString, int32>& EntryIdByKey,
@@ -778,7 +1106,7 @@ namespace FromLZActorMaterialId
 			for (int32 VertexIndex = 0; VertexIndex < Section->ProcVertexBuffer.Num(); ++VertexIndex)
 			{
 				const FVector World = ComponentTransform.TransformPosition(Section->ProcVertexBuffer[VertexIndex].Position);
-				ProjectWorldToCapturePixel(World, CameraTransform, W, H, FromLZCaptureOrthoWidth, Projected[VertexIndex]);
+				ProjectWorldToCapturePixel(World, CameraTransform, W, H, CaptureProjectionMatrix, Projected[VertexIndex]);
 			}
 
 			const int32 Id = FindOrAddEntry(Component, SectionIndex, EntryIdByKey, Entries);
@@ -798,13 +1126,19 @@ namespace FromLZActorMaterialId
 
 	static bool SaveActorMaterialIdBuffer(
 		UWorld* World,
-		const UCameraComponent* Camera,
+		const FTransform& CameraTransform,
+		double CaptureOrthoWidth,
+		const FMatrix& CaptureProjectionMatrix,
+		const TArray<AActor*>& SubjectActors,
+		const FString& SubjectMode,
 		int32 W,
 		int32 H,
 		const FString& PngPath,
 		const FString& JsonPath)
 	{
-		if (!World || !Camera || W <= 0 || H <= 0)
+		if (!World || W <= 0 || H <= 0 ||
+			CaptureOrthoWidth <= 1e-6 ||
+			!IsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
 		{
 			return false;
 		}
@@ -815,28 +1149,41 @@ namespace FromLZActorMaterialId
 		ZBuffer.Init(TNumericLimits<double>::Max(), W * H);
 		TMap<FString, int32> EntryIdByKey;
 		TArray<TSharedPtr<FJsonValue>> Entries;
-		const FTransform CameraTransform = Camera->GetComponentTransform();
 
-		for (TActorIterator<AActor> It(World); It; ++It)
+		auto RasterizeActor = [&] (AActor* Actor)
 		{
-			AActor* Actor = *It;
-			if (!Actor || Actor->IsHidden())
+			if (!IsValid(Actor) || Actor->IsHidden())
 			{
-				continue;
+				return;
 			}
 
 			TArray<UStaticMeshComponent*> StaticComponents;
 			Actor->GetComponents<UStaticMeshComponent>(StaticComponents);
 			for (UStaticMeshComponent* Component : StaticComponents)
 			{
-				RasterizeStaticMeshComponent(Component, CameraTransform, W, H, EntryIdByKey, Entries, ZBuffer, Pixels);
+				RasterizeStaticMeshComponent(Component, CameraTransform, CaptureProjectionMatrix, W, H, EntryIdByKey, Entries, ZBuffer, Pixels);
 			}
 
 			TArray<UProceduralMeshComponent*> ProceduralComponents;
 			Actor->GetComponents<UProceduralMeshComponent>(ProceduralComponents);
 			for (UProceduralMeshComponent* Component : ProceduralComponents)
 			{
-				RasterizeProceduralMeshComponent(Component, CameraTransform, W, H, EntryIdByKey, Entries, ZBuffer, Pixels);
+				RasterizeProceduralMeshComponent(Component, CameraTransform, CaptureProjectionMatrix, W, H, EntryIdByKey, Entries, ZBuffer, Pixels);
+			}
+		};
+
+		if (SubjectActors.Num() > 0)
+		{
+			for (AActor* Actor : SubjectActors)
+			{
+				RasterizeActor(Actor);
+			}
+		}
+		else
+		{
+			for (TActorIterator<AActor> It(World); It; ++It)
+			{
+				RasterizeActor(*It);
 			}
 		}
 
@@ -860,7 +1207,11 @@ namespace FromLZActorMaterialId
 		Root->SetObjectField(TEXT("image"), ImageObject);
 		Root->SetStringField(TEXT("encoding"), TEXT("rgb24_id_background_zero"));
 		Root->SetStringField(TEXT("projection_mode"), TEXT("Orthographic"));
-		Root->SetNumberField(TEXT("ortho_width"), FromLZCaptureOrthoWidth);
+		Root->SetNumberField(TEXT("ortho_width"), CaptureOrthoWidth);
+		Root->SetStringField(TEXT("projection_source"), TEXT("stable_orthographic_viewport_final_projection_matrix"));
+		Root->SetObjectField(TEXT("projection_matrix"), SerializeMatrix(CaptureProjectionMatrix));
+		Root->SetStringField(TEXT("subject_mode"), SubjectMode);
+		Root->SetNumberField(TEXT("subject_actor_count"), SubjectActors.Num());
 		Root->SetArrayField(TEXT("entries"), Entries);
 
 		FString JsonText;
@@ -914,15 +1265,378 @@ static bool SaveFColorPng(const TArray<FColor>& Pixels, int32 W, int32 H, const 
 	return bSaved;
 }
 
-static bool CaptureViewportDebugPng(const FString& OutputPath)
+static bool TryGetViewportSize(FIntPoint& OutSize)
 {
-	if (!GEngine || !GEngine->GameViewport || !GEngine->GameViewport->Viewport)
+	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: viewport debug png failed because GameViewport is unavailable."));
+		OutSize = GEngine->GameViewport->Viewport->GetSizeXY();
+		return OutSize.X > 0 && OutSize.Y > 0;
+	}
+	return false;
+}
+
+static APlayerController* GetPawnPlayerController(const APawn* Pawn)
+{
+	return Pawn ? Cast<APlayerController>(Pawn->GetController()) : nullptr;
+}
+
+static bool BuildCaptureViewFromOrthographicCamera(
+	const APawn* Pawn,
+	const UCameraComponent* Camera,
+	bool bUsedDefaultOrthoWidth,
+	FViewport* Viewport,
+	const FFromLZViewDebugSnapshot& StableOrthographicView,
+	FFromLZCaptureView& OutView)
+{
+	if (!Pawn || !Camera)
+	{
+		return false;
+	}
+	if (!StableOrthographicView.bHasProjectionData ||
+		!IsUsableOrthographicProjectionMatrix(StableOrthographicView.FinalProjectionMatrix))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: stable orthographic viewport projection matrix is unavailable or invalid."));
 		return false;
 	}
 
-	FViewport* Viewport = GEngine->GameViewport->Viewport;
+	OutView = FFromLZCaptureView();
+	OutView.SourceViewTransform = Camera->GetComponentTransform();
+	OutView.Transform = OutView.SourceViewTransform;
+	OutView.Fov = Camera->FieldOfView;
+	OutView.OrthoWidth = ResolveCameraOrthoWidthOrDefault(Camera);
+	OutView.OrthoBackoff = 0.0;
+	OutView.ProjectionMatrix = StableOrthographicView.FinalProjectionMatrix;
+	OutView.bUseViewportProjectionMatrix = true;
+	OutView.SourceViewTransformSource = TEXT("FromLZ orthographic camera component");
+	OutView.TransformSource = TEXT("FromLZ orthographic camera component");
+	OutView.FramingMode = TEXT("stable_viewport_final_projection_matrix");
+
+	OutView.OrthoWidthMode = bUsedDefaultOrthoWidth
+		? TEXT("default_ortho_width_fallback")
+		: TEXT("fromlz_camera_ortho_width");
+
+	if (Viewport)
+	{
+		OutView.ViewportSize = Viewport->GetSizeXY();
+	}
+	else
+	{
+		TryGetViewportSize(OutView.ViewportSize);
+	}
+	OutView.ViewportAspectRatio = OutView.ViewportSize.Y > 0
+		? double(OutView.ViewportSize.X) / double(OutView.ViewportSize.Y)
+		: 16.0 / 9.0;
+
+	APlayerController* PlayerController = GetPawnPlayerController(Pawn);
+	OutView.bHasPlayerCameraManager = PlayerController && PlayerController->PlayerCameraManager;
+
+	const FVector SourceViewLocation = OutView.SourceViewTransform.GetLocation();
+	const FVector SourceViewForward = OutView.SourceViewTransform.GetUnitAxis(EAxis::X).GetSafeNormal();
+	OutView.FocusDepth = OutView.OrthoWidth * 0.5;
+	OutView.FocusPoint = SourceViewLocation + SourceViewForward * OutView.FocusDepth;
+	OutView.FocusSource = TEXT("FromLZ orthographic camera forward reference");
+	OutView.ReferencePoint = OutView.FocusPoint;
+	OutView.ReferenceDepth = OutView.FocusDepth;
+	OutView.ReferenceSource = OutView.FocusSource;
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("CaptureFromLZ: using direct FromLZ orthographic camera width %.3f mode=%s viewport=%dx%d."),
+		OutView.OrthoWidth,
+		*OutView.OrthoWidthMode,
+		OutView.ViewportSize.X,
+		OutView.ViewportSize.Y);
+
+	return
+		OutView.OrthoWidth > 1e-6 &&
+		!OutView.Transform.ContainsNaN() &&
+		OutView.bUseViewportProjectionMatrix;
+}
+
+static void AddVectorFields(const TSharedRef<FJsonObject>& Object, const TCHAR* Prefix, const FVector& Value)
+{
+	Object->SetNumberField(FString::Printf(TEXT("%s_x"), Prefix), Value.X);
+	Object->SetNumberField(FString::Printf(TEXT("%s_y"), Prefix), Value.Y);
+	Object->SetNumberField(FString::Printf(TEXT("%s_z"), Prefix), Value.Z);
+}
+
+static TSharedRef<FJsonObject> SerializeVector(const FVector& Value)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	AddVectorFields(Object, TEXT("value"), Value);
+	return Object;
+}
+
+static TSharedRef<FJsonObject> SerializeMatrix(const FMatrix& Matrix)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	for (int32 Row = 0; Row < 4; ++Row)
+	{
+		TArray<TSharedPtr<FJsonValue>> Values;
+		for (int32 Column = 0; Column < 4; ++Column)
+		{
+			Values.Add(MakeShared<FJsonValueNumber>(Matrix.M[Row][Column]));
+		}
+		Object->SetArrayField(FString::Printf(TEXT("row_%d"), Row), Values);
+	}
+	return Object;
+}
+
+static TSharedRef<FJsonObject> SerializeMinimalViewInfo(const FMinimalViewInfo& View)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetObjectField(TEXT("transform"), FFromLZCaptureUtils::SerializeTransform(
+		FTransform(View.Rotation, View.Location, FVector::OneVector)));
+	Object->SetStringField(TEXT("projection_mode"), ProjectionModeToString(View.ProjectionMode));
+	Object->SetNumberField(TEXT("field_of_view"), View.FOV);
+	Object->SetNumberField(TEXT("ortho_width"), View.OrthoWidth);
+	Object->SetNumberField(TEXT("ortho_near_clip_plane"), View.OrthoNearClipPlane);
+	Object->SetNumberField(TEXT("ortho_far_clip_plane"), View.OrthoFarClipPlane);
+	Object->SetNumberField(TEXT("auto_plane_shift"), View.AutoPlaneShift);
+	Object->SetNumberField(TEXT("aspect_ratio"), View.AspectRatio);
+	Object->SetBoolField(TEXT("auto_calculate_ortho_planes"), View.bAutoCalculateOrthoPlanes);
+	Object->SetBoolField(TEXT("update_ortho_planes"), View.bUpdateOrthoPlanes);
+	Object->SetBoolField(TEXT("use_camera_height_as_view_target"), View.bUseCameraHeightAsViewTarget);
+	Object->SetBoolField(TEXT("constrain_aspect_ratio"), View.bConstrainAspectRatio);
+	return Object;
+}
+
+static FFromLZViewDebugSnapshot CaptureViewDebugSnapshot(
+	const TCHAR* Stage,
+	const APawn* Pawn,
+	const UCameraComponent* Camera,
+	FViewport* Viewport)
+{
+	FFromLZViewDebugSnapshot Snapshot;
+	Snapshot.Stage = Stage;
+	if (!Pawn || !Camera)
+	{
+		return Snapshot;
+	}
+
+	Snapshot.PawnTransform = Pawn->GetActorTransform();
+	Snapshot.CameraComponentTransform = Camera->GetComponentTransform();
+	Snapshot.CameraProjection = MakeCameraProjectionSnapshot(Camera);
+	if (USpringArmComponent* CameraBoom = FFromLZCaptureUtils::FindCameraBoom(Pawn))
+	{
+		Snapshot.bHasCameraBoom = true;
+		Snapshot.CameraBoomTransform = CameraBoom->GetComponentTransform();
+	}
+
+	APlayerController* PlayerController = GetPawnPlayerController(Pawn);
+	if (PlayerController && PlayerController->PlayerCameraManager)
+	{
+		Snapshot.bHasPlayerCameraManager = true;
+		Snapshot.PlayerCameraView = PlayerController->PlayerCameraManager->GetCameraCacheView();
+	}
+
+	if (PlayerController && Viewport)
+	{
+		if (ULocalPlayer* LocalPlayer = PlayerController->GetLocalPlayer())
+		{
+			FSceneViewProjectionData ProjectionData;
+			if (LocalPlayer->GetProjectionData(Viewport, ProjectionData))
+			{
+				Snapshot.bHasProjectionData = true;
+				Snapshot.FinalViewOrigin = ProjectionData.ViewOrigin;
+				Snapshot.CameraToViewTarget = ProjectionData.CameraToViewTarget;
+				Snapshot.FinalViewRotationMatrix = ProjectionData.ViewRotationMatrix;
+				Snapshot.FinalProjectionMatrix = ProjectionData.ProjectionMatrix;
+				Snapshot.ViewRect = ProjectionData.GetViewRect();
+				Snapshot.ConstrainedViewRect = ProjectionData.GetConstrainedViewRect();
+			}
+		}
+	}
+
+	return Snapshot;
+}
+
+static TSharedRef<FJsonObject> SerializeViewDebugSnapshot(const FFromLZViewDebugSnapshot& Snapshot)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("stage"), Snapshot.Stage);
+	Object->SetObjectField(TEXT("pawn_transform"), FFromLZCaptureUtils::SerializeTransform(Snapshot.PawnTransform));
+	Object->SetObjectField(TEXT("camera_component_transform"), FFromLZCaptureUtils::SerializeTransform(Snapshot.CameraComponentTransform));
+	Object->SetObjectField(TEXT("camera_component_projection"), SerializeCameraProjectionSnapshot(Snapshot.CameraProjection));
+	Object->SetBoolField(TEXT("camera_boom_available"), Snapshot.bHasCameraBoom);
+	if (Snapshot.bHasCameraBoom)
+	{
+		Object->SetObjectField(TEXT("camera_boom_transform"), FFromLZCaptureUtils::SerializeTransform(Snapshot.CameraBoomTransform));
+	}
+
+	Object->SetBoolField(TEXT("player_camera_manager_available"), Snapshot.bHasPlayerCameraManager);
+	if (Snapshot.bHasPlayerCameraManager)
+	{
+		Object->SetObjectField(TEXT("player_camera_manager_view"), SerializeMinimalViewInfo(Snapshot.PlayerCameraView));
+	}
+
+	Object->SetBoolField(TEXT("projection_data_available"), Snapshot.bHasProjectionData);
+	if (Snapshot.bHasProjectionData)
+	{
+		Object->SetObjectField(TEXT("final_view_origin"), SerializeVector(Snapshot.FinalViewOrigin));
+		Object->SetObjectField(TEXT("camera_to_view_target"), SerializeVector(Snapshot.CameraToViewTarget));
+		Object->SetObjectField(TEXT("final_view_rotation_matrix"), SerializeMatrix(Snapshot.FinalViewRotationMatrix));
+		Object->SetObjectField(TEXT("final_projection_matrix"), SerializeMatrix(Snapshot.FinalProjectionMatrix));
+		Object->SetNumberField(TEXT("view_rect_min_x"), Snapshot.ViewRect.Min.X);
+		Object->SetNumberField(TEXT("view_rect_min_y"), Snapshot.ViewRect.Min.Y);
+		Object->SetNumberField(TEXT("view_rect_max_x"), Snapshot.ViewRect.Max.X);
+		Object->SetNumberField(TEXT("view_rect_max_y"), Snapshot.ViewRect.Max.Y);
+		Object->SetNumberField(TEXT("constrained_view_rect_min_x"), Snapshot.ConstrainedViewRect.Min.X);
+		Object->SetNumberField(TEXT("constrained_view_rect_min_y"), Snapshot.ConstrainedViewRect.Min.Y);
+		Object->SetNumberField(TEXT("constrained_view_rect_max_x"), Snapshot.ConstrainedViewRect.Max.X);
+		Object->SetNumberField(TEXT("constrained_view_rect_max_y"), Snapshot.ConstrainedViewRect.Max.Y);
+		AddVectorFields(
+			Object,
+			TEXT("final_view_origin_minus_camera_component"),
+			Snapshot.FinalViewOrigin - Snapshot.CameraComponentTransform.GetLocation());
+		if (Snapshot.bHasPlayerCameraManager)
+		{
+			AddVectorFields(
+				Object,
+				TEXT("final_view_origin_minus_player_camera_manager"),
+				Snapshot.FinalViewOrigin - Snapshot.PlayerCameraView.Location);
+		}
+	}
+	return Object;
+}
+
+static void ConfigureSceneCaptureOrthoWithoutViewOriginShift(USceneCaptureComponent2D* SceneCapture)
+{
+	if (!SceneCapture)
+	{
+		return;
+	}
+
+	SceneCapture->bAutoCalculateOrthoPlanes = false;
+	SceneCapture->AutoPlaneShift = 0.0f;
+	SceneCapture->bUpdateOrthoPlanes = false;
+	SceneCapture->bUseCameraHeightAsViewTarget = false;
+}
+
+static bool ConfigureSceneCaptureFromCaptureView(
+	USceneCaptureComponent2D* SceneCapture,
+	const FFromLZCaptureView& CaptureView)
+{
+	if (!SceneCapture ||
+		!CaptureView.bUseViewportProjectionMatrix ||
+		!IsUsableOrthographicProjectionMatrix(CaptureView.ProjectionMatrix))
+	{
+		return false;
+	}
+
+	SceneCapture->ProjectionType = ECameraProjectionMode::Orthographic;
+	SceneCapture->FOVAngle = CaptureView.Fov;
+	SceneCapture->OrthoWidth = CaptureView.OrthoWidth;
+	ConfigureSceneCaptureOrthoWithoutViewOriginShift(SceneCapture);
+	SceneCapture->bUseCustomProjectionMatrix = true;
+	SceneCapture->CustomProjectionMatrix = CaptureView.ProjectionMatrix;
+	return true;
+}
+
+static bool ActorNameOrLabelStartsWith(const AActor* Actor, const FString& Prefix)
+{
+	if (!Actor)
+	{
+		return false;
+	}
+
+	bool bMatch = Actor->GetName().StartsWith(Prefix);
+#if WITH_EDITOR
+	bMatch = bMatch || Actor->GetActorLabel().StartsWith(Prefix);
+#endif
+	return bMatch;
+}
+
+static bool IsFromLZGeneratedActor(const AActor* Actor)
+{
+	if (!Actor)
+	{
+		return false;
+	}
+
+	bool bGenerated = Actor->GetName().StartsWith(TEXT("FromLZ_"));
+#if WITH_EDITOR
+	bGenerated = bGenerated || Actor->GetActorLabel().StartsWith(TEXT("FromLZ_"));
+#endif
+	return bGenerated;
+}
+
+static bool IsCaptureSubjectCandidate(const AActor* Actor, const APawn* Pawn)
+{
+	return Actor && Actor != Pawn && !Actor->IsHidden() && !IsFromLZGeneratedActor(Actor);
+}
+
+static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<AActor*>& OutActors, FString& OutMode)
+{
+	OutActors.Reset();
+	OutMode = TEXT("none");
+	if (!World)
+	{
+		return;
+	}
+
+	const FString CaptureNamePrefix(TEXT("Cube"));
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (IsCaptureSubjectCandidate(Actor, Pawn) && ActorNameOrLabelStartsWith(Actor, CaptureNamePrefix))
+		{
+			OutActors.Add(Actor);
+		}
+	}
+
+	if (OutActors.Num() > 0)
+	{
+		OutMode = TEXT("name_prefix_Cube");
+		return;
+	}
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (IsCaptureSubjectCandidate(Actor, Pawn))
+		{
+			OutActors.Add(Actor);
+		}
+	}
+	OutMode = TEXT("all_visible_excluding_FromLZ_generated");
+}
+
+static void ApplyCaptureSubjectActors(USceneCaptureComponent2D* SceneCapture, const TArray<AActor*>& SubjectActors)
+{
+	if (!SceneCapture)
+	{
+		return;
+	}
+
+	SceneCapture->ShowOnlyActors.Empty();
+	for (AActor* Actor : SubjectActors)
+	{
+		if (IsValid(Actor))
+		{
+			SceneCapture->ShowOnlyActors.Add(Actor);
+		}
+	}
+
+	if (SceneCapture->ShowOnlyActors.Num() > 0)
+	{
+		SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+	}
+	else
+	{
+		SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_LegacySceneCapture;
+	}
+}
+
+static bool CaptureViewportDebugPng(FViewport* Viewport, const FString& OutputPath)
+{
+	if (!Viewport)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: viewport debug png failed because viewport is unavailable."));
+		return false;
+	}
+
 	const FIntPoint Size = Viewport->GetSizeXY();
 	if (Size.X <= 0 || Size.Y <= 0)
 	{
@@ -932,6 +1646,7 @@ static bool CaptureViewportDebugPng(const FString& OutputPath)
 
 	TArray<FColor> Pixels;
 	FReadSurfaceDataFlags ReadFlags(RCM_UNorm);
+	FlushRenderingCommands();
 	if (!Viewport->ReadPixels(Pixels, ReadFlags) || Pixels.Num() != Size.X * Size.Y)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: viewport debug png failed to read pixels (%dx%d, pixels=%d)."), Size.X, Size.Y, Pixels.Num());
@@ -945,7 +1660,7 @@ static bool CaptureViewportDebugPng(const FString& OutputPath)
 	return SaveFColorPng(Pixels, Size.X, Size.Y, OutputPath, TEXT("viewport"));
 }
 
-static bool CaptureFromLZCameraDebugPng(const APawn* Pawn, const UCameraComponent* Camera, const FString& OutputPath)
+static bool CaptureFromLZCameraDebugPng(const APawn* Pawn, const UCameraComponent* Camera, const FFromLZCaptureView& CaptureView, const FString& OutputPath)
 {
 	if (!Pawn || !Camera)
 	{
@@ -960,11 +1675,7 @@ static bool CaptureFromLZCameraDebugPng(const APawn* Pawn, const UCameraComponen
 		return false;
 	}
 
-	FIntPoint Size(1920, 1080);
-	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
-	{
-		Size = GEngine->GameViewport->Viewport->GetSizeXY();
-	}
+	FIntPoint Size = CaptureView.ViewportSize;
 	if (Size.X <= 0 || Size.Y <= 0)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed because capture size is invalid (%dx%d)."), Size.X, Size.Y);
@@ -983,10 +1694,13 @@ static bool CaptureFromLZCameraDebugPng(const APawn* Pawn, const UCameraComponen
 	SCC->bCaptureEveryFrame = false;
 	SCC->bCaptureOnMovement = false;
 	SCC->bAlwaysPersistRenderingState = true;
-	SCC->SetWorldTransform(Camera->GetComponentTransform());
-	SCC->ProjectionType = ECameraProjectionMode::Orthographic;
-	SCC->FOVAngle = Camera->FieldOfView;
-	SCC->OrthoWidth = FromLZCaptureOrthoWidth;
+	SCC->SetWorldTransform(CaptureView.Transform);
+	if (!ConfigureSceneCaptureFromCaptureView(SCC, CaptureView))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed because the stable viewport projection matrix is invalid."));
+		ColorRT->RemoveFromRoot();
+		return false;
+	}
 	SCC->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
 	SCC->TextureTarget = ColorRT;
 	SCC->RegisterComponentWithWorld(World);
@@ -1002,7 +1716,7 @@ static bool CaptureFromLZCameraDebugPng(const APawn* Pawn, const UCameraComponen
 		Pixel.A = 255;
 	}
 
-	const bool bSaved = bReadOk && SaveFColorPng(Pixels, Size.X, Size.Y, OutputPath, TEXT("FromLZ camera"));
+	const bool bSaved = bReadOk && SaveFColorPng(Pixels, Size.X, Size.Y, OutputPath, TEXT("orthographic capture view"));
 	if (!bReadOk)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera debug png failed to read render target (%dx%d, pixels=%d)."), Size.X, Size.Y, Pixels.Num());
@@ -1073,6 +1787,7 @@ static bool SaveDebugViewTransforms(
 	const APawn* Pawn,
 	const UCameraComponent* Camera,
 	const USceneCaptureComponent2D* SceneCapture,
+	const FFromLZCaptureView& CaptureView,
 	const FString& OutputPath)
 {
 	if (!Pawn || !Camera || !SceneCapture)
@@ -1087,7 +1802,38 @@ static bool SaveDebugViewTransforms(
 	RootObject->SetStringField(TEXT("scene_capture_context"), TEXT("CaptureLineArtPng"));
 	RootObject->SetStringField(TEXT("player_camera_manager_source"), TEXT("PlayerCameraManager->GetCameraLocation/Rotation"));
 	RootObject->SetStringField(TEXT("fromlz_component_source"), TEXT("FromLZ->GetComponentTransform()"));
+	RootObject->SetStringField(TEXT("source_view_source"), CaptureView.SourceViewTransformSource);
+	RootObject->SetStringField(TEXT("orthographic_capture_view_source"), CaptureView.TransformSource);
+	RootObject->SetStringField(TEXT("orthographic_framing_mode"), CaptureView.FramingMode);
+	RootObject->SetStringField(TEXT("focus_source"), CaptureView.FocusSource);
 	RootObject->SetStringField(TEXT("scene_capture_source"), TEXT("SceneCapture->GetComponentTransform()"));
+	RootObject->SetStringField(TEXT("source_view_projection_type"), StaticEnum<ECameraProjectionMode::Type>()->GetValueAsString(Camera->ProjectionMode));
+	RootObject->SetStringField(TEXT("scene_capture_projection_type"), StaticEnum<ECameraProjectionMode::Type>()->GetValueAsString(SceneCapture->ProjectionType));
+	RootObject->SetNumberField(TEXT("scene_capture_fov"), SceneCapture->FOVAngle);
+	RootObject->SetNumberField(TEXT("scene_capture_ortho_width"), SceneCapture->OrthoWidth);
+	RootObject->SetBoolField(TEXT("scene_capture_auto_calculate_ortho_planes"), SceneCapture->bAutoCalculateOrthoPlanes);
+	RootObject->SetNumberField(TEXT("scene_capture_auto_plane_shift"), SceneCapture->AutoPlaneShift);
+	RootObject->SetBoolField(TEXT("scene_capture_update_ortho_planes"), SceneCapture->bUpdateOrthoPlanes);
+	RootObject->SetBoolField(TEXT("scene_capture_use_camera_height_as_view_target"), SceneCapture->bUseCameraHeightAsViewTarget);
+	RootObject->SetBoolField(TEXT("scene_capture_uses_custom_projection_matrix"), SceneCapture->bUseCustomProjectionMatrix);
+	RootObject->SetStringField(
+		TEXT("scene_capture_projection_matrix_source"),
+		TEXT("stable_orthographic_viewport_final_projection_matrix"));
+	RootObject->SetObjectField(
+		TEXT("stable_viewport_projection_matrix"),
+		SerializeMatrix(CaptureView.ProjectionMatrix));
+	RootObject->SetObjectField(
+		TEXT("scene_capture_custom_projection_matrix"),
+		SerializeMatrix(SceneCapture->CustomProjectionMatrix));
+	RootObject->SetBoolField(
+		TEXT("scene_capture_projection_matrix_matches_stable_viewport"),
+		SceneCapture->bUseCustomProjectionMatrix &&
+		AreProjectionMatricesNearlyEqual(
+			CaptureView.ProjectionMatrix,
+			SceneCapture->CustomProjectionMatrix));
+	RootObject->SetNumberField(TEXT("orthographic_focus_depth"), CaptureView.FocusDepth);
+	RootObject->SetNumberField(TEXT("orthographic_backoff"), CaptureView.OrthoBackoff);
+	AddVectorFields(RootObject, TEXT("orthographic_focus_point"), CaptureView.FocusPoint);
 
 	FTransform PlayerCameraManagerTransform;
 	const bool bHasPlayerCameraManager = TryGetPlayerCameraManagerTransform(Pawn, PlayerCameraManagerTransform);
@@ -1100,10 +1846,14 @@ static bool SaveDebugViewTransforms(
 		RootObject->SetObjectField(TEXT("player_camera_manager_transform"), FFromLZCaptureUtils::SerializeTransform(PlayerCameraManagerTransform));
 	}
 	RootObject->SetObjectField(TEXT("fromlz_component_transform"), FFromLZCaptureUtils::SerializeTransform(FromLZTransform));
+	RootObject->SetObjectField(TEXT("source_view_transform"), FFromLZCaptureUtils::SerializeTransform(CaptureView.SourceViewTransform));
+	RootObject->SetObjectField(TEXT("orthographic_capture_view_transform"), FFromLZCaptureUtils::SerializeTransform(CaptureView.Transform));
 	RootObject->SetObjectField(TEXT("scene_capture_transform"), FFromLZCaptureUtils::SerializeTransform(SceneCaptureTransform));
 
 	RootObject->SetBoolField(TEXT("scene_capture_matches_fromlz_component_pose"), AreViewPosesNearlyEqual(FromLZTransform, SceneCaptureTransform));
+	RootObject->SetBoolField(TEXT("scene_capture_matches_orthographic_capture_view_pose"), AreViewPosesNearlyEqual(CaptureView.Transform, SceneCaptureTransform));
 	RootObject->SetObjectField(TEXT("scene_capture_minus_fromlz_component"), SerializeTransformDelta(FromLZTransform, SceneCaptureTransform));
+	RootObject->SetObjectField(TEXT("scene_capture_minus_orthographic_capture_view"), SerializeTransformDelta(CaptureView.Transform, SceneCaptureTransform));
 
 	if (bHasPlayerCameraManager)
 	{
@@ -1125,12 +1875,188 @@ static bool SaveDebugViewTransforms(
 	return bSaved;
 }
 
+static TSharedRef<FJsonObject> SerializeVectorDelta(const FVector& From, const FVector& To)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	const FVector Delta = To - From;
+	AddVectorFields(Object, TEXT("delta"), Delta);
+	Object->SetNumberField(TEXT("distance"), Delta.Size());
+	return Object;
+}
+
+static TSharedRef<FJsonObject> SerializeViewDebugDelta(
+	const FFromLZViewDebugSnapshot& From,
+	const FFromLZViewDebugSnapshot& To)
+{
+	TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+	Object->SetStringField(TEXT("from_stage"), From.Stage);
+	Object->SetStringField(TEXT("to_stage"), To.Stage);
+	Object->SetObjectField(
+		TEXT("camera_component_transform_delta"),
+		SerializeTransformDelta(From.CameraComponentTransform, To.CameraComponentTransform));
+	Object->SetBoolField(
+		TEXT("camera_component_pose_unchanged"),
+		AreViewPosesNearlyEqual(From.CameraComponentTransform, To.CameraComponentTransform));
+
+	if (From.bHasPlayerCameraManager && To.bHasPlayerCameraManager)
+	{
+		const FTransform FromPlayerCamera(
+			From.PlayerCameraView.Rotation,
+			From.PlayerCameraView.Location,
+			FVector::OneVector);
+		const FTransform ToPlayerCamera(
+			To.PlayerCameraView.Rotation,
+			To.PlayerCameraView.Location,
+			FVector::OneVector);
+		Object->SetObjectField(
+			TEXT("player_camera_manager_transform_delta"),
+			SerializeTransformDelta(FromPlayerCamera, ToPlayerCamera));
+		Object->SetBoolField(
+			TEXT("player_camera_manager_pose_unchanged"),
+			AreViewPosesNearlyEqual(FromPlayerCamera, ToPlayerCamera));
+	}
+
+	if (From.bHasProjectionData && To.bHasProjectionData)
+	{
+		const double ViewOriginDistance = FVector::Distance(From.FinalViewOrigin, To.FinalViewOrigin);
+		Object->SetObjectField(
+			TEXT("final_view_origin_delta"),
+			SerializeVectorDelta(From.FinalViewOrigin, To.FinalViewOrigin));
+		Object->SetBoolField(TEXT("final_view_origin_unchanged"), ViewOriginDistance <= 0.01);
+	}
+
+	return Object;
+}
+
+static TSharedPtr<FJsonObject> LoadJsonObjectFromFile(const FString& FilePath)
+{
+	FString JsonText;
+	if (!FFileHelper::LoadFileToString(JsonText, *FilePath))
+	{
+		return nullptr;
+	}
+
+	TSharedPtr<FJsonObject> Object;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(JsonText);
+	return FJsonSerializer::Deserialize(Reader, Object) ? Object : nullptr;
+}
+
+static bool FinalizeProjectionDebugFiles(const FPendingFromLZCapture& Pending)
+{
+	TSharedPtr<FJsonObject> DebugObject = LoadJsonObjectFromFile(Pending.OutputPaths.DebugTransformsJsonPath);
+	if (!DebugObject)
+	{
+		DebugObject = MakeShared<FJsonObject>();
+		DebugObject->SetStringField(TEXT("debug_type"), TEXT("enter_projection_validation"));
+		DebugObject->SetStringField(TEXT("json_path"), Pending.OutputPaths.DebugTransformsJsonPath);
+	}
+
+	DebugObject->SetNumberField(TEXT("debug_version"), 2);
+	DebugObject->SetBoolField(TEXT("outputs_generated"), Pending.bOutputsGenerated);
+	DebugObject->SetBoolField(TEXT("capture_succeeded"), Pending.bCaptureSucceeded);
+	DebugObject->SetNumberField(TEXT("orthographic_frames_rendered"), Pending.OrthographicFramesRendered);
+	DebugObject->SetNumberField(TEXT("restored_perspective_frames_rendered"), Pending.RestoredPerspectiveFramesRendered);
+	DebugObject->SetNumberField(TEXT("orthographic_settle_seconds"), Pending.StableFrameElapsedSeconds);
+
+	TSharedRef<FJsonObject> Prevention = MakeShared<FJsonObject>();
+	Prevention->SetStringField(TEXT("policy"), TEXT("disable_ortho_auto_planes_and_view_origin_correction"));
+	Prevention->SetBoolField(TEXT("auto_calculate_ortho_planes"), false);
+	Prevention->SetNumberField(TEXT("auto_plane_shift"), 0.0);
+	Prevention->SetBoolField(TEXT("update_ortho_planes"), false);
+	Prevention->SetBoolField(TEXT("use_camera_height_as_view_target"), false);
+	Prevention->SetNumberField(TEXT("ortho_near_clip_plane"), FromLZCaptureOrthoNearPlane);
+	Prevention->SetNumberField(TEXT("ortho_far_clip_plane"), FromLZCaptureOrthoFarPlane);
+	DebugObject->SetObjectField(TEXT("view_origin_shift_prevention"), Prevention);
+
+	TSharedRef<FJsonObject> Stages = MakeShared<FJsonObject>();
+	Stages->SetObjectField(TEXT("perspective_before_switch"), SerializeViewDebugSnapshot(Pending.PerspectiveBefore));
+	Stages->SetObjectField(TEXT("orthographic_first_rendered_frame"), SerializeViewDebugSnapshot(Pending.OrthographicFirstRendered));
+	Stages->SetObjectField(TEXT("orthographic_stable_after_wait"), SerializeViewDebugSnapshot(Pending.OrthographicStable));
+	Stages->SetObjectField(TEXT("perspective_restored_rendered_frame"), SerializeViewDebugSnapshot(Pending.PerspectiveRestored));
+	DebugObject->SetObjectField(TEXT("stages"), Stages);
+
+	TSharedRef<FJsonObject> Deltas = MakeShared<FJsonObject>();
+	Deltas->SetObjectField(
+		TEXT("switch_perspective_to_first_orthographic"),
+		SerializeViewDebugDelta(Pending.PerspectiveBefore, Pending.OrthographicFirstRendered));
+	Deltas->SetObjectField(
+		TEXT("orthographic_first_to_stable"),
+		SerializeViewDebugDelta(Pending.OrthographicFirstRendered, Pending.OrthographicStable));
+	Deltas->SetObjectField(
+		TEXT("full_cycle_perspective_before_to_restored"),
+		SerializeViewDebugDelta(Pending.PerspectiveBefore, Pending.PerspectiveRestored));
+	DebugObject->SetObjectField(TEXT("deltas"), Deltas);
+
+	const bool bSwitchComponentUnchanged =
+		AreViewPosesNearlyEqual(
+			Pending.PerspectiveBefore.CameraComponentTransform,
+			Pending.OrthographicFirstRendered.CameraComponentTransform);
+	const bool bSwitchViewOriginUnchanged =
+		Pending.PerspectiveBefore.bHasProjectionData &&
+		Pending.OrthographicFirstRendered.bHasProjectionData &&
+		FVector::Distance(
+			Pending.PerspectiveBefore.FinalViewOrigin,
+			Pending.OrthographicFirstRendered.FinalViewOrigin) <= 0.01;
+	const bool bRestoreComponentMatches =
+		AreViewPosesNearlyEqual(
+			Pending.PerspectiveBefore.CameraComponentTransform,
+			Pending.PerspectiveRestored.CameraComponentTransform);
+	const bool bRestoreViewOriginMatches =
+		Pending.PerspectiveBefore.bHasProjectionData &&
+		Pending.PerspectiveRestored.bHasProjectionData &&
+		FVector::Distance(
+			Pending.PerspectiveBefore.FinalViewOrigin,
+			Pending.PerspectiveRestored.FinalViewOrigin) <= 0.01;
+	bool bSceneCaptureUsesCustomProjection = false;
+	bool bSceneCaptureProjectionMatchesStableViewport = false;
+	DebugObject->TryGetBoolField(
+		TEXT("scene_capture_uses_custom_projection_matrix"),
+		bSceneCaptureUsesCustomProjection);
+	DebugObject->TryGetBoolField(
+		TEXT("scene_capture_projection_matrix_matches_stable_viewport"),
+		bSceneCaptureProjectionMatchesStableViewport);
+
+	TSharedRef<FJsonObject> Validation = MakeShared<FJsonObject>();
+	Validation->SetBoolField(TEXT("switch_camera_component_pose_unchanged"), bSwitchComponentUnchanged);
+	Validation->SetBoolField(TEXT("switch_final_view_origin_unchanged"), bSwitchViewOriginUnchanged);
+	Validation->SetBoolField(TEXT("restored_camera_component_pose_matches_before"), bRestoreComponentMatches);
+	Validation->SetBoolField(TEXT("restored_final_view_origin_matches_before"), bRestoreViewOriginMatches);
+	Validation->SetBoolField(
+		TEXT("orthographic_auto_origin_shift_prevented"),
+		bSwitchComponentUnchanged && bSwitchViewOriginUnchanged);
+	Validation->SetBoolField(
+		TEXT("scene_capture_uses_stable_viewport_projection_matrix"),
+		bSceneCaptureUsesCustomProjection && bSceneCaptureProjectionMatchesStableViewport);
+	DebugObject->SetObjectField(TEXT("validation"), Validation);
+
+	const bool bDebugSaved =
+		FFromLZCaptureUtils::SaveJsonToFile(DebugObject.ToSharedRef(), Pending.OutputPaths.DebugTransformsJsonPath);
+
+	if (TSharedPtr<FJsonObject> MainObject = LoadJsonObjectFromFile(Pending.OutputPaths.JsonPath))
+	{
+		MainObject->SetObjectField(TEXT("projection_debug_validation"), Validation);
+		MainObject->SetObjectField(
+			TEXT("restored_perspective_view"),
+			SerializeViewDebugSnapshot(Pending.PerspectiveRestored));
+		FFromLZCaptureUtils::SaveJsonToFile(MainObject.ToSharedRef(), Pending.OutputPaths.JsonPath);
+	}
+
+	return bDebugSaved;
+}
+
 // Renders scene depth and world-normal to off-screen render targets on the GPU,
 // then runs a CPU Sobel edge-detection pass to produce a white background with
 // black contour/crease lines (depth discontinuity = silhouette/occlusion edges,
 // normal discontinuity = surface creases). Occlusion is handled naturally because
 // the detection works in screen space on the rendered buffers.
-static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera, const FString& OutputPath, const FString& DebugTransformsJsonPath)
+static bool CaptureLineArtPng(
+	const APawn* Pawn,
+	const UCameraComponent* Camera,
+	const FFromLZCaptureView& CaptureView,
+	const TArray<AActor*>& SubjectActors,
+	const FString& SubjectMode,
+	const FString& OutputPath,
+	const FString& DebugTransformsJsonPath)
 {
 	UWorld* World = Pawn->GetWorld();
 	if (!World)
@@ -1138,11 +2064,7 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 		return false;
 	}
 
-	FIntPoint Size(1920, 1080);
-	if (GEngine && GEngine->GameViewport && GEngine->GameViewport->Viewport)
-	{
-		Size = GEngine->GameViewport->Viewport->GetSizeXY();
-	}
+	FIntPoint Size = CaptureView.ViewportSize;
 	if (Size.X <= 0 || Size.Y <= 0)
 	{
 		return false;
@@ -1168,57 +2090,23 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 	SCC->bCaptureEveryFrame = false;
 	SCC->bCaptureOnMovement = false;
 	SCC->bAlwaysPersistRenderingState = true;
-	SCC->SetWorldTransform(Camera->GetComponentTransform());
-	SCC->ProjectionType = ECameraProjectionMode::Orthographic;
-	SCC->FOVAngle = Camera->FieldOfView;
-	SCC->OrthoWidth = FromLZCaptureOrthoWidth;
+	SCC->SetWorldTransform(CaptureView.Transform);
+	if (!ConfigureSceneCaptureFromCaptureView(SCC, CaptureView))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: line-art capture failed because the stable viewport projection matrix is invalid."));
+		DepthRT->RemoveFromRoot();
+		NormalRT->RemoveFromRoot();
+		return false;
+	}
 	SCC->RegisterComponentWithWorld(World);
-	SaveDebugViewTransforms(Pawn, Camera, SCC, DebugTransformsJsonPath);
+	SaveDebugViewTransforms(Pawn, Camera, SCC, CaptureView, DebugTransformsJsonPath);
 
-	// Restrict the capture to actors whose name starts with "Cube" so that the
-	// ground plane, sky and other background geometry never enter the line-art
-	// pass. The Outliner label (e.g. "Cube") usually differs from the internal
-	// object name, so match against the editor label first and fall back to the
-	// internal name. If nothing matches, render the whole scene.
-	// Plain local (NOT static): a function-local "static" FString is not
-	// re-initialized by Live Coding hot-reload and can end up empty.
-	const FString CaptureNamePrefix(TEXT("Cube"));
-	int32 ShowOnlyCount = 0;
-	for (TActorIterator<AActor> It(World); It; ++It)
-	{
-		AActor* Actor = *It;
-		bool bMatch = Actor->GetName().StartsWith(CaptureNamePrefix);
-#if WITH_EDITOR
-		bMatch = bMatch || Actor->GetActorLabel().StartsWith(CaptureNamePrefix);
-#endif
-		if (bMatch)
-		{
-			SCC->ShowOnlyActors.Add(Actor);
-			++ShowOnlyCount;
-		}
-	}
-
-	if (ShowOnlyCount > 0)
-	{
-		SCC->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
-		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: line-art restricted to %d actor(s) named '%s*'."), ShowOnlyCount, *CaptureNamePrefix);
-	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: no actor named '%s*'; capturing the whole scene (ground/sky may appear)."), *CaptureNamePrefix);
-		for (TActorIterator<AActor> It(World); It; ++It)
-		{
-#if WITH_EDITOR
-			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: candidate actor label='%s' name='%s'"), *It->GetActorLabel(), *It->GetName());
-#else
-			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: candidate actor name='%s'"), *It->GetName());
-#endif
-		}
-	}
+	ApplyCaptureSubjectActors(SCC, SubjectActors);
+	UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: ortho capture subjects mode=%s count=%d."), *SubjectMode, SubjectActors.Num());
 
 	// Captures linear scene depth + world normal with the SCC's current config and
-	// reads them back to CPU arrays. Reused for the (Cube-only) line art and the
-	// (whole-scene) face segmentation.
+	// reads them back to CPU arrays. Reused for line art, planar faces and the
+	// actor/material buffer, all with the same orthographic view and subject list.
 	auto CaptureDepthNormal = [&](TArray<float>& OutDepth, TArray<FVector3f>& OutNormal) -> bool
 	{
 		SCC->CaptureSource = ESceneCaptureSource::SCS_SceneDepth;
@@ -1338,27 +2226,29 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to read depth/normal render targets."));
 	}
 
-	// Pass set 2: whole-scene buffers -> planar face segmentation. Unlike the line
-	// art, faces include every object in the scene (ground plane, etc.), so we drop
-	// the Cube-only show list and render all primitives.
+	// Pass set 2: same-subject buffers -> planar face segmentation and actor/material IDs.
 	{
-		SCC->ShowOnlyActors.Empty();
-		SCC->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_LegacySceneCapture;
+		ApplyCaptureSubjectActors(SCC, SubjectActors);
 		TArray<float> FaceDepth;
 		TArray<FVector3f> FaceNormal;
 		if (CaptureDepthNormal(FaceDepth, FaceNormal))
 		{
 			const FString FacesBase = FPaths::Combine(FPaths::GetPath(OutputPath), FPaths::GetBaseFilename(OutputPath));
 			if (!SaveNormalFaces(
-				FaceDepth, FaceNormal, Size.X, Size.Y, Camera,
-				/*bCaptureOrthographic*/ true, FromLZCaptureOrthoWidth,
+				FaceDepth, FaceNormal, Size.X, Size.Y, CaptureView.Transform, CaptureView.Fov,
+				/*bCaptureOrthographic*/ true, CaptureView.OrthoWidth,
+				CaptureView.ProjectionMatrix,
 				FacesBase + TEXT("_faces.png"), FacesBase + TEXT("_faces.json")))
 			{
 				UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save unique-color planar face outputs for %s."), *FacesBase);
 			}
 			FromLZActorMaterialId::SaveActorMaterialIdBuffer(
 				World,
-				Camera,
+				CaptureView.Transform,
+				CaptureView.OrthoWidth,
+				CaptureView.ProjectionMatrix,
+				SubjectActors,
+				SubjectMode,
 				Size.X,
 				Size.Y,
 				FacesBase + TEXT("_actor_material_id.png"),
@@ -1378,7 +2268,14 @@ static bool CaptureLineArtPng(const APawn* Pawn, const UCameraComponent* Camera,
 	return bSaved;
 }
 
-bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
+static bool CompleteCaptureFromPawn(
+	const APawn* Pawn,
+	FViewport* Viewport,
+	const FScopedFromLZCameraProjectionOverride& ProjectionOverride,
+	const FFromLZViewDebugSnapshot& StableOrthographicView,
+	const FPendingFromLZCapture::FOutputPaths& OutputPaths,
+	int32 OrthographicFramesRendered,
+	double StableFrameElapsedSeconds)
 {
 	if (!Pawn)
 	{
@@ -1386,8 +2283,8 @@ bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
 		return false;
 	}
 
-	UCameraComponent* CameraComponent = FindFromLZCamera(Pawn);
-	USpringArmComponent* CameraBoom = FindCameraBoom(Pawn);
+	UCameraComponent* CameraComponent = FFromLZCaptureUtils::FindFromLZCamera(Pawn);
+	USpringArmComponent* CameraBoom = FFromLZCaptureUtils::FindCameraBoom(Pawn);
 
 	if (!CameraComponent)
 	{
@@ -1395,94 +2292,451 @@ bool FFromLZCaptureUtils::CaptureFromPawn(const APawn* Pawn)
 		return false;
 	}
 
-	const FString CaptureDirectory = FPaths::ProjectSavedDir() / TEXT("FromLZCaptures");
-	IFileManager::Get().MakeDirectory(*CaptureDirectory, true);
+	if (!ProjectionOverride.bActive || CameraComponent->ProjectionMode != ECameraProjectionMode::Orthographic)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: FromLZ camera is not in the pending orthographic capture state."));
+		return false;
+	}
 
-	const FString Timestamp = FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"));
-	const FString BaseFilename = FString::Printf(TEXT("FromLZ_%s"), *Timestamp);
-	const FString JsonPath = CaptureDirectory / (BaseFilename + TEXT(".json"));
-	const FString PngPath = CaptureDirectory / (BaseFilename + TEXT(".png"));
-	const FString DebugViewportPngPath = CaptureDirectory / (BaseFilename + TEXT("_debug_viewport.png"));
-	const FString DebugFromLZCameraPngPath = CaptureDirectory / (BaseFilename + TEXT("_debug_fromlz_camera.png"));
-	const FString DebugTransformsJsonPath = CaptureDirectory / (BaseFilename + TEXT("_debug_transforms.json"));
-	const FString ActorMaterialPngPath = CaptureDirectory / (BaseFilename + TEXT("_actor_material_id.png"));
-	const FString ActorMaterialJsonPath = CaptureDirectory / (BaseFilename + TEXT("_actor_material_id.json"));
+	FFromLZCaptureView CaptureView;
+	if (!BuildCaptureViewFromOrthographicCamera(
+		Pawn,
+		CameraComponent,
+		ProjectionOverride.bUsedDefaultOrthoWidth,
+		Viewport,
+		StableOrthographicView,
+		CaptureView))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not build the direct FromLZ orthographic capture view."));
+		return false;
+	}
+
+	const bool bOrthographicViewportSaved =
+		CaptureViewportDebugPng(Viewport, OutputPaths.DebugViewportOrthographicPngPath);
+	if (!bOrthographicViewportSaved)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save the settled orthographic viewport reference image."));
+	}
+
+	TArray<AActor*> SubjectActors;
+	FString SubjectMode;
+	BuildCaptureSubjectActors(Pawn->GetWorld(), Pawn, SubjectActors, SubjectMode);
 
 	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
-	RootObject->SetStringField(TEXT("capture_timestamp"), Timestamp);
-	RootObject->SetStringField(TEXT("json_path"), JsonPath);
-	RootObject->SetStringField(TEXT("png_path"), PngPath);
-	RootObject->SetStringField(TEXT("debug_viewport_png_path"), DebugViewportPngPath);
-	RootObject->SetStringField(TEXT("debug_fromlz_camera_png_path"), DebugFromLZCameraPngPath);
-	RootObject->SetStringField(TEXT("debug_transforms_json_path"), DebugTransformsJsonPath);
-	RootObject->SetStringField(TEXT("actor_material_png_path"), ActorMaterialPngPath);
-	RootObject->SetStringField(TEXT("actor_material_json_path"), ActorMaterialJsonPath);
-	RootObject->SetObjectField(TEXT("pawn"), SerializeObjectProperties(Pawn));
-	RootObject->SetObjectField(TEXT("pawn_transform"), SerializeTransform(Pawn->GetActorTransform()));
-	RootObject->SetObjectField(TEXT("camera_component"), SerializeObjectProperties(CameraComponent));
-	RootObject->SetObjectField(TEXT("camera_component_transform"), SerializeTransform(CameraComponent->GetComponentTransform()));
+	RootObject->SetStringField(TEXT("capture_timestamp"), OutputPaths.Timestamp);
+	RootObject->SetStringField(TEXT("json_path"), OutputPaths.JsonPath);
+	RootObject->SetStringField(TEXT("png_path"), OutputPaths.PngPath);
+	RootObject->SetStringField(TEXT("debug_viewport_png_path"), OutputPaths.DebugViewportOrthographicPngPath);
+	RootObject->SetStringField(TEXT("debug_viewport_perspective_png_path"), OutputPaths.DebugViewportPerspectivePngPath);
+	RootObject->SetStringField(TEXT("debug_viewport_orthographic_png_path"), OutputPaths.DebugViewportOrthographicPngPath);
+	RootObject->SetStringField(TEXT("debug_fromlz_camera_png_path"), OutputPaths.DebugFromLZCameraPngPath);
+	RootObject->SetStringField(TEXT("debug_transforms_json_path"), OutputPaths.DebugTransformsJsonPath);
+	RootObject->SetStringField(TEXT("actor_material_png_path"), OutputPaths.ActorMaterialPngPath);
+	RootObject->SetStringField(TEXT("actor_material_json_path"), OutputPaths.ActorMaterialJsonPath);
+	RootObject->SetObjectField(TEXT("pawn"), FFromLZCaptureUtils::SerializeObjectProperties(Pawn));
+	RootObject->SetObjectField(TEXT("pawn_transform"), FFromLZCaptureUtils::SerializeTransform(Pawn->GetActorTransform()));
+	RootObject->SetObjectField(TEXT("camera_component"), FFromLZCaptureUtils::SerializeObjectProperties(CameraComponent));
+	RootObject->SetObjectField(TEXT("camera_component_transform"), FFromLZCaptureUtils::SerializeTransform(CameraComponent->GetComponentTransform()));
+	RootObject->SetBoolField(TEXT("camera_projection_temporarily_overridden"), true);
+	RootObject->SetStringField(TEXT("camera_projection_restore_policy"), TEXT("restore_original_after_capture"));
+	RootObject->SetBoolField(TEXT("capture_ortho_width_used_default"), ProjectionOverride.bUsedDefaultOrthoWidth);
+	RootObject->SetNumberField(TEXT("orthographic_viewport_frames_rendered_before_capture"), OrthographicFramesRendered);
+	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_required"), FromLZOrthographicSettleSeconds);
+	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_actual"), StableFrameElapsedSeconds);
+	RootObject->SetBoolField(TEXT("debug_viewport_perspective_saved"), true);
+	RootObject->SetBoolField(TEXT("debug_viewport_orthographic_saved"), bOrthographicViewportSaved);
+	RootObject->SetStringField(TEXT("debug_viewport_perspective_capture_source"), TEXT("displayed_game_viewport_backbuffer_before_projection_override"));
+	RootObject->SetStringField(TEXT("debug_viewport_orthographic_capture_source"), TEXT("game_viewport_backbuffer_after_two_second_orthographic_settle"));
+	RootObject->SetObjectField(TEXT("original_camera_projection"), SerializeCameraProjectionSnapshot(ProjectionOverride.Original));
+	RootObject->SetObjectField(TEXT("capture_camera_projection"), SerializeCameraProjectionSnapshot(MakeCameraProjectionSnapshot(CameraComponent)));
+	RootObject->SetObjectField(TEXT("source_view_transform"), FFromLZCaptureUtils::SerializeTransform(CaptureView.SourceViewTransform));
+	RootObject->SetStringField(TEXT("source_view_transform_source"), CaptureView.SourceViewTransformSource);
+	RootObject->SetObjectField(TEXT("capture_view_transform"), FFromLZCaptureUtils::SerializeTransform(CaptureView.Transform));
+	RootObject->SetStringField(TEXT("capture_view_transform_source"), CaptureView.TransformSource);
+	RootObject->SetBoolField(TEXT("capture_view_has_player_camera_manager"), CaptureView.bHasPlayerCameraManager);
+	if (CaptureView.bHasPlayerCameraManager)
+	{
+		FTransform PlayerCameraManagerTransform;
+		if (TryGetPlayerCameraManagerTransform(Pawn, PlayerCameraManagerTransform))
+		{
+			RootObject->SetObjectField(TEXT("player_camera_manager_transform"), FFromLZCaptureUtils::SerializeTransform(PlayerCameraManagerTransform));
+		}
+	}
 
 	if (CameraBoom)
 	{
-		RootObject->SetObjectField(TEXT("camera_boom"), SerializeObjectProperties(CameraBoom));
-		RootObject->SetObjectField(TEXT("camera_boom_transform"), SerializeTransform(CameraBoom->GetComponentTransform()));
+		RootObject->SetObjectField(TEXT("camera_boom"), FFromLZCaptureUtils::SerializeObjectProperties(CameraBoom));
+		RootObject->SetObjectField(TEXT("camera_boom_transform"), FFromLZCaptureUtils::SerializeTransform(CameraBoom->GetComponentTransform()));
 	}
 
 	TSharedRef<FJsonObject> ViewObject = MakeShared<FJsonObject>();
-	ViewObject->SetNumberField(TEXT("fov"), CameraComponent->FieldOfView);
+	ViewObject->SetNumberField(TEXT("fov"), CaptureView.Fov);
 	ViewObject->SetNumberField(TEXT("aspect_ratio"), CameraComponent->AspectRatio);
+	ViewObject->SetNumberField(TEXT("viewport_width"), CaptureView.ViewportSize.X);
+	ViewObject->SetNumberField(TEXT("viewport_height"), CaptureView.ViewportSize.Y);
+	ViewObject->SetNumberField(TEXT("viewport_aspect_ratio"), CaptureView.ViewportAspectRatio);
 	ViewObject->SetBoolField(TEXT("constrain_aspect_ratio"), CameraComponent->bConstrainAspectRatio);
+	ViewObject->SetStringField(TEXT("source_projection_mode"), StaticEnum<ECameraProjectionMode::Type>()->GetValueAsString(CameraComponent->ProjectionMode));
+	ViewObject->SetStringField(TEXT("capture_projection_mode"), StaticEnum<ECameraProjectionMode::Type>()->GetValueAsString(ECameraProjectionMode::Orthographic));
 	ViewObject->SetStringField(TEXT("projection_mode"), StaticEnum<ECameraProjectionMode::Type>()->GetValueAsString(ECameraProjectionMode::Orthographic));
-	ViewObject->SetNumberField(TEXT("ortho_width"), FromLZCaptureOrthoWidth);
+	ViewObject->SetStringField(TEXT("framing_mode"), CaptureView.FramingMode);
+	ViewObject->SetNumberField(TEXT("ortho_width"), CaptureView.OrthoWidth);
+	ViewObject->SetBoolField(TEXT("uses_stable_viewport_projection_matrix"), CaptureView.bUseViewportProjectionMatrix);
+	ViewObject->SetStringField(TEXT("projection_matrix_source"), TEXT("orthographic_stable_after_wait.final_projection_matrix"));
+	ViewObject->SetObjectField(TEXT("projection_matrix"), SerializeMatrix(CaptureView.ProjectionMatrix));
+	ViewObject->SetNumberField(TEXT("default_ortho_width"), FromLZDefaultOrthoWidth);
+	ViewObject->SetStringField(TEXT("ortho_width_mode"), CaptureView.OrthoWidthMode);
+	ViewObject->SetStringField(TEXT("focus_source"), CaptureView.FocusSource);
+	ViewObject->SetNumberField(TEXT("focus_depth"), CaptureView.FocusDepth);
+	ViewObject->SetNumberField(TEXT("ortho_backoff"), CaptureView.OrthoBackoff);
+	AddVectorFields(ViewObject, TEXT("focus_point"), CaptureView.FocusPoint);
+	ViewObject->SetStringField(TEXT("reference_source"), CaptureView.ReferenceSource);
+	ViewObject->SetNumberField(TEXT("reference_depth"), CaptureView.ReferenceDepth);
+	AddVectorFields(ViewObject, TEXT("reference_point"), CaptureView.ReferencePoint);
+	ViewObject->SetBoolField(TEXT("used_deproject_width"), CaptureView.bUsedDeprojectWidth);
+	ViewObject->SetBoolField(TEXT("used_formula_fallback"), CaptureView.bUsedFormulaFallback);
+	ViewObject->SetBoolField(TEXT("used_depth_fallback"), CaptureView.bUsedDepthFallback);
+	ViewObject->SetBoolField(TEXT("used_focus_trace"), CaptureView.bUsedFocusTrace);
+	ViewObject->SetStringField(TEXT("subject_mode"), SubjectMode);
+	ViewObject->SetNumberField(TEXT("subject_actor_count"), SubjectActors.Num());
 	ViewObject->SetNumberField(TEXT("near_clip_plane"), CameraComponent->OrthoNearClipPlane);
 	ViewObject->SetNumberField(TEXT("far_clip_plane"), CameraComponent->OrthoFarClipPlane);
 	RootObject->SetObjectField(TEXT("camera_view"), ViewObject);
 
-	if (!SaveJsonToFile(RootObject, JsonPath))
+	if (!FFromLZCaptureUtils::SaveJsonToFile(RootObject, OutputPaths.JsonPath))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not write json file %s"), *JsonPath);
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not write json file %s"), *OutputPaths.JsonPath);
 		return false;
 	}
 
-	CaptureViewportDebugPng(DebugViewportPngPath);
-	CaptureFromLZCameraDebugPng(Pawn, CameraComponent, DebugFromLZCameraPngPath);
+	CaptureFromLZCameraDebugPng(Pawn, CameraComponent, CaptureView, OutputPaths.DebugFromLZCameraPngPath);
 
-	if (CaptureLineArtPng(Pawn, CameraComponent, PngPath, DebugTransformsJsonPath))
+	if (CaptureLineArtPng(Pawn, CameraComponent, CaptureView, SubjectActors, SubjectMode, OutputPaths.PngPath, OutputPaths.DebugTransformsJsonPath))
 	{
-		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ saved json to %s and line-art png to %s"), *JsonPath, *PngPath);
+		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ saved json to %s and line-art png to %s"), *OutputPaths.JsonPath, *OutputPaths.PngPath);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ saved json to %s but line-art png failed: %s"), *JsonPath, *PngPath);
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ saved json to %s but line-art png failed: %s"), *OutputPaths.JsonPath, *OutputPaths.PngPath);
 	}
 	return true;
 }
 
-bool FFromLZCaptureUtils::CaptureFromWorld(const UWorld* World)
+bool FFromLZCaptureUtils::BeginCaptureFromWorld(const UWorld* World, FViewport* Viewport)
 {
-	if (!World)
+	if (!World || !Viewport)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: world is null."));
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: world or viewport is null."));
 		return false;
+	}
+
+	if (GPendingFromLZCapture)
+	{
+		if (GPendingFromLZCapture->World.Get() == World)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ ignored: an orthographic viewport capture is already pending."));
+			return false;
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: discarding stale pending capture from another world."));
+		GPendingFromLZCapture.Reset();
 	}
 
 	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
 	{
-		if (const APlayerController* PlayerController = It->Get())
+		if (APlayerController* PlayerController = It->Get())
 		{
-			if (const APawn* Pawn = PlayerController->GetPawn())
+			if (APawn* Pawn = PlayerController->GetPawn())
 			{
-				UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ attempting capture from controller %s with pawn %s."), *PlayerController->GetName(), *Pawn->GetName());
-				if (CaptureFromPawn(Pawn))
+				UCameraComponent* CameraComponent = FindFromLZCamera(Pawn);
+				if (!CameraComponent)
 				{
-					return true;
+					continue;
 				}
+
+				const FPendingFromLZCapture::FOutputPaths OutputPaths = MakeCaptureOutputPaths();
+				const FFromLZViewDebugSnapshot PerspectiveBefore =
+					CaptureViewDebugSnapshot(TEXT("perspective_before_switch"), Pawn, CameraComponent, Viewport);
+				if (!CaptureViewportDebugPng(Viewport, OutputPaths.DebugViewportPerspectivePngPath))
+				{
+					UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not save the current perspective viewport before switching projection."));
+					return false;
+				}
+
+				TUniquePtr<FPendingFromLZCapture> Pending = MakeUnique<FPendingFromLZCapture>();
+				Pending->Pawn = Pawn;
+				Pending->Camera = CameraComponent;
+				Pending->World = const_cast<UWorld*>(World);
+				Pending->OutputPaths = OutputPaths;
+				Pending->PerspectiveBefore = PerspectiveBefore;
+				Pending->ProjectionOverride = MakeUnique<FScopedFromLZCameraProjectionOverride>(CameraComponent);
+				if (!Pending->ProjectionOverride || !Pending->ProjectionOverride->bActive)
+				{
+					UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not switch FromLZ camera to orthographic."));
+					return false;
+				}
+				Pending->OrthographicStartTimeSeconds = FPlatformTime::Seconds();
+
+				UE_LOG(
+					LogTemp,
+					Log,
+					TEXT("CaptureFromLZ began for controller %s pawn %s: saved perspective viewport to %s, switched to orthographic width %.3f, and will wait at least %.1f seconds."),
+					*PlayerController->GetName(),
+					*Pawn->GetName(),
+					*OutputPaths.DebugViewportPerspectivePngPath,
+					Pending->ProjectionOverride->CaptureOrthoWidth,
+					FromLZOrthographicSettleSeconds);
+				GPendingFromLZCapture = MoveTemp(Pending);
+				return true;
 			}
 		}
 	}
 
 	UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: no player controller with a capturable pawn was found."));
 	return false;
+}
+
+void FFromLZCaptureUtils::NotifyViewportDrawn(const UWorld* World, FViewport* Viewport)
+{
+	if (!GPendingFromLZCapture)
+	{
+		return;
+	}
+
+	if (GPendingFromLZCapture->bWaitingForRestoredPerspective)
+	{
+		if (!World || !Viewport || GPendingFromLZCapture->World.Get() != World ||
+			!GPendingFromLZCapture->Pawn.IsValid() || !GPendingFromLZCapture->Camera.IsValid())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: restored-perspective validation became invalid."));
+			GPendingFromLZCapture.Reset();
+			return;
+		}
+
+		APawn* Pawn = GPendingFromLZCapture->Pawn.Get();
+		UCameraComponent* Camera = GPendingFromLZCapture->Camera.Get();
+		APlayerController* PlayerController = GetPawnPlayerController(Pawn);
+		const ECameraProjectionMode::Type OriginalProjection =
+			GPendingFromLZCapture->ProjectionOverride
+			? GPendingFromLZCapture->ProjectionOverride->Original.ProjectionMode
+			: ECameraProjectionMode::Perspective;
+		if (Camera->ProjectionMode != OriginalProjection ||
+			!PlayerController || !PlayerController->PlayerCameraManager ||
+			PlayerController->PlayerCameraManager->GetCameraCacheView().ProjectionMode != OriginalProjection)
+		{
+			return;
+		}
+
+		++GPendingFromLZCapture->RestoredPerspectiveFramesRendered;
+		GPendingFromLZCapture->PerspectiveRestored =
+			CaptureViewDebugSnapshot(TEXT("perspective_restored_rendered_frame"), Pawn, Camera, Viewport);
+		GPendingFromLZCapture->bRestoredPerspectiveFrameRendered = true;
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("CaptureFromLZ: restored %s viewport frame rendered; projection validation will finalize on the next viewport tick."),
+			*ProjectionModeToString(OriginalProjection));
+		return;
+	}
+
+	if (GPendingFromLZCapture->bCompleting)
+	{
+		return;
+	}
+
+	if (GPendingFromLZCapture->bStableOrthographicFrameRendered)
+	{
+		return;
+	}
+
+	if (!World || !Viewport || GPendingFromLZCapture->World.Get() != World ||
+		!GPendingFromLZCapture->Pawn.IsValid() || !GPendingFromLZCapture->Camera.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: pending capture became invalid before the orthographic viewport frame was rendered; restoring camera."));
+		GPendingFromLZCapture.Reset();
+		return;
+	}
+
+	APawn* Pawn = GPendingFromLZCapture->Pawn.Get();
+	if (GPendingFromLZCapture->Camera->ProjectionMode != ECameraProjectionMode::Orthographic)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera left orthographic mode before viewport rendering; restoring camera."));
+		GPendingFromLZCapture.Reset();
+		return;
+	}
+
+	APlayerController* PlayerController = GetPawnPlayerController(Pawn);
+	if (PlayerController && PlayerController->PlayerCameraManager)
+	{
+		const FMinimalViewInfo& CachedView = PlayerController->PlayerCameraManager->GetCameraCacheView();
+		if (CachedView.ProjectionMode != ECameraProjectionMode::Orthographic)
+		{
+			if (GPendingFromLZCapture->OrthographicFramesRendered == 0)
+			{
+				UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: viewport draw still used a non-orthographic PlayerCameraManager view; waiting for another frame."));
+			}
+			return;
+		}
+	}
+
+	if (!GPendingFromLZCapture->bFirstOrthographicFrameRecorded)
+	{
+		GPendingFromLZCapture->OrthographicFirstRendered =
+			CaptureViewDebugSnapshot(TEXT("orthographic_first_rendered_frame"), Pawn, GPendingFromLZCapture->Camera.Get(), Viewport);
+		GPendingFromLZCapture->bFirstOrthographicFrameRecorded = true;
+	}
+
+	++GPendingFromLZCapture->OrthographicFramesRendered;
+	const double ElapsedSeconds = FPlatformTime::Seconds() - GPendingFromLZCapture->OrthographicStartTimeSeconds;
+	if (ElapsedSeconds < FromLZOrthographicSettleSeconds)
+	{
+		if (GPendingFromLZCapture->OrthographicFramesRendered == 1)
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("CaptureFromLZ: first orthographic viewport frame rendered; continuing to render until the %.1f-second settle interval is complete."),
+				FromLZOrthographicSettleSeconds);
+		}
+		return;
+	}
+
+	GPendingFromLZCapture->StableFrameElapsedSeconds = ElapsedSeconds;
+	GPendingFromLZCapture->OrthographicStable =
+		CaptureViewDebugSnapshot(TEXT("orthographic_stable_after_wait"), Pawn, GPendingFromLZCapture->Camera.Get(), Viewport);
+	GPendingFromLZCapture->bStableOrthographicFrameRendered = true;
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("CaptureFromLZ: stable orthographic viewport frame rendered after %.3f seconds (%d orthographic frame(s)); capture will complete on the next viewport tick."),
+		ElapsedSeconds,
+		GPendingFromLZCapture->OrthographicFramesRendered);
+}
+
+void FFromLZCaptureUtils::CompletePendingCapture(const UWorld* World, FViewport* Viewport)
+{
+	if (!GPendingFromLZCapture)
+	{
+		return;
+	}
+
+	if (!World || !Viewport || GPendingFromLZCapture->World.Get() != World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: pending capture world or viewport became invalid; restoring camera."));
+		GPendingFromLZCapture.Reset();
+		return;
+	}
+
+	APawn* Pawn = GPendingFromLZCapture->Pawn.Get();
+	UCameraComponent* CameraComponent = GPendingFromLZCapture->Camera.Get();
+	FScopedFromLZCameraProjectionOverride* ProjectionOverride = GPendingFromLZCapture->ProjectionOverride.Get();
+	if (!Pawn || !CameraComponent || !ProjectionOverride)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: pending pawn/camera state became invalid; restoring camera."));
+		GPendingFromLZCapture.Reset();
+		return;
+	}
+
+	if (GPendingFromLZCapture->bWaitingForRestoredPerspective)
+	{
+		if (GPendingFromLZCapture->bRestoredPerspectiveFrameRendered)
+		{
+			const bool bCaptured = GPendingFromLZCapture->bCaptureSucceeded;
+			const double StableFrameElapsedSeconds = GPendingFromLZCapture->StableFrameElapsedSeconds;
+			const int32 OrthographicFramesRendered = GPendingFromLZCapture->OrthographicFramesRendered;
+			const FString RestoredProjectionMode = ProjectionModeToString(ProjectionOverride->Original.ProjectionMode);
+			const bool bDebugSaved = FinalizeProjectionDebugFiles(*GPendingFromLZCapture);
+			GPendingFromLZCapture.Reset();
+
+			if (bCaptured && bDebugSaved)
+			{
+				UE_LOG(
+					LogTemp,
+					Log,
+					TEXT("CaptureFromLZ: cross-frame capture completed after %.3f seconds and %d orthographic viewport frame(s); restored camera projection to %s; projection debug saved."),
+					StableFrameElapsedSeconds,
+					OrthographicFramesRendered,
+					*RestoredProjectionMode);
+			}
+			else
+			{
+				UE_LOG(
+					LogTemp,
+					Warning,
+					TEXT("CaptureFromLZ: cross-frame capture or projection debug failed after %.3f seconds and %d orthographic viewport frame(s); restored camera projection to %s."),
+					StableFrameElapsedSeconds,
+					OrthographicFramesRendered,
+					*RestoredProjectionMode);
+			}
+			return;
+		}
+
+		const double RestoreElapsedSeconds = FPlatformTime::Seconds() - GPendingFromLZCapture->RestoreStartTimeSeconds;
+		if (RestoreElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
+		{
+			GPendingFromLZCapture->PerspectiveRestored =
+				CaptureViewDebugSnapshot(TEXT("perspective_restore_timeout"), Pawn, CameraComponent, Viewport);
+			FinalizeProjectionDebugFiles(*GPendingFromLZCapture);
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("CaptureFromLZ: timed out after %.3f seconds waiting for a rendered restored-perspective frame."),
+				RestoreElapsedSeconds);
+			GPendingFromLZCapture.Reset();
+		}
+		return;
+	}
+
+	if (GPendingFromLZCapture->bCompleting)
+	{
+		return;
+	}
+
+	if (!ProjectionOverride->bActive)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: orthographic projection override ended before capture completion."));
+		GPendingFromLZCapture.Reset();
+		return;
+	}
+
+	if (!GPendingFromLZCapture->bStableOrthographicFrameRendered)
+	{
+		const double ElapsedSeconds = FPlatformTime::Seconds() - GPendingFromLZCapture->OrthographicStartTimeSeconds;
+		if (ElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("CaptureFromLZ: timed out after %.3f seconds without a settled orthographic viewport frame; restoring camera."),
+				ElapsedSeconds);
+			GPendingFromLZCapture.Reset();
+		}
+		return;
+	}
+
+	GPendingFromLZCapture->bCompleting = true;
+	const int32 OrthographicFramesRendered = GPendingFromLZCapture->OrthographicFramesRendered;
+	const double StableFrameElapsedSeconds = GPendingFromLZCapture->StableFrameElapsedSeconds;
+	const bool bCaptured = CompleteCaptureFromPawn(
+		Pawn,
+		Viewport,
+		*ProjectionOverride,
+		GPendingFromLZCapture->OrthographicStable,
+		GPendingFromLZCapture->OutputPaths,
+		OrthographicFramesRendered,
+		StableFrameElapsedSeconds);
+
+	GPendingFromLZCapture->bOutputsGenerated = true;
+	GPendingFromLZCapture->bCaptureSucceeded = bCaptured;
+	ProjectionOverride->Restore();
+	GPendingFromLZCapture->bCompleting = false;
+	GPendingFromLZCapture->bWaitingForRestoredPerspective = true;
+	GPendingFromLZCapture->RestoreStartTimeSeconds = FPlatformTime::Seconds();
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("CaptureFromLZ: output generation finished; restored camera component to %s and waiting for a rendered viewport frame to validate the full cycle."),
+		*ProjectionModeToString(ProjectionOverride->Original.ProjectionMode));
 }
 
 UCameraComponent* FFromLZCaptureUtils::FindFromLZCamera(const APawn* Pawn)

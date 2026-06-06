@@ -14,6 +14,18 @@ void UFromLZGameViewportClient::Init(FWorldContext& WorldContext, UGameInstance*
 	UE_LOG(LogTemp, Log, TEXT("FromLZGameViewportClient initialized. World=%s GameInstance=%s"), *WorldName, *GetNameSafe(OwningGameInstance));
 }
 
+void UFromLZGameViewportClient::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+	FFromLZCaptureUtils::CompletePendingCapture(GetWorld(), Viewport);
+}
+
+void UFromLZGameViewportClient::Draw(FViewport* InViewport, FCanvas* SceneCanvas)
+{
+	Super::Draw(InViewport, SceneCanvas);
+	FFromLZCaptureUtils::NotifyViewportDrawn(GetWorld(), InViewport);
+}
+
 bool UFromLZGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 {
 	if (EventArgs.Event == IE_Pressed)
@@ -21,7 +33,7 @@ bool UFromLZGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 		if (EventArgs.Key == EKeys::Enter)
 		{
 			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ invoked from viewport input. Key=%s"), *EventArgs.Key.ToString());
-			FFromLZCaptureUtils::CaptureFromWorld(GetWorld());
+			FFromLZCaptureUtils::BeginCaptureFromWorld(GetWorld(), Viewport);
 		}
 		else if (EventArgs.Key == EKeys::LeftShift || EventArgs.Key == EKeys::RightShift)
 		{
