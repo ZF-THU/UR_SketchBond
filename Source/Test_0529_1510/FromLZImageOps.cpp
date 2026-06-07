@@ -609,9 +609,14 @@ namespace FromLZImageOps
 		const TArray<uint8>& Skel, int32 Width, int32 Height,
 		float GapTol, int32 ConnectThickness,
 		float SmallLoopBboxAreaThresh, float BranchPruneMaxPixels,
+		const TArray<uint8>& SourceColorMap, int32 SourceColorSampleRadius,
+		const FString& RedBlackConnectorsDebugPngPath, const FString& RedBlackReconnectedDebugPngPath,
+		const FString& ConnectorPruneDebugJsonPath,
 		TArray<uint8>& OutConnected, TArray<uint8>& OutSmallLoopPruned, TArray<uint8>& OutCleaned)
 	{
 		const int32 N = Width * Height;
+		const bool bHasSourceColorMap = SourceColorMap.Num() >= N;
+		const int32 SampleRadius = FMath::Max(0, SourceColorSampleRadius);
 
 		// work = binarized copy (foreground = 255).
 		TArray<uint8> Work;
@@ -663,7 +668,25 @@ namespace FromLZImageOps
 			}
 		}
 
-		struct FConn { FIntPoint P0; FIntPoint P1; };
+		struct FConn
+		{
+			FString Source = TEXT("all_skeleton");
+			FIntPoint P0;
+			FIntPoint P1;
+			TArray<FIntPoint> LinePts;
+			TArray<FIntPoint> AddedPts;
+			bool bRbAltPath = false;
+			int32 RbAltPathPixels = 0;
+			int64 RbBboxArea = -1;
+			bool bProtectedKeep = false;
+			bool bFullSkippedByProtection = false;
+			bool bFullAltPath = false;
+			int32 FullAltPathPixels = 0;
+			int64 FullBboxArea = -1;
+			int32 FullAddedPixels = 0;
+			bool bKept = true;
+			FString Decision = TEXT("not_processed");
+		};
 		TArray<FConn> Connections;
 		TArray<bool> Used;
 		Used.Init(false, E);
@@ -678,53 +701,358 @@ namespace FromLZImageOps
 			{
 				continue;
 			}
-			Connections.Add({ EndpointsBefore[i], EndpointsBefore[j] });
+			FConn Conn;
+			Conn.P0 = EndpointsBefore[i];
+			Conn.P1 = EndpointsBefore[j];
+			Connections.Add(MoveTemp(Conn));
 			Used[i] = true;
 			Used[j] = true;
 		}
 
 		// connected = work + drawn 1px connection lines.
 		TArray<uint8> Connected = Work;
-		TArray<FIntPoint> LineBuf;
-		for (const FConn& C : Connections)
+		for (FConn& C : Connections)
 		{
-			SkelGraph::LinePoints(C.P0, C.P1, LineBuf);
-			for (const FIntPoint& P : LineBuf)
+			SkelGraph::LinePoints(C.P0, C.P1, C.LinePts);
+			for (const FIntPoint& P : C.LinePts)
 			{
 				if (P.X >= 0 && P.X < Width && P.Y >= 0 && P.Y < Height)
 				{
-					Connected[P.Y * Width + P.X] = 255;
+					const int32 Idx = P.Y * Width + P.X;
+					if (Work[Idx] == 0)
+					{
+						C.AddedPts.Add(P);
+					}
+					Connected[Idx] = 255;
 				}
 			}
 		}
 		OutConnected = Connected;
 
-		// ---- 2. prune connections that only close a small loop -----------------
-		TArray<uint8> Current = Connected;
 		const float LoopThresh = FMath::Max(0.0f, SmallLoopBboxAreaThresh);
+
+		auto SampleSourceColorClass = [&](const FIntPoint& P) -> EStrokeColor
+		{
+			if (!bHasSourceColorMap)
+			{
+				return EStrokeColor::None;
+			}
+
+			int32 Counts[5] = { 0, 0, 0, 0, 0 };
+			const int32 MinY = FMath::Max(0, P.Y - SampleRadius);
+			const int32 MaxY = FMath::Min(Height - 1, P.Y + SampleRadius);
+			const int32 MinX = FMath::Max(0, P.X - SampleRadius);
+			const int32 MaxX = FMath::Min(Width - 1, P.X + SampleRadius);
+			for (int32 yy = MinY; yy <= MaxY; ++yy)
+			{
+				for (int32 xx = MinX; xx <= MaxX; ++xx)
+				{
+					const uint8 C = SourceColorMap[yy * Width + xx];
+					if (C > uint8(EStrokeColor::None) && C <= uint8(EStrokeColor::Blue))
+					{
+						++Counts[C];
+					}
+				}
+			}
+
+			int32 Best = int32(EStrokeColor::None);
+			int32 BestCount = 0;
+			for (int32 c = 1; c <= 4; ++c)
+			{
+				if (Counts[c] > BestCount)
+				{
+					BestCount = Counts[c];
+					Best = c;
+				}
+			}
+			return EStrokeColor(Best);
+		};
+
+		auto LoopBboxArea = [](const TArray<FIntPoint>& Path, const TArray<FIntPoint>& AddedPts) -> int64
+		{
+			if (Path.Num() == 0 && AddedPts.Num() == 0)
+			{
+				return -1;
+			}
+			int32 MinX = MAX_int32, MinY = MAX_int32, MaxX = MIN_int32, MaxY = MIN_int32;
+			auto Acc = [&](const FIntPoint& P)
+			{
+				MinX = FMath::Min(MinX, P.X);
+				MinY = FMath::Min(MinY, P.Y);
+				MaxX = FMath::Max(MaxX, P.X);
+				MaxY = FMath::Max(MaxY, P.Y);
+			};
+			for (const FIntPoint& P : Path) { Acc(P); }
+			for (const FIntPoint& P : AddedPts) { Acc(P); }
+			return int64(MaxX - MinX + 1) * int64(MaxY - MinY + 1);
+		};
+
+		TArray<uint8> RedBlackCandidate;
+		RedBlackCandidate.Init(0, N);
+		TArray<uint8> RedBlackDebugKind; // 0 background, 1 source black, 2 source/connector red
+		RedBlackDebugKind.Init(0, N);
+		if (bHasSourceColorMap)
+		{
+			for (int32 y = 0; y < Height; ++y)
+			{
+				for (int32 x = 0; x < Width; ++x)
+				{
+					const int32 Idx = y * Width + x;
+					if (Work[Idx] == 0)
+					{
+						continue;
+					}
+					const EStrokeColor C = SampleSourceColorClass(FIntPoint(x, y));
+					if (C == EStrokeColor::Red || C == EStrokeColor::Black)
+					{
+						RedBlackCandidate[Idx] = 255;
+						RedBlackDebugKind[Idx] = (C == EStrokeColor::Black) ? 1 : 2;
+					}
+				}
+			}
+		}
+		for (const FConn& C : Connections)
+		{
+			for (const FIntPoint& P : C.AddedPts)
+			{
+				if (P.X >= 0 && P.X < Width && P.Y >= 0 && P.Y < Height)
+				{
+					const int32 Idx = P.Y * Width + P.X;
+					RedBlackCandidate[Idx] = 255;
+					RedBlackDebugKind[Idx] = 2;
+				}
+			}
+		}
+
+		if (!RedBlackConnectorsDebugPngPath.IsEmpty())
+		{
+			TArray<uint8> RGBA;
+			RGBA.Init(255, N * 4);
+			for (int32 i = 0; i < N; ++i)
+			{
+				const int32 Off = i * 4;
+				if (RedBlackDebugKind[i] == 1)
+				{
+					RGBA[Off + 0] = 0;
+					RGBA[Off + 1] = 0;
+					RGBA[Off + 2] = 0;
+				}
+				else if (RedBlackDebugKind[i] == 2)
+				{
+					RGBA[Off + 0] = 220;
+					RGBA[Off + 1] = 20;
+					RGBA[Off + 2] = 60;
+				}
+				RGBA[Off + 3] = 255;
+			}
+			IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+			TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
+			if (IW.IsValid())
+			{
+				IW->SetRaw(RGBA.GetData(), RGBA.Num(), Width, Height, ERGBFormat::RGBA, 8);
+				const TArray64<uint8>& C = IW->GetCompressed();
+				FFileHelper::SaveArrayToFile(TArrayView<const uint8>(C.GetData(), static_cast<int32>(C.Num())), *RedBlackConnectorsDebugPngPath);
+			}
+		}
+
+		// Re-run the endpoint repair on the red/black candidate graph. These
+		// second-pass connectors are promoted into the same connector list, so they
+		// participate in the red/black protection check and the full-skeleton prune.
+		TArray<FIntPoint> RbEndpoints;
+		SkelGraph::FindEndpoints(RedBlackCandidate.GetData(), Width, Height, RbEndpoints);
+		const int32 RbE = RbEndpoints.Num();
+		TArray<int32> RbNearestJ;
+		TArray<double> RbNearestD2;
+		RbNearestJ.Init(-1, RbE);
+		RbNearestD2.Init(TNumericLimits<double>::Max(), RbE);
+		for (int32 i = 0; i < RbE; ++i)
+		{
+			for (int32 j = 0; j < RbE; ++j)
+			{
+				if (i == j)
+				{
+					continue;
+				}
+				const double ddx = double(RbEndpoints[i].X - RbEndpoints[j].X);
+				const double ddy = double(RbEndpoints[i].Y - RbEndpoints[j].Y);
+				const double D2 = ddx * ddx + ddy * ddy;
+				if (D2 > Tol2)
+				{
+					continue;
+				}
+				if (D2 < RbNearestD2[i])
+				{
+					RbNearestD2[i] = D2;
+					RbNearestJ[i] = j;
+				}
+			}
+		}
+
+		TArray<bool> RbUsed;
+		RbUsed.Init(false, RbE);
+		for (int32 i = 0; i < RbE; ++i)
+		{
+			const int32 j = RbNearestJ[i];
+			if (j < 0 || RbUsed[i] || RbUsed[j])
+			{
+				continue;
+			}
+			if (RbNearestJ[j] != i)
+			{
+				continue;
+			}
+
+			FConn Conn;
+			Conn.Source = TEXT("red_black_reconnect");
+			Conn.P0 = RbEndpoints[i];
+			Conn.P1 = RbEndpoints[j];
+			SkelGraph::LinePoints(Conn.P0, Conn.P1, Conn.LinePts);
+
+			bool bAddsRedBlackPixel = false;
+			for (const FIntPoint& P : Conn.LinePts)
+			{
+				if (P.X < 0 || P.X >= Width || P.Y < 0 || P.Y >= Height)
+				{
+					continue;
+				}
+				const int32 Idx = P.Y * Width + P.X;
+				if (RedBlackCandidate[Idx] == 0)
+				{
+					bAddsRedBlackPixel = true;
+				}
+				if (Connected[Idx] == 0)
+				{
+					Conn.AddedPts.Add(P);
+				}
+			}
+
+			if (!bAddsRedBlackPixel && Conn.AddedPts.Num() == 0)
+			{
+				RbUsed[i] = true;
+				RbUsed[j] = true;
+				continue;
+			}
+
+			for (const FIntPoint& P : Conn.LinePts)
+			{
+				if (P.X < 0 || P.X >= Width || P.Y < 0 || P.Y >= Height)
+				{
+					continue;
+				}
+				const int32 Idx = P.Y * Width + P.X;
+				RedBlackCandidate[Idx] = 255;
+				RedBlackDebugKind[Idx] = 2;
+				Connected[Idx] = 255;
+			}
+			Connections.Add(MoveTemp(Conn));
+			RbUsed[i] = true;
+			RbUsed[j] = true;
+		}
+
+		if (!RedBlackReconnectedDebugPngPath.IsEmpty())
+		{
+			TArray<uint8> RGBA;
+			RGBA.Init(255, N * 4);
+			for (int32 i = 0; i < N; ++i)
+			{
+				const int32 Off = i * 4;
+				if (RedBlackDebugKind[i] == 1)
+				{
+					RGBA[Off + 0] = 0;
+					RGBA[Off + 1] = 0;
+					RGBA[Off + 2] = 0;
+				}
+				else if (RedBlackDebugKind[i] == 2)
+				{
+					RGBA[Off + 0] = 220;
+					RGBA[Off + 1] = 20;
+					RGBA[Off + 2] = 60;
+				}
+				RGBA[Off + 3] = 255;
+			}
+			IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+			TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
+			if (IW.IsValid())
+			{
+				IW->SetRaw(RGBA.GetData(), RGBA.Num(), Width, Height, ERGBFormat::RGBA, 8);
+				const TArray64<uint8>& C = IW->GetCompressed();
+				FFileHelper::SaveArrayToFile(TArrayView<const uint8>(C.GetData(), static_cast<int32>(C.Num())), *RedBlackReconnectedDebugPngPath);
+			}
+		}
+
+		TArray<uint8> ProtectedConnectorPixels;
+		ProtectedConnectorPixels.Init(0, N);
 		if (LoopThresh > 0.0f)
 		{
-			for (const FConn& C : Connections)
+			for (FConn& C : Connections)
 			{
-				SkelGraph::LinePoints(C.P0, C.P1, LineBuf);
+				if (C.AddedPts.Num() == 0)
+				{
+					C.Decision = TEXT("skip_no_added_pixels");
+					continue;
+				}
+
+				TArray<uint8> Probe = RedBlackCandidate;
+				for (const FIntPoint& P : C.AddedPts)
+				{
+					Probe[P.Y * Width + P.X] = 0;
+				}
+
+				TArray<FIntPoint> RbPath;
+				C.bRbAltPath = SkelGraph::ShortestPath(Probe.GetData(), Width, Height, C.P0, C.P1, RbPath);
+				if (!C.bRbAltPath)
+				{
+					continue;
+				}
+
+				C.RbAltPathPixels = RbPath.Num();
+				C.RbBboxArea = LoopBboxArea(RbPath, C.AddedPts);
+				if (double(C.RbBboxArea) >= double(LoopThresh))
+				{
+					C.bProtectedKeep = true;
+					for (const FIntPoint& P : C.AddedPts)
+					{
+						ProtectedConnectorPixels[P.Y * Width + P.X] = 255;
+					}
+				}
+			}
+		}
+
+		// ---- 2. prune connections that only close a small loop -----------------
+		TArray<uint8> Current = Connected;
+		if (LoopThresh > 0.0f)
+		{
+			for (FConn& C : Connections)
+			{
+				if (C.bProtectedKeep)
+				{
+					C.bFullSkippedByProtection = true;
+					C.bKept = true;
+					C.Decision = TEXT("keep_red_black_large_loop_protected");
+					continue;
+				}
 
 				// Pixels added by this connection (background in original Work) that are
-				// currently still foreground.
+				// currently still foreground. Pixels owned by a protected connector are
+				// never removed through another connector's full-skeleton prune.
 				TArray<FIntPoint> AddedPts;
-				for (const FIntPoint& P : LineBuf)
+				for (const FIntPoint& P : C.LinePts)
 				{
 					if (P.X < 0 || P.X >= Width || P.Y < 0 || P.Y >= Height)
 					{
 						continue;
 					}
 					const int32 Idx = P.Y * Width + P.X;
-					if (Work[Idx] == 0 && Current[Idx] > 0)
+					if (Work[Idx] == 0 && Current[Idx] > 0 && ProtectedConnectorPixels[Idx] == 0)
 					{
 						AddedPts.Add(P);
 					}
 				}
+				C.FullAddedPixels = AddedPts.Num();
 				if (AddedPts.Num() == 0)
 				{
+					C.bKept = true;
+					C.Decision = C.AddedPts.Num() == 0 ? TEXT("skip_no_added_pixels") : TEXT("keep_no_unprotected_added_pixels");
 					continue;
 				}
 
@@ -734,31 +1062,27 @@ namespace FromLZImageOps
 					Current[P.Y * Width + P.X] = 0;
 				}
 				TArray<FIntPoint> Path;
-				const bool bAltPath = SkelGraph::ShortestPath(Current.GetData(), Width, Height, C.P0, C.P1, Path);
-				if (!bAltPath)
+				C.bFullAltPath = SkelGraph::ShortestPath(Current.GetData(), Width, Height, C.P0, C.P1, Path);
+				if (!C.bFullAltPath)
 				{
 					// No alternate path => not a loop; restore the connection.
 					for (const FIntPoint& P : AddedPts)
 					{
 						Current[P.Y * Width + P.X] = 255;
 					}
+					C.bKept = true;
+					C.Decision = TEXT("keep_no_full_alt_path");
 					continue;
 				}
 
-				// Loop bbox over the alternate path + the added pixels.
-				int32 MinX = MAX_int32, MinY = MAX_int32, MaxX = MIN_int32, MaxY = MIN_int32;
-				auto Acc = [&](const FIntPoint& P)
-				{
-					MinX = FMath::Min(MinX, P.X); MinY = FMath::Min(MinY, P.Y);
-					MaxX = FMath::Max(MaxX, P.X); MaxY = FMath::Max(MaxY, P.Y);
-				};
-				for (const FIntPoint& P : Path) { Acc(P); }
-				for (const FIntPoint& P : AddedPts) { Acc(P); }
-				const int64 BboxArea = int64(MaxX - MinX + 1) * int64(MaxY - MinY + 1);
+				C.FullAltPathPixels = Path.Num();
+				C.FullBboxArea = LoopBboxArea(Path, AddedPts);
 
-				if (double(BboxArea) < double(LoopThresh))
+				if (double(C.FullBboxArea) < double(LoopThresh))
 				{
 					// Small loop: keep the added pixels removed.
+					C.bKept = false;
+					C.Decision = TEXT("delete_full_small_loop");
 				}
 				else
 				{
@@ -767,10 +1091,49 @@ namespace FromLZImageOps
 					{
 						Current[P.Y * Width + P.X] = 255;
 					}
+					C.bKept = true;
+					C.Decision = TEXT("keep_full_large_loop");
 				}
 			}
 		}
 		OutSmallLoopPruned = Current;
+
+		if (!ConnectorPruneDebugJsonPath.IsEmpty())
+		{
+			FString Json;
+			Json += TEXT("{\n");
+			Json += FString::Printf(TEXT("  \"gap_tol\": %.3f,\n"), GapTol);
+			Json += FString::Printf(TEXT("  \"small_loop_bbox_area_thresh\": %.3f,\n"), SmallLoopBboxAreaThresh);
+			Json += FString::Printf(TEXT("  \"red_black_source_sample_radius\": %d,\n"), SampleRadius);
+			Json += FString::Printf(TEXT("  \"connector_count\": %d,\n"), Connections.Num());
+			Json += TEXT("  \"connectors\": [\n");
+			for (int32 i = 0; i < Connections.Num(); ++i)
+			{
+				const FConn& C = Connections[i];
+				Json += TEXT("    {\n");
+				Json += FString::Printf(TEXT("      \"id\": %d,\n"), i + 1);
+				Json += FString::Printf(TEXT("      \"source\": \"%s\",\n"), *C.Source);
+				Json += FString::Printf(TEXT("      \"p0\": [%d, %d],\n"), C.P0.X, C.P0.Y);
+				Json += FString::Printf(TEXT("      \"p1\": [%d, %d],\n"), C.P1.X, C.P1.Y);
+				Json += FString::Printf(TEXT("      \"line_pixels\": %d,\n"), C.LinePts.Num());
+				Json += FString::Printf(TEXT("      \"added_pixels\": %d,\n"), C.AddedPts.Num());
+				Json += FString::Printf(TEXT("      \"rb_alt_path_found\": %s,\n"), C.bRbAltPath ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"rb_alt_path_pixels\": %d,\n"), C.RbAltPathPixels);
+				Json += FString::Printf(TEXT("      \"rb_bbox_area\": %lld,\n"), C.RbBboxArea);
+				Json += FString::Printf(TEXT("      \"protected_keep\": %s,\n"), C.bProtectedKeep ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"full_skipped_by_protection\": %s,\n"), C.bFullSkippedByProtection ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"full_added_pixels_checked\": %d,\n"), C.FullAddedPixels);
+				Json += FString::Printf(TEXT("      \"full_alt_path_found\": %s,\n"), C.bFullAltPath ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"full_alt_path_pixels\": %d,\n"), C.FullAltPathPixels);
+				Json += FString::Printf(TEXT("      \"full_bbox_area\": %lld,\n"), C.FullBboxArea);
+				Json += FString::Printf(TEXT("      \"kept\": %s,\n"), C.bKept ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"decision\": \"%s\"\n"), *C.Decision);
+				Json += FString::Printf(TEXT("    }%s\n"), (i + 1 < Connections.Num()) ? TEXT(",") : TEXT(""));
+			}
+			Json += TEXT("  ]\n");
+			Json += TEXT("}\n");
+			FFileHelper::SaveStringToFile(Json, *ConnectorPruneDebugJsonPath);
+		}
 
 		// ---- 3. trim dangling branches ----------------------------------------
 		// Branch-prune endpoint set + stop nodes are taken from the small-loop-pruned snapshot.
@@ -803,6 +1166,62 @@ namespace FromLZImageOps
 		TSet<int32> StopNodes;
 		SkelGraph::BranchStopPoints(Current.GetData(), Width, Height, StopNodes);
 
+		auto SamplesAsProtectedSourceColor = [&](const FIntPoint& P) -> bool
+		{
+			if (!bHasSourceColorMap)
+			{
+				return false;
+			}
+
+			int32 ProtectedSamples = 0;
+			int32 ColoredSamples = 0;
+			const int32 MinY = FMath::Max(0, P.Y - SampleRadius);
+			const int32 MaxY = FMath::Min(Height - 1, P.Y + SampleRadius);
+			const int32 MinX = FMath::Max(0, P.X - SampleRadius);
+			const int32 MaxX = FMath::Min(Width - 1, P.X + SampleRadius);
+			for (int32 yy = MinY; yy <= MaxY; ++yy)
+			{
+				for (int32 xx = MinX; xx <= MaxX; ++xx)
+				{
+					const uint8 C = SourceColorMap[yy * Width + xx];
+					if (C == uint8(EStrokeColor::None))
+					{
+						continue;
+					}
+					++ColoredSamples;
+					if (C == uint8(EStrokeColor::Red) || C == uint8(EStrokeColor::Black))
+					{
+						++ProtectedSamples;
+					}
+				}
+			}
+
+			return ProtectedSamples > 0 && ProtectedSamples * 2 >= ColoredSamples;
+		};
+
+		auto BranchHasProtectedSourceColor = [&](const TArray<FIntPoint>& BranchPath) -> bool
+		{
+			// The prune operation removes all but the terminal node, so classify only
+			// pixels that would actually be deleted.
+			const int32 DeleteCount = FMath::Max(0, BranchPath.Num() - 1);
+			if (DeleteCount == 0)
+			{
+				return false;
+			}
+
+			int32 ProtectedPathSamples = 0;
+			for (int32 k = 0; k < DeleteCount; ++k)
+			{
+				if (SamplesAsProtectedSourceColor(BranchPath[k]))
+				{
+					++ProtectedPathSamples;
+				}
+			}
+
+			const int32 Needed = FMath::Max(1, (DeleteCount + 1) / 2);
+			return ProtectedPathSamples >= Needed;
+		};
+
 		TArray<uint8> Cleaned = Current;
 		TArray<FIntPoint> Path;
 		for (const FIntPoint& P : PrunePoints)
@@ -828,6 +1247,10 @@ namespace FromLZImageOps
 			if (MaxPixels > 0.0f && Path.Num() > MaxPixels)
 			{
 				continue; // branch too long to be noise
+			}
+			if (BranchHasProtectedSourceColor(Path))
+			{
+				continue; // preserve short branches that still map to source red/black strokes
 			}
 			// Remove all but the terminal node.
 			for (int32 k = 0; k < Path.Num() - 1; ++k)
@@ -2945,6 +3368,10 @@ namespace FromLZImageOps
 	{
 		FVector2D Pos = FVector2D::ZeroVector;
 		FVector2D Forward = FVector2D::ZeroVector;
+		int32 SourceStrokeId = INDEX_NONE;
+		int32 TopologyStrokeId = INDEX_NONE;
+		int32 EndpointIndex = 0;
+		bool bSynthetic = false;
 	};
 
 	struct FCapRedTopologyNode
@@ -2959,19 +3386,42 @@ namespace FromLZImageOps
 		const TArray<FColoredStroke>& SourceStrokes,
 		const TArray<int32>& RedIdx,
 		const TArray<TArray<FCapStrokeSplit>>& SplitsByStroke,
+		const TArray<FColoredStroke>* ExtraRedStrokes,
 		TArray<FCapRedDeadEnd>& OutDeadEnds)
 	{
 		OutDeadEnds.Reset();
 
 		TArray<FColoredStroke> PlanarRedStrokes;
+		TArray<int32> PlanarRedSourceIds;
+		TArray<uint8> PlanarRedSynthetic;
+		const TArray<FCapStrokeSplit> EmptySplits;
+
+		auto AppendRedTopologyStroke = [&](const FColoredStroke& Stroke, const TArray<FCapStrokeSplit>& Splits, int32 SourceStrokeId, bool bSynthetic)
+		{
+			const int32 Before = PlanarRedStrokes.Num();
+			AppendPlanarStrokeFragments(Stroke, Splits, PlanarRedStrokes);
+			for (int32 i = Before; i < PlanarRedStrokes.Num(); ++i)
+			{
+				PlanarRedSourceIds.Add(SourceStrokeId);
+				PlanarRedSynthetic.Add(bSynthetic ? 1 : 0);
+			}
+		};
+
 		for (int32 RedStrokeId : RedIdx)
 		{
 			if (SourceStrokes.IsValidIndex(RedStrokeId) && SplitsByStroke.IsValidIndex(RedStrokeId))
 			{
-				AppendPlanarStrokeFragments(
-					SourceStrokes[RedStrokeId],
-					SplitsByStroke[RedStrokeId],
-					PlanarRedStrokes);
+				AppendRedTopologyStroke(SourceStrokes[RedStrokeId], SplitsByStroke[RedStrokeId], RedStrokeId, false);
+			}
+		}
+		if (ExtraRedStrokes)
+		{
+			for (const FColoredStroke& Extra : *ExtraRedStrokes)
+			{
+				if (Extra.Color == EStrokeColor::Red)
+				{
+					AppendRedTopologyStroke(Extra, EmptySplits, INDEX_NONE, true);
+				}
 			}
 		}
 
@@ -3029,6 +3479,10 @@ namespace FromLZImageOps
 			FCapRedDeadEnd DeadEnd;
 			DeadEnd.Pos = Node.Pos;
 			DeadEnd.Forward = Forward;
+			DeadEnd.SourceStrokeId = PlanarRedSourceIds.IsValidIndex(Node.IncidentStrokeId) ? PlanarRedSourceIds[Node.IncidentStrokeId] : INDEX_NONE;
+			DeadEnd.TopologyStrokeId = Node.IncidentStrokeId;
+			DeadEnd.EndpointIndex = Node.IncidentEndpointIndex;
+			DeadEnd.bSynthetic = PlanarRedSynthetic.IsValidIndex(Node.IncidentStrokeId) && PlanarRedSynthetic[Node.IncidentStrokeId] != 0;
 			OutDeadEnds.Add(DeadEnd);
 		}
 	}
@@ -3074,6 +3528,109 @@ namespace FromLZImageOps
 		OutT = FMath::Clamp(ProjectionT, MinT, MaxT);
 		OutPoint = A + Segment * OutT;
 		return FVector2D::DotProduct(OutPoint - Endpoint, Forward) >= -CapGeometryEpsilon;
+	}
+
+	static FString RoundedConnectorKey(const FVector2D& A, const FVector2D& B)
+	{
+		const int32 Ax = FMath::RoundToInt(A.X);
+		const int32 Ay = FMath::RoundToInt(A.Y);
+		const int32 Bx = FMath::RoundToInt(B.X);
+		const int32 By = FMath::RoundToInt(B.Y);
+		return (Ax < Bx || (Ax == Bx && Ay <= By))
+			? FString::Printf(TEXT("%d,%d-%d,%d"), Ax, Ay, Bx, By)
+			: FString::Printf(TEXT("%d,%d-%d,%d"), Bx, By, Ax, Ay);
+	}
+
+	static int32 AddRedForwardConnectorsToRedTargets(
+		const TArray<FColoredStroke>& SourceStrokes,
+		const TArray<int32>& RedIdx,
+		const TArray<FCapRedDeadEnd>& RedDeadEnds,
+		float ConnectorTol,
+		TArray<TArray<FCapStrokeSplit>>& SplitsByStroke,
+		TArray<FColoredStroke>& SyntheticConnectors)
+	{
+		const double ConnectorTol2 = double(ConnectorTol) * double(ConnectorTol);
+		TSet<FString> ConnectorKeys;
+		for (const FColoredStroke& Existing : SyntheticConnectors)
+		{
+			if (Existing.Color == EStrokeColor::Red && Existing.Points.Num() >= 2)
+			{
+				ConnectorKeys.Add(RoundedConnectorKey(Existing.Points[0], Existing.Points.Last()));
+			}
+		}
+
+		int32 AddedCount = 0;
+		for (const FCapRedDeadEnd& DeadEnd : RedDeadEnds)
+		{
+			const FVector2D Endpoint = DeadEnd.Pos;
+			int32 BestRedStrokeId = INDEX_NONE;
+			int32 BestRedSegment = INDEX_NONE;
+			double BestRedT = 0.0;
+			double BestD2 = TNumericLimits<double>::Max();
+			FVector2D BestPoint = FVector2D::ZeroVector;
+
+			for (int32 RedStrokeId : RedIdx)
+			{
+				if (!SourceStrokes.IsValidIndex(RedStrokeId) || RedStrokeId == DeadEnd.SourceStrokeId)
+				{
+					continue;
+				}
+				const FStroke& RedPoints = SourceStrokes[RedStrokeId].Points;
+				for (int32 SegmentIndex = 0; SegmentIndex + 1 < RedPoints.Num(); ++SegmentIndex)
+				{
+					double SegmentT = 0.0;
+					FVector2D CandidatePoint;
+					if (!ClosestPointOnSegmentInForwardHalfPlane(
+						Endpoint, DeadEnd.Forward,
+						RedPoints[SegmentIndex], RedPoints[SegmentIndex + 1],
+						SegmentT, CandidatePoint))
+					{
+						continue;
+					}
+
+					const double D2 = FVector2D::DistSquared(Endpoint, CandidatePoint);
+					if (D2 <= CapGeometryEpsilon * CapGeometryEpsilon || D2 > ConnectorTol2 || D2 >= BestD2)
+					{
+						continue;
+					}
+
+					BestRedStrokeId = RedStrokeId;
+					BestRedSegment = SegmentIndex;
+					BestRedT = SegmentT;
+					BestD2 = D2;
+					BestPoint = CandidatePoint;
+				}
+			}
+
+			if (BestRedStrokeId == INDEX_NONE)
+			{
+				continue;
+			}
+
+			const FString Key = RoundedConnectorKey(Endpoint, BestPoint);
+			if (ConnectorKeys.Contains(Key))
+			{
+				continue;
+			}
+			ConnectorKeys.Add(Key);
+
+			AddStrokeSplit(
+				SplitsByStroke,
+				BestRedStrokeId,
+				BestRedSegment,
+				BestRedT,
+				BestPoint);
+
+			FColoredStroke Connector;
+			Connector.Points.Add(Endpoint);
+			Connector.Points.Add(BestPoint);
+			Connector.Color = EStrokeColor::Red;
+			Connector.ConnectionPointCount = Connector.Points.Num();
+			SyntheticConnectors.Add(MoveTemp(Connector));
+			++AddedCount;
+		}
+
+		return AddedCount;
 	}
 
 	static bool EndpointTouchesAnyBlackStroke(
@@ -3166,9 +3723,24 @@ namespace FromLZImageOps
 		// 5px graph-node snap.
 		TArray<FColoredStroke> SyntheticConnectors;
 		TArray<FCapRedDeadEnd> RedDeadEnds;
-		CollectPlanarRedDeadEnds(SourceStrokes, RedIdx, SplitsByStroke, RedDeadEnds);
+		CollectPlanarRedDeadEnds(SourceStrokes, RedIdx, SplitsByStroke, nullptr, RedDeadEnds);
 		const double ConnectorTol2 = double(ConnectorTol) * double(ConnectorTol);
-		for (const FCapRedDeadEnd& DeadEnd : RedDeadEnds)
+		const int32 InitialRedDeadEndCount = RedDeadEnds.Num();
+
+		// Prefer repairing red topology with red targets before borrowing black edges.
+		const int32 RedToRedConnectorCount = AddRedForwardConnectorsToRedTargets(
+			SourceStrokes,
+			RedIdx,
+			RedDeadEnds,
+			ConnectorTol,
+			SplitsByStroke,
+			SyntheticConnectors);
+
+		TArray<FCapRedDeadEnd> RedDeadEndsAfterRedRepair;
+		CollectPlanarRedDeadEnds(SourceStrokes, RedIdx, SplitsByStroke, &SyntheticConnectors, RedDeadEndsAfterRedRepair);
+
+		int32 RedToBlackConnectorCount = 0;
+		for (const FCapRedDeadEnd& DeadEnd : RedDeadEndsAfterRedRepair)
 		{
 			const FVector2D Endpoint = DeadEnd.Pos;
 			if (EndpointTouchesAnyBlackStroke(Endpoint, SourceStrokes, BlackIdx))
@@ -3228,22 +3800,195 @@ namespace FromLZImageOps
 			Connector.Color = EStrokeColor::Red;
 			Connector.ConnectionPointCount = Connector.Points.Num();
 			SyntheticConnectors.Add(MoveTemp(Connector));
+			++RedToBlackConnectorCount;
+		}
+
+		TArray<FColoredStroke> PlanarSourceStrokes;
+		TArray<int32> PlanarSourceIds;
+		for (int32 StrokeId = 0; StrokeId < SourceStrokes.Num(); ++StrokeId)
+		{
+			const int32 Before = PlanarSourceStrokes.Num();
+			AppendPlanarStrokeFragments(SourceStrokes[StrokeId], SplitsByStroke[StrokeId], PlanarSourceStrokes);
+			for (int32 i = Before; i < PlanarSourceStrokes.Num(); ++i)
+			{
+				PlanarSourceIds.Add(StrokeId);
+			}
+		}
+
+		struct FEndpointNode
+		{
+			FVector2D Pos = FVector2D::ZeroVector;
+			int32 Degree = 0;
+		};
+		struct FEndpointRef
+		{
+			FVector2D Pos = FVector2D::ZeroVector;
+			EStrokeColor Color = EStrokeColor::None;
+			int32 SourceStrokeId = INDEX_NONE;
+			int32 LocalStrokeId = INDEX_NONE;
+			int32 EndpointIndex = 0;
+			bool bSynthetic = false;
+		};
+		TArray<FEndpointNode> EndpointNodes;
+		TArray<FEndpointRef> EndpointRefs;
+		auto AddEndpointRef = [&](const FStroke& Points, EStrokeColor Color, int32 SourceStrokeId, int32 LocalStrokeId, int32 EndpointIndex, bool bSynthetic)
+		{
+			if (Points.Num() < 2)
+			{
+				return;
+			}
+			const FVector2D Pos = EndpointIndex == 0 ? Points[0] : Points.Last();
+			int32 NodeId = INDEX_NONE;
+			for (int32 CandidateNodeId = 0; CandidateNodeId < EndpointNodes.Num(); ++CandidateNodeId)
+			{
+				if (FVector2D::DistSquared(Pos, EndpointNodes[CandidateNodeId].Pos) <= CapGeometryEpsilon * CapGeometryEpsilon)
+				{
+					NodeId = CandidateNodeId;
+					break;
+				}
+			}
+			if (NodeId == INDEX_NONE)
+			{
+				NodeId = EndpointNodes.AddDefaulted();
+				EndpointNodes[NodeId].Pos = Pos;
+			}
+			++EndpointNodes[NodeId].Degree;
+
+			FEndpointRef Ref;
+			Ref.Pos = Pos;
+			Ref.Color = Color;
+			Ref.SourceStrokeId = SourceStrokeId;
+			Ref.LocalStrokeId = LocalStrokeId;
+			Ref.EndpointIndex = EndpointIndex;
+			Ref.bSynthetic = bSynthetic;
+			EndpointRefs.Add(Ref);
+		};
+		for (int32 i = 0; i < PlanarSourceStrokes.Num(); ++i)
+		{
+			const FColoredStroke& S = PlanarSourceStrokes[i];
+			if (S.Color != EStrokeColor::Red && S.Color != EStrokeColor::Black)
+			{
+				continue;
+			}
+			AddEndpointRef(S.Points, S.Color, PlanarSourceIds.IsValidIndex(i) ? PlanarSourceIds[i] : INDEX_NONE, i, 0, false);
+			AddEndpointRef(S.Points, S.Color, PlanarSourceIds.IsValidIndex(i) ? PlanarSourceIds[i] : INDEX_NONE, i, 1, false);
+		}
+		const int32 FirstSyntheticBeforeBlackPass = SyntheticConnectors.Num();
+		for (int32 i = 0; i < FirstSyntheticBeforeBlackPass; ++i)
+		{
+			const FColoredStroke& S = SyntheticConnectors[i];
+			if (S.Color != EStrokeColor::Red && S.Color != EStrokeColor::Black)
+			{
+				continue;
+			}
+			AddEndpointRef(S.Points, S.Color, INDEX_NONE, i, 0, true);
+			AddEndpointRef(S.Points, S.Color, INDEX_NONE, i, 1, true);
+		}
+
+		int32 BlackDeadEndCount = 0;
+		int32 BlackEndpointConnectorCount = 0;
+		TSet<FString> BlackConnectorKeys;
+		for (const FEndpointRef& DeadEnd : EndpointRefs)
+		{
+			if (DeadEnd.Color != EStrokeColor::Black || DeadEnd.bSynthetic || !PlanarSourceStrokes.IsValidIndex(DeadEnd.LocalStrokeId))
+			{
+				continue;
+			}
+
+			int32 NodeDegree = 0;
+			for (const FEndpointNode& Node : EndpointNodes)
+			{
+				if (FVector2D::DistSquared(DeadEnd.Pos, Node.Pos) <= CapGeometryEpsilon * CapGeometryEpsilon)
+				{
+					NodeDegree = Node.Degree;
+					break;
+				}
+			}
+			if (NodeDegree != 1)
+			{
+				continue;
+			}
+			++BlackDeadEndCount;
+
+			const FVector2D Forward = GetEndpointOutwardDirection(PlanarSourceStrokes[DeadEnd.LocalStrokeId].Points, DeadEnd.EndpointIndex);
+			if (Forward.IsNearlyZero())
+			{
+				continue;
+			}
+
+			int32 BestEndpointIndex = INDEX_NONE;
+			double BestD2 = TNumericLimits<double>::Max();
+			for (int32 CandidateIndex = 0; CandidateIndex < EndpointRefs.Num(); ++CandidateIndex)
+			{
+				const FEndpointRef& Candidate = EndpointRefs[CandidateIndex];
+				if (Candidate.Color != EStrokeColor::Red && Candidate.Color != EStrokeColor::Black)
+				{
+					continue;
+				}
+				if (!Candidate.bSynthetic && Candidate.SourceStrokeId == DeadEnd.SourceStrokeId)
+				{
+					continue;
+				}
+				const FVector2D Delta = Candidate.Pos - DeadEnd.Pos;
+				const double D2 = Delta.SizeSquared();
+				if (D2 <= CapGeometryEpsilon * CapGeometryEpsilon || D2 > ConnectorTol2)
+				{
+					continue;
+				}
+				if (FVector2D::DotProduct(Delta, Forward) < -CapGeometryEpsilon)
+				{
+					continue;
+				}
+				if (D2 < BestD2)
+				{
+					BestD2 = D2;
+					BestEndpointIndex = CandidateIndex;
+				}
+			}
+			if (!EndpointRefs.IsValidIndex(BestEndpointIndex))
+			{
+				continue;
+			}
+
+			const FVector2D A = DeadEnd.Pos;
+			const FVector2D B = EndpointRefs[BestEndpointIndex].Pos;
+			const int32 Ax = FMath::RoundToInt(A.X);
+			const int32 Ay = FMath::RoundToInt(A.Y);
+			const int32 Bx = FMath::RoundToInt(B.X);
+			const int32 By = FMath::RoundToInt(B.Y);
+			const FString Key = (Ax < Bx || (Ax == Bx && Ay <= By))
+				? FString::Printf(TEXT("%d,%d-%d,%d"), Ax, Ay, Bx, By)
+				: FString::Printf(TEXT("%d,%d-%d,%d"), Bx, By, Ax, Ay);
+			if (BlackConnectorKeys.Contains(Key))
+			{
+				continue;
+			}
+			BlackConnectorKeys.Add(Key);
+
+			FColoredStroke Connector;
+			Connector.Points.Add(A);
+			Connector.Points.Add(B);
+			Connector.Color = EStrokeColor::Black;
+			Connector.ConnectionPointCount = Connector.Points.Num();
+			SyntheticConnectors.Add(MoveTemp(Connector));
+			++BlackEndpointConnectorCount;
 		}
 
 		OutStrokes.Reset();
-		for (int32 StrokeId = 0; StrokeId < SourceStrokes.Num(); ++StrokeId)
-		{
-			AppendPlanarStrokeFragments(SourceStrokes[StrokeId], SplitsByStroke[StrokeId], OutStrokes);
-		}
+		OutStrokes = MoveTemp(PlanarSourceStrokes);
 		OutFirstSyntheticStrokeId = OutStrokes.Num();
 		OutStrokes.Append(MoveTemp(SyntheticConnectors));
 		ComputeStrokeMetrics(OutStrokes);
 
 		UE_LOG(LogTemp, Log,
-			TEXT("Sketch2D Step 9 topology: %d red/black intersection(s), %d red dead-end(s), %d forward connector(s), %d planar stroke(s)"),
+			TEXT("Sketch2D Step 9 topology: %d red/black intersection(s), %d initial red dead-end(s), %d red dead-end(s) after red repair, %d black dead-end(s), %d red-red connector(s), %d red-black connector(s), %d black endpoint connector(s), %d planar stroke(s)"),
 			TrueIntersectionCount,
-			RedDeadEnds.Num(),
-			OutStrokes.Num() - OutFirstSyntheticStrokeId,
+			InitialRedDeadEndCount,
+			RedDeadEndsAfterRedRepair.Num(),
+			BlackDeadEndCount,
+			RedToRedConnectorCount,
+			RedToBlackConnectorCount,
+			BlackEndpointConnectorCount,
 			OutStrokes.Num());
 	}
 
@@ -3749,6 +4494,245 @@ namespace FromLZImageOps
 		return Stats.InsideLength >= InteriorGreenMinInsideLengthPx;
 	}
 
+	struct FGreenPixelClass
+	{
+		bool bInside = false;
+		bool bOutside = false;
+		bool bBoundary = false;
+	};
+
+	struct FGreenActionStats
+	{
+		int32 LocalGreenCount = 0;
+		double InsideLength = 0.0;
+		double OutsideLength = 0.0;
+		double BoundaryLength = 0.0;
+		FString Action = TEXT("skip");
+		FString DecisionReason = TEXT("no_local_green");
+		bool bHasBestInterior = false;
+		FInteriorGreenStats BestInterior;
+	};
+
+	static void BuildLoopPixelMasks(const FStroke& Loop, int32 Width, int32 Height, TArray<uint8>& OutBoundary, TArray<uint8>& OutInterior)
+	{
+		const int32 N = Width * Height;
+		OutBoundary.Init(0, N);
+		OutInterior.Init(0, N);
+		if (Width <= 0 || Height <= 0 || Loop.Num() < 3)
+		{
+			return;
+		}
+
+		TArray<FIntPoint> LineBuf;
+		auto MarkLine = [&](const FVector2D& A, const FVector2D& B)
+		{
+			SkelGraph::LinePoints(
+				FIntPoint(FMath::RoundToInt(A.X), FMath::RoundToInt(A.Y)),
+				FIntPoint(FMath::RoundToInt(B.X), FMath::RoundToInt(B.Y)), LineBuf);
+			for (const FIntPoint& P : LineBuf)
+			{
+				if (P.X >= 0 && P.X < Width && P.Y >= 0 && P.Y < Height)
+				{
+					OutBoundary[P.Y * Width + P.X] = 255;
+				}
+			}
+		};
+
+		for (int32 k = 0; k + 1 < Loop.Num(); ++k)
+		{
+			MarkLine(Loop[k], Loop[k + 1]);
+		}
+		if ((Loop[0] - Loop.Last()).SizeSquared() > 1e-6)
+		{
+			MarkLine(Loop.Last(), Loop[0]);
+		}
+
+		TArray<uint8> Reachable;
+		Reachable.Init(0, N);
+		TArray<int32> Stack;
+		Stack.Reserve(1024);
+		auto TryPush = [&](int32 X, int32 Y)
+		{
+			if (X < 0 || X >= Width || Y < 0 || Y >= Height)
+			{
+				return;
+			}
+			const int32 Idx = Y * Width + X;
+			if (OutBoundary[Idx] == 0 && Reachable[Idx] == 0)
+			{
+				Reachable[Idx] = 1;
+				Stack.Push(Idx);
+			}
+		};
+		for (int32 X = 0; X < Width; ++X)
+		{
+			TryPush(X, 0);
+			TryPush(X, Height - 1);
+		}
+		for (int32 Y = 0; Y < Height; ++Y)
+		{
+			TryPush(0, Y);
+			TryPush(Width - 1, Y);
+		}
+		while (Stack.Num() > 0)
+		{
+			const int32 P = Stack.Pop(EAllowShrinking::No);
+			const int32 X = P % Width;
+			const int32 Y = P / Width;
+			TryPush(X + 1, Y);
+			TryPush(X - 1, Y);
+			TryPush(X, Y + 1);
+			TryPush(X, Y - 1);
+		}
+
+		for (int32 Idx = 0; Idx < N; ++Idx)
+		{
+			if (OutBoundary[Idx] == 0 && Reachable[Idx] == 0)
+			{
+				OutInterior[Idx] = 255;
+			}
+		}
+	}
+
+	static FGreenPixelClass ClassifyGreenPixelAgainstLoop(int32 X, int32 Y, int32 Width, int32 Height, const TArray<uint8>& Boundary, const TArray<uint8>& Interior)
+	{
+		FGreenPixelClass C;
+		if (X < 0 || X >= Width || Y < 0 || Y >= Height)
+		{
+			C.bOutside = true;
+			return C;
+		}
+		const int32 Idx = Y * Width + X;
+		C.bBoundary = Boundary.IsValidIndex(Idx) && Boundary[Idx] != 0;
+		if (C.bBoundary)
+		{
+			C.bInside = true;
+			C.bOutside = true;
+			return C;
+		}
+		C.bInside = Interior.IsValidIndex(Idx) && Interior[Idx] != 0;
+		C.bOutside = !C.bInside;
+		return C;
+	}
+
+	static void AddGreenPixelStepLength(
+		const FIntPoint& Prev, const FGreenPixelClass& PrevClass,
+		const FIntPoint& Cur, const FGreenPixelClass& CurClass,
+		double& InsideLength, double& OutsideLength, double& BoundaryLength)
+	{
+		const double Dx = double(Cur.X - Prev.X);
+		const double Dy = double(Cur.Y - Prev.Y);
+		const double Len = FMath::Sqrt(Dx * Dx + Dy * Dy);
+		if (Len <= 0.0)
+		{
+			return;
+		}
+
+		const bool bBoundary = PrevClass.bBoundary || CurClass.bBoundary;
+		if (bBoundary)
+		{
+			InsideLength += Len;
+			OutsideLength += Len;
+			BoundaryLength += Len;
+			return;
+		}
+
+		if (PrevClass.bInside && CurClass.bInside)
+		{
+			InsideLength += Len;
+		}
+		else if (PrevClass.bOutside && CurClass.bOutside)
+		{
+			OutsideLength += Len;
+		}
+		else
+		{
+			// A one-pixel crossing without a rasterized boundary hit is ambiguous.
+			InsideLength += Len;
+			OutsideLength += Len;
+		}
+	}
+
+	static FGreenActionStats MeasureLocalGreenAction(
+		const FStroke& CapPolygon,
+		const TArray<FColoredStroke>& Strokes,
+		const TArray<int32>& LocalGreen,
+		int32 Width,
+		int32 Height)
+	{
+		FGreenActionStats Out;
+		Out.LocalGreenCount = LocalGreen.Num();
+		if (LocalGreen.Num() == 0)
+		{
+			Out.Action = TEXT("skip");
+			Out.DecisionReason = TEXT("no_local_green");
+			return Out;
+		}
+
+		TArray<uint8> Boundary;
+		TArray<uint8> Interior;
+		BuildLoopPixelMasks(CapPolygon, Width, Height, Boundary, Interior);
+
+		TArray<FIntPoint> LineBuf;
+		for (int32 g : LocalGreen)
+		{
+			if (!Strokes.IsValidIndex(g))
+			{
+				continue;
+			}
+
+			const FInteriorGreenStats InteriorStats = MeasureInteriorGreen(CapPolygon, Strokes, g);
+			if (!Out.bHasBestInterior || InteriorStats.InsideLength > Out.BestInterior.InsideLength)
+			{
+				Out.bHasBestInterior = true;
+				Out.BestInterior = InteriorStats;
+			}
+
+			const FStroke& Points = Strokes[g].Points;
+			for (int32 k = 0; k + 1 < Points.Num(); ++k)
+			{
+				SkelGraph::LinePoints(
+					FIntPoint(FMath::RoundToInt(Points[k].X), FMath::RoundToInt(Points[k].Y)),
+					FIntPoint(FMath::RoundToInt(Points[k + 1].X), FMath::RoundToInt(Points[k + 1].Y)), LineBuf);
+				if (LineBuf.Num() == 0)
+				{
+					continue;
+				}
+
+				FIntPoint Prev = LineBuf[0];
+				FGreenPixelClass PrevClass = ClassifyGreenPixelAgainstLoop(Prev.X, Prev.Y, Width, Height, Boundary, Interior);
+				for (int32 p = 1; p < LineBuf.Num(); ++p)
+				{
+					const FIntPoint Cur = LineBuf[p];
+					if (Cur == Prev)
+					{
+						continue;
+					}
+					const FGreenPixelClass CurClass = ClassifyGreenPixelAgainstLoop(Cur.X, Cur.Y, Width, Height, Boundary, Interior);
+					AddGreenPixelStepLength(Prev, PrevClass, Cur, CurClass, Out.InsideLength, Out.OutsideLength, Out.BoundaryLength);
+					Prev = Cur;
+					PrevClass = CurClass;
+				}
+			}
+		}
+
+		if (Out.InsideLength > Out.OutsideLength)
+		{
+			Out.Action = TEXT("excavate");
+			Out.DecisionReason = TEXT("inside_greater_than_outside");
+		}
+		else if (Out.OutsideLength > Out.InsideLength)
+		{
+			Out.Action = TEXT("attach");
+			Out.DecisionReason = TEXT("outside_greater_than_inside");
+		}
+		else
+		{
+			Out.Action = TEXT("skip");
+			Out.DecisionReason = TEXT("inside_outside_equal");
+		}
+		return Out;
+	}
 	static double DistancePointToSegmentSquared2D(const FVector2D& P, const FVector2D& A, const FVector2D& B)
 	{
 		const FVector2D AB = B - A;
@@ -3949,32 +4933,23 @@ namespace FromLZImageOps
 
 			SaveCapExtrusionPng(TraceStrokes, R, Width, Height, CompDir / TEXT("09_cap_extrusion.png"));
 
-			// Interior-green test: only this component's local green strokes can
-			// classify the cap as an excavation.
-			bool bInteriorGreen = false;
-			FInteriorGreenStats BestInterior;
-			for (int32 g : LocalGreen)
+			// Action test: only this component's local green strokes vote. Green pixels
+			// on the cap boundary count as both inside and outside.
+			const FGreenActionStats ActionStats = MeasureLocalGreenAction(R.CapPolygon, TraceStrokes, LocalGreen, Width, Height);
+			R.Action = ActionStats.Action;
+			R.ActionDecisionReason = ActionStats.DecisionReason;
+			R.LocalGreenStrokeCount = ActionStats.LocalGreenCount;
+			R.GreenInsideTotalLength = ActionStats.InsideLength;
+			R.GreenOutsideTotalLength = ActionStats.OutsideLength;
+			R.bHasInteriorGreen = R.Action == TEXT("excavate");
+			if (ActionStats.bHasBestInterior)
 			{
-				const FInteriorGreenStats Stats = MeasureInteriorGreen(R.CapPolygon, TraceStrokes, g);
-				if (!PassesInteriorGreenThresholds(Stats))
-				{
-					continue;
-				}
-				if (!bInteriorGreen || Stats.InsideLength > BestInterior.InsideLength)
-				{
-					bInteriorGreen = true;
-					BestInterior = Stats;
-				}
-			}
-			R.bHasInteriorGreen = bInteriorGreen;
-			if (bInteriorGreen)
-			{
-				R.InteriorGreenStrokeId = BestInterior.StrokeId;
-				R.InteriorGreenInsidePoints = BestInterior.InsidePoints;
-				R.InteriorGreenTotalPoints = BestInterior.TotalPoints;
-				R.InteriorGreenInsideRatio = BestInterior.InsideRatio;
-				R.InteriorGreenInsideLength = BestInterior.InsideLength;
-				R.InteriorGreenStrokeLength = BestInterior.StrokeLength;
+				R.InteriorGreenStrokeId = ActionStats.BestInterior.StrokeId;
+				R.InteriorGreenInsidePoints = ActionStats.BestInterior.InsidePoints;
+				R.InteriorGreenTotalPoints = ActionStats.BestInterior.TotalPoints;
+				R.InteriorGreenInsideRatio = ActionStats.BestInterior.InsideRatio;
+				R.InteriorGreenInsideLength = ActionStats.BestInterior.InsideLength;
+				R.InteriorGreenStrokeLength = ActionStats.BestInterior.StrokeLength;
 			}
 			SaveCapExtrusionJson(R, CompDir / TEXT("09_cap_extrusion.json"));
 
@@ -3984,12 +4959,22 @@ namespace FromLZImageOps
 				TEXT("{\n")
 				TEXT("  \"action\": \"%s\",\n")
 				TEXT("  \"has_interior_green\": %s,\n")
+				TEXT("  \"local_green_count\": %d,\n")
+				TEXT("  \"inside_green_total\": %.3f,\n")
+				TEXT("  \"outside_green_total\": %.3f,\n")
+				TEXT("  \"boundary_green_total\": %.3f,\n")
+				TEXT("  \"decision_reason\": \"%s\",\n")
 				TEXT("  \"interior_green_stroke_id\": %d,\n")
 				TEXT("  \"interior_green_inside_length\": %.3f,\n")
 				TEXT("  \"interior_green_min_inside_length\": %.3f\n")
 				TEXT("}\n"),
-				bInteriorGreen ? TEXT("excavate") : TEXT("attach"),
-				bInteriorGreen ? TEXT("true") : TEXT("false"),
+				*R.Action,
+				R.bHasInteriorGreen ? TEXT("true") : TEXT("false"),
+				R.LocalGreenStrokeCount,
+				R.GreenInsideTotalLength,
+				R.GreenOutsideTotalLength,
+				ActionStats.BoundaryLength,
+				*JsonEscaped(R.ActionDecisionReason),
 				R.InteriorGreenStrokeId,
 				R.InteriorGreenInsideLength,
 				InteriorGreenMinInsideLengthPx);
@@ -4075,6 +5060,11 @@ namespace FromLZImageOps
 		Json += FString::Printf(TEXT("  \"used_black\": %s,\n"), Res.bUsedBlack ? TEXT("true") : TEXT("false"));
 		Json += FString::Printf(TEXT("  \"side_stroke_id\": %d,\n"), Res.SideStrokeId);
 		Json += FString::Printf(TEXT("  \"side_vector\": [%.3f, %.3f],\n"), Res.SideVector.X, Res.SideVector.Y);
+		Json += FString::Printf(TEXT("  \"action\": \"%s\",\n"), *JsonEscaped(Res.Action));
+		Json += FString::Printf(TEXT("  \"decision_reason\": \"%s\",\n"), *JsonEscaped(Res.ActionDecisionReason));
+		Json += FString::Printf(TEXT("  \"local_green_count\": %d,\n"), Res.LocalGreenStrokeCount);
+		Json += FString::Printf(TEXT("  \"inside_green_total\": %.3f,\n"), Res.GreenInsideTotalLength);
+		Json += FString::Printf(TEXT("  \"outside_green_total\": %.3f,\n"), Res.GreenOutsideTotalLength);
 		Json += FString::Printf(TEXT("  \"has_interior_green\": %s,\n"), Res.bHasInteriorGreen ? TEXT("true") : TEXT("false"));
 		Json += FString::Printf(TEXT("  \"interior_green_stroke_id\": %d,\n"), Res.InteriorGreenStrokeId);
 		Json += FString::Printf(TEXT("  \"interior_green_inside_points\": %d,\n"), Res.InteriorGreenInsidePoints);

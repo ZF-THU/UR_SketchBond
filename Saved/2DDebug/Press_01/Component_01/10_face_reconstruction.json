@@ -5,121 +5,75 @@
 	"success": true,
 	"error": "",
 	"actor_name": "FromLZ_ReconstructedFace_Press_01_Component_01",
-	"cap_width": 1720,
-	"cap_height": 1222,
-	"faces_width": 1720,
-	"faces_height": 1222,
-	"cap_mask_pixels": 515436,
-	"min_overlap_pixels": 25772,
+	"cap_width": 1716,
+	"cap_height": 1273,
+	"faces_width": 1716,
+	"faces_height": 1273,
+	"cap_mask_pixels": 21202,
+	"min_overlap_pixels": 1061,
 	"green_line_vector_2d": [
-		0.8975006034169517,
-		-0.44101322754108835
+		0.72953720414008516,
+		-0.68394112888132985
 	],
 	"green_line_vectors_2d": [
 		[
-			0.8975006034169517,
-			-0.44101322754108835
+			0.72953720414008516,
+			-0.68394112888132985
 		]
 	],
 	"normal_parallel_threshold_degrees": 30,
 	"preferred_normal_angle_threshold_degrees": 10,
-	"selected_face_id": 1,
+	"selected_face_id": 0,
 	"selected_plane_hit_3d": [
-		-38.632869068388459,
-		-50.296127443590422,
-		328.25811763005004
+		-450.34361420408339,
+		-49.826085875615036,
+		234.83779340302561
 	],
 	"candidates": [
 		{
-			"face_id": 1,
-			"overlap_pixels": 346958,
-			"overlap_ratio": 0.67313497699035385,
+			"face_id": 0,
+			"overlap_pixels": 21202,
+			"overlap_ratio": 1,
 			"mask_centroid_2d": [
-				699.86089670795889,
-				472.95317012433782
+				1054.8188850108479,
+				515.81435713611927
 			],
 			"has_plane_hit": true,
 			"plane_hit_3d": [
-				-38.632869068388459,
-				-50.296127443590422,
-				328.25811763005004
+				-450.34361420408339,
+				-49.826085875615036,
+				234.83779340302561
 			],
-			"distance_to_camera": 979.02387855597885,
+			"distance_to_camera": 1052.3927808639676,
 			"has_projected_normal": true,
 			"projected_normal_2d": [
-				0.90496995069969821,
-				-0.42547548499365534
+				0.77049984604407695,
+				-0.6374401832690294
 			],
-			"normal_green_angle_degrees": 0.98778315024638319,
+			"normal_green_angle_degrees": 3.5511855646473451,
 			"normal_parallel_pass": true
-		},
-		{
-			"face_id": 2,
-			"overlap_pixels": 87483,
-			"overlap_ratio": 0.16972621237166205,
-			"mask_centroid_2d": [
-				752.9037127213287,
-				212.26918944252026
-			],
-			"has_plane_hit": true,
-			"plane_hit_3d": [
-				-29.465648031751243,
-				47.708373192575095,
-				544.87971873065771
-			],
-			"distance_to_camera": 1041.2758484374394,
-			"has_projected_normal": true,
-			"projected_normal_2d": [
-				0.0002761761171172632,
-				-0.99999996186337547
-			],
-			"normal_green_angle_degrees": 63.815629351940835,
-			"normal_parallel_pass": false
-		},
-		{
-			"face_id": 3,
-			"overlap_pixels": 61571,
-			"overlap_ratio": 0.11945420963999411,
-			"mask_centroid_2d": [
-				1279.90195871433,
-				595.42606909096821
-			],
-			"has_plane_hit": true,
-			"plane_hit_3d": [
-				-599.90649964682302,
-				44.704298642087338,
-				291.76507566708631
-			],
-			"distance_to_camera": 837.37682746061205,
-			"has_projected_normal": true,
-			"projected_normal_2d": [
-				0.97745101439436499,
-				0.21116229412332799
-			],
-			"normal_green_angle_degrees": 38.359021262959786,
-			"normal_parallel_pass": false
 		}
 	],
 	"mesh_vertices_world": [
 		[
-			599.16700000000003,
-			-51.131,
-			545.15499999999997
+			599.41300000000001,
+			-51.112000000000002,
+			499.55200000000002
 		],
 		[
-			-598.33500000000004,
-			-49.960999999999999,
-			544.92899999999997
+			-599.774,
+			-49.939999999999998,
+			499.20999999999998
 		],
 		[
-			-599.053,
-			-49.427999999999997,
-			-0.192
+			-599.524,
+			-49.453000000000003,
+			-0.076999999999999999
 		],
 		[
-			599.52700000000004,
-			-50.600000000000001,
-			0.77300000000000002
+			598.30799999999999,
+			-50.624000000000002,
+			0.55200000000000005
 		]
 	],
 	"mesh_triangles": [

@@ -1,21 +1,51 @@
 {
-  "candidate_count": 1,
-  "selected_count": 1,
+  "candidate_count": 3,
+  "selected_count": 3,
   "candidates": [
   {
     "index": 0,
-    "source": "local_black",
-    "priority": 1,
-    "anchor_stroke_id": 10,
+    "source": "red_only",
+    "priority": 0,
+    "anchor_stroke_id": 38,
     "selected": true,
     "reason": "selected",
-    "edge_count": 12,
+    "edge_count": 8,
+    "used_black": false,
+    "stroke_ids": [38, 39, 42, 43, 51, 52, 53, 120],
+    "red_stroke_ids": [38, 39, 42, 43, 51, 52, 53, 120],
+    "real_red_stroke_ids": [38, 39, 42, 43, 51, 52, 53],
+    "synthetic_stroke_ids": [120],
+    "black_stroke_ids": []
+  },
+  {
+    "index": 1,
+    "source": "red_only",
+    "priority": 0,
+    "anchor_stroke_id": 66,
+    "selected": true,
+    "reason": "selected",
+    "edge_count": 6,
+    "used_black": false,
+    "stroke_ids": [66, 68, 81, 88, 89, 115],
+    "red_stroke_ids": [66, 68, 81, 88, 89, 115],
+    "real_red_stroke_ids": [66, 68, 81, 88, 89],
+    "synthetic_stroke_ids": [115],
+    "black_stroke_ids": []
+  },
+  {
+    "index": 2,
+    "source": "local_black",
+    "priority": 1,
+    "anchor_stroke_id": 35,
+    "selected": true,
+    "reason": "selected",
+    "edge_count": 7,
     "used_black": true,
-    "stroke_ids": [2, 3, 4, 6, 9, 10, 11, 14, 15, 16, 42, 47],
-    "red_stroke_ids": [10, 11, 14, 15, 16, 42],
-    "real_red_stroke_ids": [10, 11, 14, 15, 16, 42],
-    "synthetic_stroke_ids": [],
-    "black_stroke_ids": [2, 3, 4, 6, 9, 47]
+    "stroke_ids": [35, 36, 46, 55, 86, 93, 123],
+    "red_stroke_ids": [35, 36, 46, 55, 86],
+    "real_red_stroke_ids": [35, 36, 46, 55, 86],
+    "synthetic_stroke_ids": [123],
+    "black_stroke_ids": [93, 123]
   }
   ]
 }

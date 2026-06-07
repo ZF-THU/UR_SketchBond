@@ -11,9 +11,9 @@
 			"actor_name": "FromLZ_ReconstructedSolid_Press_01_Component_01",
 			"tag": "FromLZ_ReconstructedSolid",
 			"is_excavate_cutter": false,
-			"input_world_vertex_count": 46,
-			"input_triangle_index_count": 264,
-			"input_triangle_count": 88,
+			"input_world_vertex_count": 36,
+			"input_triangle_index_count": 204,
+			"input_triangle_count": 68,
 			"normal": [
 				-0.00097999905880935588,
 				-0.99999903960138359,
@@ -23,44 +23,3873 @@
 			{
 				"valid": true,
 				"min": [
-					-724.67875332011511,
-					-237.59431182013796,
-					76.309450407744649
+					-573.96731064053859,
+					-94.734317831533588,
+					148.5708539918821
 				],
 				"max": [
-					475.52161926283122,
-					-49.379823482748066,
-					624.17074823451298
+					-324.60084782596005,
+					-49.628411515932157,
+					314.5641143986349
 				],
 				"center": [
-					-124.57856702864194,
-					-143.487067651443,
-					350.24009932112881
+					-449.28407923324932,
+					-72.181364673732872,
+					231.56748419525849
 				],
 				"extent": [
-					600.10018629147316,
-					94.107244168694947,
-					273.93064891338418
+					124.68323140728927,
+					22.552953157800715,
+					82.996630203376398
 				],
 				"size": [
-					1200.2003725829463,
-					188.21448833738989,
-					547.86129782676835
+					249.36646281457854,
+					45.10590631560143,
+					165.9932604067528
 				],
-				"diagonal": 1332.6881216641723
+				"diagonal": 302.9388355125015
+			}
+		},
+		{
+			"actor_name": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+			"tag": "FromLZ_ReconstructedSolid",
+			"is_excavate_cutter": true,
+			"input_world_vertex_count": 16,
+			"input_triangle_index_count": 84,
+			"input_triangle_count": 28,
+			"normal": [
+				0.00097999905880935588,
+				0.99999903960138359,
+				0.00097999905880935588
+			],
+			"input_bounds":
+			{
+				"valid": true,
+				"min": [
+					254.1238468368413,
+					-143.87032477762406,
+					227.34692597809536
+				],
+				"max": [
+					316.52394932393202,
+					-101.36832424377941,
+					286.27545910571052
+				],
+				"center": [
+					285.32389808038664,
+					-122.61932451070174,
+					256.81119254190293
+				],
+				"extent": [
+					31.20005124354536,
+					21.251000266922325,
+					29.464266563807584
+				],
+				"size": [
+					62.40010248709072,
+					42.502000533844651,
+					58.928533127615168
+				],
+				"diagonal": 95.774552237798517
+			}
+		},
+		{
+			"actor_name": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+			"tag": "FromLZ_ReconstructedSolid",
+			"is_excavate_cutter": true,
+			"input_world_vertex_count": 40,
+			"input_triangle_index_count": 228,
+			"input_triangle_count": 76,
+			"normal": [
+				0.00097999905880935588,
+				0.99999903960138359,
+				0.00097999905880935588
+			],
+			"input_bounds":
+			{
+				"valid": true,
+				"min": [
+					-240.62940038481941,
+					-79.902592629992256,
+					-0.14917373446173063
+				],
+				"max": [
+					151.47104975235948,
+					273.9625387319229,
+					311.64141714885341
+				],
+				"center": [
+					-44.579175316229964,
+					97.029973050965324,
+					155.74612170719584
+				],
+				"extent": [
+					196.05022506858944,
+					176.93256568095757,
+					155.89529544165757
+				],
+				"size": [
+					392.10045013717888,
+					353.86513136191513,
+					311.79059088331513
+				],
+				"diagonal": 613.33242760751739
 			}
 		}
 	],
-	"cutters": [],
+	"cutters": [
+		{
+			"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+			"source_type": "excavate_cutter",
+			"vertex_count": 16,
+			"triangle_count": 28,
+			"edge_count": 42,
+			"boundary_edge_count": 0,
+			"non_manifold_edge_count": 0,
+			"inconsistent_orientation_edge_count": 0,
+			"invalid_triangle_count": 0,
+			"degenerate_triangle_count": 0,
+			"tiny_triangle_count": 0,
+			"duplicate_triangle_count": 0,
+			"surface_area": 15750.405748517824,
+			"min_triangle_area": 26.159588768715754,
+			"max_triangle_area": 1253.8561513280749,
+			"signed_volume": 132681.48887853615,
+			"abs_volume": 132681.48887853615,
+			"orientation_reversed_for_boolean": false,
+			"signed_volume_before_orientation_fix": 132681.48887853615,
+			"signed_volume_after_orientation_fix": 132681.48887853615,
+			"min_edge_length": 8.311234750836217,
+			"max_edge_length": 72.020739401103455,
+			"mean_edge_length": 41.976099841109701,
+			"euler_characteristic": 2,
+			"closed_two_manifold": true,
+			"bounds":
+			{
+				"valid": true,
+				"min": [
+					254.1238468368413,
+					-143.87032477762406,
+					227.34692597809536
+				],
+				"max": [
+					316.52394932393202,
+					-101.36832424377941,
+					286.27545910571052
+				],
+				"center": [
+					285.32389808038664,
+					-122.61932451070174,
+					256.81119254190293
+				],
+				"extent": [
+					31.20005124354536,
+					21.251000266922325,
+					29.464266563807584
+				],
+				"size": [
+					62.40010248709072,
+					42.502000533844651,
+					58.928533127615168
+				],
+				"diagonal": 95.774552237798517
+			}
+		},
+		{
+			"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+			"source_type": "excavate_cutter",
+			"vertex_count": 40,
+			"triangle_count": 76,
+			"edge_count": 114,
+			"boundary_edge_count": 0,
+			"non_manifold_edge_count": 0,
+			"inconsistent_orientation_edge_count": 0,
+			"invalid_triangle_count": 0,
+			"degenerate_triangle_count": 0,
+			"tiny_triangle_count": 0,
+			"duplicate_triangle_count": 0,
+			"surface_area": 707539.9605156465,
+			"min_triangle_area": 150.64314911639011,
+			"max_triangle_area": 63417.124731509692,
+			"signed_volume": 39553724.687032267,
+			"abs_volume": 39553724.687032267,
+			"orientation_reversed_for_boolean": false,
+			"signed_volume_before_orientation_fix": 39553724.687032267,
+			"signed_volume_after_orientation_fix": 39553724.687032267,
+			"min_edge_length": 3.9465688392872593,
+			"max_edge_length": 503.68927729492572,
+			"mean_edge_length": 237.29480171138866,
+			"euler_characteristic": 2,
+			"closed_two_manifold": true,
+			"bounds":
+			{
+				"valid": true,
+				"min": [
+					-240.62940038481941,
+					-79.902592629992256,
+					-0.14917373446173063
+				],
+				"max": [
+					151.47104975235948,
+					273.9625387319229,
+					311.64141714885341
+				],
+				"center": [
+					-44.579175316229964,
+					97.029973050965324,
+					155.74612170719584
+				],
+				"extent": [
+					196.05022506858944,
+					176.93256568095757,
+					155.89529544165757
+				],
+				"size": [
+					392.10045013717888,
+					353.86513136191513,
+					311.79059088331513
+				],
+				"diagonal": 613.33242760751739
+			}
+		}
+	],
 	"build_failures": [],
 	"summary":
 	{
-		"excavate_cutter_count": 0,
-		"updated_static_component_count": 0,
+		"excavate_cutter_count": 2,
+		"updated_static_component_count": 2,
 		"updated_procedural_component_count": 0,
-		"created_boolean_result_actor_count": 0,
-		"failed_boolean_count": 0,
-		"status": "no_excavate_cutters"
+		"created_boolean_result_actor_count": 2,
+		"failed_boolean_count": 1,
+		"target_record_count": 7,
+		"accepted_cutter_actor_count": 2,
+		"status": "completed_with_boolean_failures"
 	},
-	"targets": []
+	"targets": [
+		{
+			"target_actor": "StaticMeshActor_0",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_0/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 26,
+				"triangle_count": 48,
+				"edge_count": 72,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 1299999.9999999995,
+				"min_triangle_area": 6249.9999999999945,
+				"max_triangle_area": 62499.999999999978,
+				"signed_volume": -49999999.999999903,
+				"abs_volume": 49999999.999999903,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -49999999.999999903,
+				"signed_volume_after_orientation_fix": -49999999.999999903,
+				"min_edge_length": 49.999999999999957,
+				"max_edge_length": 559.01699437494722,
+				"mean_edge_length": 324.0513056789589,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						-499.99999999999977,
+						-50.000000000000036,
+						0
+					],
+					"max": [
+						499.99999999999977,
+						50.000000000000036,
+						500
+					],
+					"center": [
+						0,
+						0,
+						250
+					],
+					"extent": [
+						499.99999999999977,
+						50.000000000000036,
+						250
+					],
+					"size": [
+						999.99999999999955,
+						100.00000000000007,
+						500
+					],
+					"diagonal": 1122.497216032182
+				}
+			},
+			"modified": true,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_0",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 310.63099958486197,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-499.99999999999977,
+							-50.000000000000036,
+							0
+						],
+						"max": [
+							499.99999999999977,
+							50.000000000000036,
+							500
+						],
+						"center": [
+							0,
+							0,
+							250
+						],
+						"extent": [
+							499.99999999999977,
+							50.000000000000036,
+							250
+						],
+						"size": [
+							999.99999999999955,
+							100.00000000000007,
+							500
+						],
+						"diagonal": 1122.497216032182
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_0/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 1299999.9999999995,
+						"min_triangle_area": 6249.9999999999945,
+						"max_triangle_area": 62499.999999999978,
+						"signed_volume": -49999999.999999903,
+						"abs_volume": 49999999.999999903,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -49999999.999999903,
+						"signed_volume_after_orientation_fix": -49999999.999999903,
+						"min_edge_length": 49.999999999999957,
+						"max_edge_length": 559.01699437494722,
+						"mean_edge_length": 324.0513056789589,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-499.99999999999977,
+								-50.000000000000036,
+								0
+							],
+							"max": [
+								499.99999999999977,
+								50.000000000000036,
+								500
+							],
+							"center": [
+								0,
+								0,
+								250
+							],
+							"extent": [
+								499.99999999999977,
+								50.000000000000036,
+								250
+							],
+							"size": [
+								999.99999999999955,
+								100.00000000000007,
+								500
+							],
+							"diagonal": 1122.497216032182
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				},
+				{
+					"target_actor": "StaticMeshActor_0",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": true,
+					"expanded_bounds_intersect": true,
+					"center_distance": 142.42862112434059,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-499.99999999999977,
+							-50.000000000000036,
+							0
+						],
+						"max": [
+							499.99999999999977,
+							50.000000000000036,
+							500
+						],
+						"center": [
+							0,
+							0,
+							250
+						],
+						"extent": [
+							499.99999999999977,
+							50.000000000000036,
+							250
+						],
+						"size": [
+							999.99999999999955,
+							100.00000000000007,
+							500
+						],
+						"diagonal": 1122.497216032182
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_0/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 1299999.9999999995,
+						"min_triangle_area": 6249.9999999999945,
+						"max_triangle_area": 62499.999999999978,
+						"signed_volume": -49999999.999999903,
+						"abs_volume": 49999999.999999903,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -49999999.999999903,
+						"signed_volume_after_orientation_fix": -49999999.999999903,
+						"min_edge_length": 49.999999999999957,
+						"max_edge_length": 559.01699437494722,
+						"mean_edge_length": 324.0513056789589,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-499.99999999999977,
+								-50.000000000000036,
+								0
+							],
+							"max": [
+								499.99999999999977,
+								50.000000000000036,
+								500
+							],
+							"center": [
+								0,
+								0,
+								250
+							],
+							"extent": [
+								499.99999999999977,
+								50.000000000000036,
+								250
+							],
+							"size": [
+								999.99999999999955,
+								100.00000000000007,
+								500
+							],
+							"diagonal": 1122.497216032182
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"attempts": [
+						{
+							"pass_name": "primary_target_render_orientation",
+							"boolean_backend": "Manifold3D",
+							"manifold_library_version": "3.5.0+37125da",
+							"status": "accepted",
+							"reject_reason": "",
+							"compute_success": true,
+							"accepted": true,
+							"empty_result": false,
+							"target_reversed_for_pass": false,
+							"cutter_reversed_for_pass": false,
+							"result_reversed_to_target_sign": true,
+							"target_manifold_input_valid": true,
+							"cutter_manifold_input_valid": true,
+							"manifold_difference_success": true,
+							"manifold_error_message": "",
+							"target_input_triangles": 48,
+							"cutter_input_triangles": 76,
+							"result_output_triangles": 128,
+							"target_orientation_reversed_for_manifold": true,
+							"cutter_orientation_reversed_for_manifold": false,
+							"target_signed_volume_for_manifold": 49999999.999999903,
+							"cutter_signed_volume_for_manifold": 39553724.687032267,
+							"result_signed_volume_before_render_fix": 38801952.197252095,
+							"cap_section_unavailable": true,
+							"volume_delta": 11198047.802747816,
+							"min_required_volume_delta": 4999.9999999999909,
+							"result":
+							{
+								"label": "StaticMeshActor_0/StaticMeshComponent0 result_after_FromLZ_ReconstructedSolid_Press_01_Component_03_primary",
+								"source_type": "boolean_result",
+								"vertex_count": 66,
+								"triangle_count": 128,
+								"edge_count": 192,
+								"boundary_edge_count": 0,
+								"non_manifold_edge_count": 0,
+								"inconsistent_orientation_edge_count": 0,
+								"invalid_triangle_count": 0,
+								"degenerate_triangle_count": 0,
+								"tiny_triangle_count": 0,
+								"duplicate_triangle_count": 0,
+								"surface_area": 1209491.9863003963,
+								"min_triangle_area": 26.184561792220446,
+								"max_triangle_area": 62499.999999999978,
+								"signed_volume": -38801952.197252087,
+								"abs_volume": 38801952.197252087,
+								"orientation_reversed_for_boolean": false,
+								"signed_volume_before_orientation_fix": -38801952.197252087,
+								"signed_volume_after_orientation_fix": -38801952.197252087,
+								"min_edge_length": 3.8186578644592788,
+								"max_edge_length": 559.01699437494722,
+								"mean_edge_length": 201.98643391814744,
+								"euler_characteristic": 2,
+								"closed_two_manifold": true,
+								"bounds":
+								{
+									"valid": true,
+									"min": [
+										-499.99999999999977,
+										-50.000000000000036,
+										0
+									],
+									"max": [
+										499.99999999999977,
+										50.000000000000036,
+										500
+									],
+									"center": [
+										0,
+										0,
+										250
+									],
+									"extent": [
+										499.99999999999977,
+										50.000000000000036,
+										250
+									],
+									"size": [
+										999.99999999999955,
+										100.00000000000007,
+										500
+									],
+									"diagonal": 1122.497216032182
+								}
+							}
+						}
+					],
+					"status": "accepted_non_empty",
+					"accepted_result":
+					{
+						"label": "StaticMeshActor_0/StaticMeshComponent0 result_after_FromLZ_ReconstructedSolid_Press_01_Component_03_primary",
+						"source_type": "boolean_result",
+						"vertex_count": 66,
+						"triangle_count": 128,
+						"edge_count": 192,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 1209491.9863003963,
+						"min_triangle_area": 26.184561792220446,
+						"max_triangle_area": 62499.999999999978,
+						"signed_volume": -38801952.197252087,
+						"abs_volume": 38801952.197252087,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -38801952.197252087,
+						"signed_volume_after_orientation_fix": -38801952.197252087,
+						"min_edge_length": 3.8186578644592788,
+						"max_edge_length": 559.01699437494722,
+						"mean_edge_length": 201.98643391814744,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-499.99999999999977,
+								-50.000000000000036,
+								0
+							],
+							"max": [
+								499.99999999999977,
+								50.000000000000036,
+								500
+							],
+							"center": [
+								0,
+								0,
+								250
+							],
+							"extent": [
+								499.99999999999977,
+								50.000000000000036,
+								250
+							],
+							"size": [
+								999.99999999999955,
+								100.00000000000007,
+								500
+							],
+							"diagonal": 1122.497216032182
+						}
+					},
+					"accepted_pass": "primary_target_render_orientation",
+					"volume_delta": 11198047.802747816,
+					"min_required_volume_delta": 4999.9999999999909
+				}
+			],
+			"status": "created_boolean_result_actor",
+			"result_actor": "FromLZ_BooleanResult_StaticMeshActor_0_StaticMeshComponent0_0",
+			"final":
+			{
+				"label": "StaticMeshActor_0/StaticMeshComponent0 final",
+				"source_type": "static_mesh_boolean_result",
+				"vertex_count": 66,
+				"triangle_count": 128,
+				"edge_count": 192,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 1209491.9863003963,
+				"min_triangle_area": 26.184561792220446,
+				"max_triangle_area": 62499.999999999978,
+				"signed_volume": -38801952.197252087,
+				"abs_volume": 38801952.197252087,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -38801952.197252087,
+				"signed_volume_after_orientation_fix": -38801952.197252087,
+				"min_edge_length": 3.8186578644592788,
+				"max_edge_length": 559.01699437494722,
+				"mean_edge_length": 201.98643391814744,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						-499.99999999999977,
+						-50.000000000000036,
+						0
+					],
+					"max": [
+						499.99999999999977,
+						50.000000000000036,
+						500
+					],
+					"center": [
+						0,
+						0,
+						250
+					],
+					"extent": [
+						499.99999999999977,
+						50.000000000000036,
+						250
+					],
+					"size": [
+						999.99999999999955,
+						100.00000000000007,
+						500
+					],
+					"diagonal": 1122.497216032182
+				}
+			}
+		},
+		{
+			"target_actor": "StaticMeshActor_1",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_1/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 4,
+				"triangle_count": 2,
+				"edge_count": 5,
+				"boundary_edge_count": 4,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 100000000,
+				"min_triangle_area": 50000000,
+				"max_triangle_area": 50000000,
+				"signed_volume": 0,
+				"abs_volume": 0,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": 0,
+				"signed_volume_after_orientation_fix": 0,
+				"min_edge_length": 10000,
+				"max_edge_length": 14142.13562373095,
+				"mean_edge_length": 10828.427124746191,
+				"euler_characteristic": 1,
+				"closed_two_manifold": false,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						-5000,
+						-5000,
+						-8.040613564774899e-13
+					],
+					"max": [
+						5000,
+						5000,
+						8.040613564774899e-13
+					],
+					"center": [
+						0,
+						0,
+						0
+					],
+					"extent": [
+						5000,
+						5000,
+						8.040613564774899e-13
+					],
+					"size": [
+						10000,
+						10000,
+						1.6081227129549798e-12
+					],
+					"diagonal": 14142.13562373095
+				}
+			},
+			"modified": false,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_1",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 402.98537712185288,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-5000,
+							-5000,
+							-8.040613564774899e-13
+						],
+						"max": [
+							5000,
+							5000,
+							8.040613564774899e-13
+						],
+						"center": [
+							0,
+							0,
+							0
+						],
+						"extent": [
+							5000,
+							5000,
+							8.040613564774899e-13
+						],
+						"size": [
+							10000,
+							10000,
+							1.6081227129549798e-12
+						],
+						"diagonal": 14142.13562373095
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_1/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 4,
+						"triangle_count": 2,
+						"edge_count": 5,
+						"boundary_edge_count": 4,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 100000000,
+						"min_triangle_area": 50000000,
+						"max_triangle_area": 50000000,
+						"signed_volume": 0,
+						"abs_volume": 0,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 0,
+						"signed_volume_after_orientation_fix": 0,
+						"min_edge_length": 10000,
+						"max_edge_length": 14142.13562373095,
+						"mean_edge_length": 10828.427124746191,
+						"euler_characteristic": 1,
+						"closed_two_manifold": false,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-5000,
+								-5000,
+								-8.040613564774899e-13
+							],
+							"max": [
+								5000,
+								5000,
+								8.040613564774899e-13
+							],
+							"center": [
+								0,
+								0,
+								0
+							],
+							"extent": [
+								5000,
+								5000,
+								8.040613564774899e-13
+							],
+							"size": [
+								10000,
+								10000,
+								1.6081227129549798e-12
+							],
+							"diagonal": 14142.13562373095
+						}
+					},
+					"target_render_sign": 0,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				},
+				{
+					"target_actor": "StaticMeshActor_1",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": true,
+					"expanded_bounds_intersect": true,
+					"center_distance": 188.83583602954943,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-5000,
+							-5000,
+							-8.040613564774899e-13
+						],
+						"max": [
+							5000,
+							5000,
+							8.040613564774899e-13
+						],
+						"center": [
+							0,
+							0,
+							0
+						],
+						"extent": [
+							5000,
+							5000,
+							8.040613564774899e-13
+						],
+						"size": [
+							10000,
+							10000,
+							1.6081227129549798e-12
+						],
+						"diagonal": 14142.13562373095
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_1/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 4,
+						"triangle_count": 2,
+						"edge_count": 5,
+						"boundary_edge_count": 4,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 100000000,
+						"min_triangle_area": 50000000,
+						"max_triangle_area": 50000000,
+						"signed_volume": 0,
+						"abs_volume": 0,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 0,
+						"signed_volume_after_orientation_fix": 0,
+						"min_edge_length": 10000,
+						"max_edge_length": 14142.13562373095,
+						"mean_edge_length": 10828.427124746191,
+						"euler_characteristic": 1,
+						"closed_two_manifold": false,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-5000,
+								-5000,
+								-8.040613564774899e-13
+							],
+							"max": [
+								5000,
+								5000,
+								8.040613564774899e-13
+							],
+							"center": [
+								0,
+								0,
+								0
+							],
+							"extent": [
+								5000,
+								5000,
+								8.040613564774899e-13
+							],
+							"size": [
+								10000,
+								10000,
+								1.6081227129549798e-12
+							],
+							"diagonal": 14142.13562373095
+						}
+					},
+					"target_render_sign": 0,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"attempts": [
+						{
+							"pass_name": "primary_target_render_orientation",
+							"boolean_backend": "Manifold3D",
+							"manifold_library_version": "3.5.0+37125da",
+							"status": "rejected",
+							"reject_reason": "target_zero_volume",
+							"compute_success": false,
+							"accepted": false,
+							"empty_result": false,
+							"target_reversed_for_pass": false,
+							"cutter_reversed_for_pass": false,
+							"result_reversed_to_target_sign": false,
+							"target_manifold_input_valid": false,
+							"cutter_manifold_input_valid": false,
+							"manifold_difference_success": false,
+							"manifold_error_message": "",
+							"target_input_triangles": 2,
+							"cutter_input_triangles": 76,
+							"result_output_triangles": 0,
+							"target_orientation_reversed_for_manifold": false,
+							"cutter_orientation_reversed_for_manifold": false,
+							"target_signed_volume_for_manifold": 0,
+							"cutter_signed_volume_for_manifold": 0,
+							"result_signed_volume_before_render_fix": 0,
+							"cap_section_unavailable": true,
+							"volume_delta": 0,
+							"min_required_volume_delta": 1
+						},
+						{
+							"pass_name": "fallback_reversed_pair_orientation",
+							"boolean_backend": "Manifold3D",
+							"manifold_library_version": "3.5.0+37125da",
+							"status": "rejected",
+							"reject_reason": "target_zero_volume",
+							"compute_success": false,
+							"accepted": false,
+							"empty_result": false,
+							"target_reversed_for_pass": false,
+							"cutter_reversed_for_pass": false,
+							"result_reversed_to_target_sign": false,
+							"target_manifold_input_valid": false,
+							"cutter_manifold_input_valid": false,
+							"manifold_difference_success": false,
+							"manifold_error_message": "",
+							"target_input_triangles": 2,
+							"cutter_input_triangles": 76,
+							"result_output_triangles": 0,
+							"target_orientation_reversed_for_manifold": false,
+							"cutter_orientation_reversed_for_manifold": false,
+							"target_signed_volume_for_manifold": 0,
+							"cutter_signed_volume_for_manifold": 0,
+							"result_signed_volume_before_render_fix": 0,
+							"cap_section_unavailable": true,
+							"volume_delta": 0,
+							"min_required_volume_delta": 1
+						}
+					],
+					"status": "rejected",
+					"reject_reason": "target_zero_volume"
+				}
+			],
+			"status": "not_modified"
+		},
+		{
+			"target_actor": "StaticMeshActor_2",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_2/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 26,
+				"triangle_count": 48,
+				"edge_count": 72,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 59999.999999999978,
+				"min_triangle_area": 1249.9999999999975,
+				"max_triangle_area": 1250,
+				"signed_volume": -1000000.0000000005,
+				"abs_volume": 1000000.0000000005,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -1000000.0000000005,
+				"signed_volume_after_orientation_fix": -1000000.0000000005,
+				"min_edge_length": 49.999999999999943,
+				"max_edge_length": 70.710678118654755,
+				"mean_edge_length": 56.903559372884928,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						230.00000000000003,
+						-139.99999999999997,
+						210
+					],
+					"max": [
+						330,
+						-40.000000000000021,
+						310
+					],
+					"center": [
+						280,
+						-90,
+						260
+					],
+					"extent": [
+						49.999999999999986,
+						49.999999999999972,
+						50
+					],
+					"size": [
+						99.999999999999972,
+						99.999999999999943,
+						100
+					],
+					"diagonal": 173.2050807568877
+				}
+			},
+			"modified": true,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_2",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": true,
+					"expanded_bounds_intersect": true,
+					"center_distance": 33.204408070459976,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							230.00000000000003,
+							-139.99999999999997,
+							210
+						],
+						"max": [
+							330,
+							-40.000000000000021,
+							310
+						],
+						"center": [
+							280,
+							-90,
+							260
+						],
+						"extent": [
+							49.999999999999986,
+							49.999999999999972,
+							50
+						],
+						"size": [
+							99.999999999999972,
+							99.999999999999943,
+							100
+						],
+						"diagonal": 173.2050807568877
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_2/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 59999.999999999978,
+						"min_triangle_area": 1249.9999999999975,
+						"max_triangle_area": 1250,
+						"signed_volume": -1000000.0000000005,
+						"abs_volume": 1000000.0000000005,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -1000000.0000000005,
+						"signed_volume_after_orientation_fix": -1000000.0000000005,
+						"min_edge_length": 49.999999999999943,
+						"max_edge_length": 70.710678118654755,
+						"mean_edge_length": 56.903559372884928,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								230.00000000000003,
+								-139.99999999999997,
+								210
+							],
+							"max": [
+								330,
+								-40.000000000000021,
+								310
+							],
+							"center": [
+								280,
+								-90,
+								260
+							],
+							"extent": [
+								49.999999999999986,
+								49.999999999999972,
+								50
+							],
+							"size": [
+								99.999999999999972,
+								99.999999999999943,
+								100
+							],
+							"diagonal": 173.2050807568877
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"attempts": [
+						{
+							"pass_name": "primary_target_render_orientation",
+							"boolean_backend": "Manifold3D",
+							"manifold_library_version": "3.5.0+37125da",
+							"status": "accepted",
+							"reject_reason": "",
+							"compute_success": true,
+							"accepted": true,
+							"empty_result": false,
+							"target_reversed_for_pass": false,
+							"cutter_reversed_for_pass": false,
+							"result_reversed_to_target_sign": true,
+							"target_manifold_input_valid": true,
+							"cutter_manifold_input_valid": true,
+							"manifold_difference_success": true,
+							"manifold_error_message": "",
+							"target_input_triangles": 48,
+							"cutter_input_triangles": 28,
+							"result_output_triangles": 78,
+							"target_orientation_reversed_for_manifold": true,
+							"cutter_orientation_reversed_for_manifold": false,
+							"target_signed_volume_for_manifold": 1000000,
+							"cutter_signed_volume_for_manifold": 132681.4888785361,
+							"result_signed_volume_before_render_fix": 879276.79857065773,
+							"cap_section_unavailable": true,
+							"volume_delta": 120723.20142934483,
+							"min_required_volume_delta": 100.00000000000006,
+							"result":
+							{
+								"label": "StaticMeshActor_2/StaticMeshComponent0 result_after_FromLZ_ReconstructedSolid_Press_01_Component_02_primary",
+								"source_type": "boolean_result",
+								"vertex_count": 41,
+								"triangle_count": 78,
+								"edge_count": 117,
+								"boundary_edge_count": 0,
+								"non_manifold_edge_count": 0,
+								"inconsistent_orientation_edge_count": 0,
+								"invalid_triangle_count": 0,
+								"degenerate_triangle_count": 0,
+								"tiny_triangle_count": 0,
+								"duplicate_triangle_count": 0,
+								"surface_area": 68636.603186934575,
+								"min_triangle_area": 26.159588768715754,
+								"max_triangle_area": 1253.8561513280742,
+								"signed_volume": -879276.79857065564,
+								"abs_volume": 879276.79857065564,
+								"orientation_reversed_for_boolean": false,
+								"signed_volume_before_orientation_fix": -879276.79857065564,
+								"signed_volume_after_orientation_fix": -879276.79857065564,
+								"min_edge_length": 8.311234750836217,
+								"max_edge_length": 81.935544302616378,
+								"mean_edge_length": 48.47486751384497,
+								"euler_characteristic": 2,
+								"closed_two_manifold": true,
+								"bounds":
+								{
+									"valid": true,
+									"min": [
+										230.00000000000003,
+										-139.99999999999997,
+										210
+									],
+									"max": [
+										330,
+										-40.000000000000021,
+										310
+									],
+									"center": [
+										280,
+										-90,
+										260
+									],
+									"extent": [
+										49.999999999999986,
+										49.999999999999972,
+										50
+									],
+									"size": [
+										99.999999999999972,
+										99.999999999999943,
+										100
+									],
+									"diagonal": 173.2050807568877
+								}
+							}
+						}
+					],
+					"status": "accepted_non_empty",
+					"accepted_result":
+					{
+						"label": "StaticMeshActor_2/StaticMeshComponent0 result_after_FromLZ_ReconstructedSolid_Press_01_Component_02_primary",
+						"source_type": "boolean_result",
+						"vertex_count": 41,
+						"triangle_count": 78,
+						"edge_count": 117,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 68636.603186934575,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280742,
+						"signed_volume": -879276.79857065564,
+						"abs_volume": 879276.79857065564,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -879276.79857065564,
+						"signed_volume_after_orientation_fix": -879276.79857065564,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 81.935544302616378,
+						"mean_edge_length": 48.47486751384497,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								230.00000000000003,
+								-139.99999999999997,
+								210
+							],
+							"max": [
+								330,
+								-40.000000000000021,
+								310
+							],
+							"center": [
+								280,
+								-90,
+								260
+							],
+							"extent": [
+								49.999999999999986,
+								49.999999999999972,
+								50
+							],
+							"size": [
+								99.999999999999972,
+								99.999999999999943,
+								100
+							],
+							"diagonal": 173.2050807568877
+						}
+					},
+					"accepted_pass": "primary_target_render_orientation",
+					"volume_delta": 120723.20142934483,
+					"min_required_volume_delta": 100.00000000000006
+				},
+				{
+					"target_actor": "StaticMeshActor_2",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 388.84537159068719,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							230.00000000000003,
+							-139.99999999999997,
+							210
+						],
+						"max": [
+							330,
+							-40.000000000000021,
+							310
+						],
+						"center": [
+							280,
+							-90,
+							260
+						],
+						"extent": [
+							49.999999999999986,
+							49.999999999999972,
+							50
+						],
+						"size": [
+							99.999999999999972,
+							99.999999999999943,
+							100
+						],
+						"diagonal": 173.2050807568877
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_2/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 41,
+						"triangle_count": 78,
+						"edge_count": 117,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 68636.603186934575,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280742,
+						"signed_volume": -879276.79857065564,
+						"abs_volume": 879276.79857065564,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -879276.79857065564,
+						"signed_volume_after_orientation_fix": -879276.79857065564,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 81.935544302616378,
+						"mean_edge_length": 48.47486751384497,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								230.00000000000003,
+								-139.99999999999997,
+								210
+							],
+							"max": [
+								330,
+								-40.000000000000021,
+								310
+							],
+							"center": [
+								280,
+								-90,
+								260
+							],
+							"extent": [
+								49.999999999999986,
+								49.999999999999972,
+								50
+							],
+							"size": [
+								99.999999999999972,
+								99.999999999999943,
+								100
+							],
+							"diagonal": 173.2050807568877
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				}
+			],
+			"status": "created_boolean_result_actor",
+			"result_actor": "FromLZ_BooleanResult_StaticMeshActor_2_StaticMeshComponent0_0",
+			"final":
+			{
+				"label": "StaticMeshActor_2/StaticMeshComponent0 final",
+				"source_type": "static_mesh_boolean_result",
+				"vertex_count": 41,
+				"triangle_count": 78,
+				"edge_count": 117,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 68636.603186934575,
+				"min_triangle_area": 26.159588768715754,
+				"max_triangle_area": 1253.8561513280742,
+				"signed_volume": -879276.79857065564,
+				"abs_volume": 879276.79857065564,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -879276.79857065564,
+				"signed_volume_after_orientation_fix": -879276.79857065564,
+				"min_edge_length": 8.311234750836217,
+				"max_edge_length": 81.935544302616378,
+				"mean_edge_length": 48.47486751384497,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						230.00000000000003,
+						-139.99999999999997,
+						210
+					],
+					"max": [
+						330,
+						-40.000000000000021,
+						310
+					],
+					"center": [
+						280,
+						-90,
+						260
+					],
+					"extent": [
+						49.999999999999986,
+						49.999999999999972,
+						50
+					],
+					"size": [
+						99.999999999999972,
+						99.999999999999943,
+						100
+					],
+					"diagonal": 173.2050807568877
+				}
+			}
+		},
+		{
+			"target_actor": "StaticMeshActor_3",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_3/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 26,
+				"triangle_count": 48,
+				"edge_count": 72,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 3100000.0000000014,
+				"min_triangle_area": 6250,
+				"max_triangle_area": 156250.00000000017,
+				"signed_volume": -125000000.00000012,
+				"abs_volume": 125000000.00000012,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -125000000.00000012,
+				"signed_volume_after_orientation_fix": -125000000.00000012,
+				"min_edge_length": 50,
+				"max_edge_length": 1274.7548783981972,
+				"mean_edge_length": 653.41171715527969,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						499.99999999999972,
+						-50.000000000000682,
+						-4.5474735088646412e-13
+					],
+					"max": [
+						600.00000000000023,
+						2450.0000000000009,
+						500.00000000000045
+					],
+					"center": [
+						550,
+						1200,
+						250
+					],
+					"extent": [
+						50.000000000000256,
+						1250.0000000000009,
+						250.00000000000045
+					],
+					"size": [
+						100.00000000000051,
+						2500.0000000000018,
+						500.00000000000091
+					],
+					"diagonal": 2551.4701644346169
+				}
+			},
+			"modified": false,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_3",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 1348.8594103316882,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							499.99999999999972,
+							-50.000000000000682,
+							-4.5474735088646412e-13
+						],
+						"max": [
+							600.00000000000023,
+							2450.0000000000009,
+							500.00000000000045
+						],
+						"center": [
+							550,
+							1200,
+							250
+						],
+						"extent": [
+							50.000000000000256,
+							1250.0000000000009,
+							250.00000000000045
+						],
+						"size": [
+							100.00000000000051,
+							2500.0000000000018,
+							500.00000000000091
+						],
+						"diagonal": 2551.4701644346169
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_3/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 3100000.0000000014,
+						"min_triangle_area": 6250,
+						"max_triangle_area": 156250.00000000017,
+						"signed_volume": -125000000.00000012,
+						"abs_volume": 125000000.00000012,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -125000000.00000012,
+						"signed_volume_after_orientation_fix": -125000000.00000012,
+						"min_edge_length": 50,
+						"max_edge_length": 1274.7548783981972,
+						"mean_edge_length": 653.41171715527969,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								499.99999999999972,
+								-50.000000000000682,
+								-4.5474735088646412e-13
+							],
+							"max": [
+								600.00000000000023,
+								2450.0000000000009,
+								500.00000000000045
+							],
+							"center": [
+								550,
+								1200,
+								250
+							],
+							"extent": [
+								50.000000000000256,
+								1250.0000000000009,
+								250.00000000000045
+							],
+							"size": [
+								100.00000000000051,
+								2500.0000000000018,
+								500.00000000000091
+							],
+							"diagonal": 2551.4701644346169
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				},
+				{
+					"target_actor": "StaticMeshActor_3",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 1256.563197631109,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							499.99999999999972,
+							-50.000000000000682,
+							-4.5474735088646412e-13
+						],
+						"max": [
+							600.00000000000023,
+							2450.0000000000009,
+							500.00000000000045
+						],
+						"center": [
+							550,
+							1200,
+							250
+						],
+						"extent": [
+							50.000000000000256,
+							1250.0000000000009,
+							250.00000000000045
+						],
+						"size": [
+							100.00000000000051,
+							2500.0000000000018,
+							500.00000000000091
+						],
+						"diagonal": 2551.4701644346169
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_3/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 3100000.0000000014,
+						"min_triangle_area": 6250,
+						"max_triangle_area": 156250.00000000017,
+						"signed_volume": -125000000.00000012,
+						"abs_volume": 125000000.00000012,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -125000000.00000012,
+						"signed_volume_after_orientation_fix": -125000000.00000012,
+						"min_edge_length": 50,
+						"max_edge_length": 1274.7548783981972,
+						"mean_edge_length": 653.41171715527969,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								499.99999999999972,
+								-50.000000000000682,
+								-4.5474735088646412e-13
+							],
+							"max": [
+								600.00000000000023,
+								2450.0000000000009,
+								500.00000000000045
+							],
+							"center": [
+								550,
+								1200,
+								250
+							],
+							"extent": [
+								50.000000000000256,
+								1250.0000000000009,
+								250.00000000000045
+							],
+							"size": [
+								100.00000000000051,
+								2500.0000000000018,
+								500.00000000000091
+							],
+							"diagonal": 2551.4701644346169
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				}
+			],
+			"status": "not_modified"
+		},
+		{
+			"target_actor": "StaticMeshActor_6",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_6/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 26,
+				"triangle_count": 48,
+				"edge_count": 72,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 3100000.0000000014,
+				"min_triangle_area": 6250,
+				"max_triangle_area": 156250.00000000017,
+				"signed_volume": -124999999.9999999,
+				"abs_volume": 124999999.9999999,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -124999999.9999999,
+				"signed_volume_after_orientation_fix": -124999999.9999999,
+				"min_edge_length": 50,
+				"max_edge_length": 1274.7548783981972,
+				"mean_edge_length": 653.41171715527969,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						-600.00000000000023,
+						-50.000000000000682,
+						-4.5474735088646412e-13
+					],
+					"max": [
+						-499.99999999999972,
+						2450.0000000000009,
+						500.00000000000045
+					],
+					"center": [
+						-550,
+						1200,
+						250
+					],
+					"extent": [
+						50.000000000000256,
+						1250.0000000000009,
+						250.00000000000045
+					],
+					"size": [
+						100.00000000000051,
+						2500.0000000000018,
+						500.00000000000091
+					],
+					"diagonal": 2551.4701644346169
+				}
+			},
+			"modified": false,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_6",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 1564.3318972063441,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-600.00000000000023,
+							-50.000000000000682,
+							-4.5474735088646412e-13
+						],
+						"max": [
+							-499.99999999999972,
+							2450.0000000000009,
+							500.00000000000045
+						],
+						"center": [
+							-550,
+							1200,
+							250
+						],
+						"extent": [
+							50.000000000000256,
+							1250.0000000000009,
+							250.00000000000045
+						],
+						"size": [
+							100.00000000000051,
+							2500.0000000000018,
+							500.00000000000091
+						],
+						"diagonal": 2551.4701644346169
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_6/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 3100000.0000000014,
+						"min_triangle_area": 6250,
+						"max_triangle_area": 156250.00000000017,
+						"signed_volume": -124999999.9999999,
+						"abs_volume": 124999999.9999999,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -124999999.9999999,
+						"signed_volume_after_orientation_fix": -124999999.9999999,
+						"min_edge_length": 50,
+						"max_edge_length": 1274.7548783981972,
+						"mean_edge_length": 653.41171715527969,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-600.00000000000023,
+								-50.000000000000682,
+								-4.5474735088646412e-13
+							],
+							"max": [
+								-499.99999999999972,
+								2450.0000000000009,
+								500.00000000000045
+							],
+							"center": [
+								-550,
+								1200,
+								250
+							],
+							"extent": [
+								50.000000000000256,
+								1250.0000000000009,
+								250.00000000000045
+							],
+							"size": [
+								100.00000000000051,
+								2500.0000000000018,
+								500.00000000000091
+							],
+							"diagonal": 2551.4701644346169
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				},
+				{
+					"target_actor": "StaticMeshActor_6",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 1216.9128497740548,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-600.00000000000023,
+							-50.000000000000682,
+							-4.5474735088646412e-13
+						],
+						"max": [
+							-499.99999999999972,
+							2450.0000000000009,
+							500.00000000000045
+						],
+						"center": [
+							-550,
+							1200,
+							250
+						],
+						"extent": [
+							50.000000000000256,
+							1250.0000000000009,
+							250.00000000000045
+						],
+						"size": [
+							100.00000000000051,
+							2500.0000000000018,
+							500.00000000000091
+						],
+						"diagonal": 2551.4701644346169
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_6/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 3100000.0000000014,
+						"min_triangle_area": 6250,
+						"max_triangle_area": 156250.00000000017,
+						"signed_volume": -124999999.9999999,
+						"abs_volume": 124999999.9999999,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -124999999.9999999,
+						"signed_volume_after_orientation_fix": -124999999.9999999,
+						"min_edge_length": 50,
+						"max_edge_length": 1274.7548783981972,
+						"mean_edge_length": 653.41171715527969,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-600.00000000000023,
+								-50.000000000000682,
+								-4.5474735088646412e-13
+							],
+							"max": [
+								-499.99999999999972,
+								2450.0000000000009,
+								500.00000000000045
+							],
+							"center": [
+								-550,
+								1200,
+								250
+							],
+							"extent": [
+								50.000000000000256,
+								1250.0000000000009,
+								250.00000000000045
+							],
+							"size": [
+								100.00000000000051,
+								2500.0000000000018,
+								500.00000000000091
+							],
+							"diagonal": 2551.4701644346169
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				}
+			],
+			"status": "not_modified"
+		},
+		{
+			"target_actor": "StaticMeshActor_5",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_5/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 26,
+				"triangle_count": 48,
+				"edge_count": 72,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 1299999.9999999998,
+				"min_triangle_area": 6249.9999999999991,
+				"max_triangle_area": 62499.999999999978,
+				"signed_volume": -50000000.000000164,
+				"abs_volume": 50000000.000000164,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -50000000.000000164,
+				"signed_volume_after_orientation_fix": -50000000.000000164,
+				"min_edge_length": 50,
+				"max_edge_length": 559.01699437494722,
+				"mean_edge_length": 324.0513056789589,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						-499.99999999999977,
+						2420,
+						0
+					],
+					"max": [
+						499.99999999999977,
+						2520,
+						500
+					],
+					"center": [
+						0,
+						2470,
+						250
+					],
+					"extent": [
+						499.99999999999977,
+						50,
+						250
+					],
+					"size": [
+						999.99999999999955,
+						100,
+						500
+					],
+					"diagonal": 1122.497216032182
+				}
+			},
+			"modified": false,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_5",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 2608.2812503612327,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-499.99999999999977,
+							2420,
+							0
+						],
+						"max": [
+							499.99999999999977,
+							2520,
+							500
+						],
+						"center": [
+							0,
+							2470,
+							250
+						],
+						"extent": [
+							499.99999999999977,
+							50,
+							250
+						],
+						"size": [
+							999.99999999999955,
+							100,
+							500
+						],
+						"diagonal": 1122.497216032182
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_5/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 1299999.9999999998,
+						"min_triangle_area": 6249.9999999999991,
+						"max_triangle_area": 62499.999999999978,
+						"signed_volume": -50000000.000000164,
+						"abs_volume": 50000000.000000164,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -50000000.000000164,
+						"signed_volume_after_orientation_fix": -50000000.000000164,
+						"min_edge_length": 50,
+						"max_edge_length": 559.01699437494722,
+						"mean_edge_length": 324.0513056789589,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-499.99999999999977,
+								2420,
+								0
+							],
+							"max": [
+								499.99999999999977,
+								2520,
+								500
+							],
+							"center": [
+								0,
+								2470,
+								250
+							],
+							"extent": [
+								499.99999999999977,
+								50,
+								250
+							],
+							"size": [
+								999.99999999999955,
+								100,
+								500
+							],
+							"diagonal": 1122.497216032182
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				},
+				{
+					"target_actor": "StaticMeshActor_5",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 2375.2595321866647,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-499.99999999999977,
+							2420,
+							0
+						],
+						"max": [
+							499.99999999999977,
+							2520,
+							500
+						],
+						"center": [
+							0,
+							2470,
+							250
+						],
+						"extent": [
+							499.99999999999977,
+							50,
+							250
+						],
+						"size": [
+							999.99999999999955,
+							100,
+							500
+						],
+						"diagonal": 1122.497216032182
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_5/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 1299999.9999999998,
+						"min_triangle_area": 6249.9999999999991,
+						"max_triangle_area": 62499.999999999978,
+						"signed_volume": -50000000.000000164,
+						"abs_volume": 50000000.000000164,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -50000000.000000164,
+						"signed_volume_after_orientation_fix": -50000000.000000164,
+						"min_edge_length": 50,
+						"max_edge_length": 559.01699437494722,
+						"mean_edge_length": 324.0513056789589,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-499.99999999999977,
+								2420,
+								0
+							],
+							"max": [
+								499.99999999999977,
+								2520,
+								500
+							],
+							"center": [
+								0,
+								2470,
+								250
+							],
+							"extent": [
+								499.99999999999977,
+								50,
+								250
+							],
+							"size": [
+								999.99999999999955,
+								100,
+								500
+							],
+							"diagonal": 1122.497216032182
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				}
+			],
+			"status": "not_modified"
+		},
+		{
+			"target_actor": "StaticMeshActor_7",
+			"target_component": "StaticMeshComponent0",
+			"source_type": "static_mesh",
+			"initial":
+			{
+				"label": "StaticMeshActor_7/StaticMeshComponent0",
+				"source_type": "static_mesh",
+				"vertex_count": 26,
+				"triangle_count": 48,
+				"edge_count": 72,
+				"boundary_edge_count": 0,
+				"non_manifold_edge_count": 0,
+				"inconsistent_orientation_edge_count": 0,
+				"invalid_triangle_count": 0,
+				"degenerate_triangle_count": 0,
+				"tiny_triangle_count": 0,
+				"duplicate_triangle_count": 0,
+				"surface_area": 6370000,
+				"min_triangle_area": 7499.9999999999973,
+				"max_triangle_area": 375000.00000000012,
+				"signed_volume": -150000000.00000033,
+				"abs_volume": 150000000.00000033,
+				"orientation_reversed_for_boolean": false,
+				"signed_volume_before_orientation_fix": -150000000.00000033,
+				"signed_volume_after_orientation_fix": -150000000.00000033,
+				"min_edge_length": 24.999999999999993,
+				"max_edge_length": 1386.5424623862048,
+				"mean_edge_length": 776.36811609604649,
+				"euler_characteristic": 2,
+				"closed_two_manifold": true,
+				"bounds":
+				{
+					"valid": true,
+					"min": [
+						-2310,
+						-50,
+						-5.0000000000002274
+					],
+					"max": [
+						-1110,
+						2450,
+						45.000000000000227
+					],
+					"center": [
+						-1710,
+						1200,
+						20
+					],
+					"extent": [
+						600,
+						1250,
+						25.000000000000227
+					],
+					"size": [
+						1200,
+						2500,
+						50.000000000000455
+					],
+					"diagonal": 2773.5356496717327
+				}
+			},
+			"modified": false,
+			"empty_result": false,
+			"operations": [
+				{
+					"target_actor": "StaticMeshActor_7",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+					"cutter_index": 0,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 2405.5599923371215,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-2310,
+							-50,
+							-5.0000000000002274
+						],
+						"max": [
+							-1110,
+							2450,
+							45.000000000000227
+						],
+						"center": [
+							-1710,
+							1200,
+							20
+						],
+						"extent": [
+							600,
+							1250,
+							25.000000000000227
+						],
+						"size": [
+							1200,
+							2500,
+							50.000000000000455
+						],
+						"diagonal": 2773.5356496717327
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							254.1238468368413,
+							-143.87032477762406,
+							227.34692597809536
+						],
+						"max": [
+							316.52394932393202,
+							-101.36832424377941,
+							286.27545910571052
+						],
+						"center": [
+							285.32389808038664,
+							-122.61932451070174,
+							256.81119254190293
+						],
+						"extent": [
+							31.20005124354536,
+							21.251000266922325,
+							29.464266563807584
+						],
+						"size": [
+							62.40010248709072,
+							42.502000533844651,
+							58.928533127615168
+						],
+						"diagonal": 95.774552237798517
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_7/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 6370000,
+						"min_triangle_area": 7499.9999999999973,
+						"max_triangle_area": 375000.00000000012,
+						"signed_volume": -150000000.00000033,
+						"abs_volume": 150000000.00000033,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -150000000.00000033,
+						"signed_volume_after_orientation_fix": -150000000.00000033,
+						"min_edge_length": 24.999999999999993,
+						"max_edge_length": 1386.5424623862048,
+						"mean_edge_length": 776.36811609604649,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-2310,
+								-50,
+								-5.0000000000002274
+							],
+							"max": [
+								-1110,
+								2450,
+								45.000000000000227
+							],
+							"center": [
+								-1710,
+								1200,
+								20
+							],
+							"extent": [
+								600,
+								1250,
+								25.000000000000227
+							],
+							"size": [
+								1200,
+								2500,
+								50.000000000000455
+							],
+							"diagonal": 2773.5356496717327
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_02",
+						"source_type": "excavate_cutter",
+						"vertex_count": 16,
+						"triangle_count": 28,
+						"edge_count": 42,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 15750.405748517824,
+						"min_triangle_area": 26.159588768715754,
+						"max_triangle_area": 1253.8561513280749,
+						"signed_volume": 132681.48887853615,
+						"abs_volume": 132681.48887853615,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 132681.48887853615,
+						"signed_volume_after_orientation_fix": 132681.48887853615,
+						"min_edge_length": 8.311234750836217,
+						"max_edge_length": 72.020739401103455,
+						"mean_edge_length": 41.976099841109701,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								254.1238468368413,
+								-143.87032477762406,
+								227.34692597809536
+							],
+							"max": [
+								316.52394932393202,
+								-101.36832424377941,
+								286.27545910571052
+							],
+							"center": [
+								285.32389808038664,
+								-122.61932451070174,
+								256.81119254190293
+							],
+							"extent": [
+								31.20005124354536,
+								21.251000266922325,
+								29.464266563807584
+							],
+							"size": [
+								62.40010248709072,
+								42.502000533844651,
+								58.928533127615168
+							],
+							"diagonal": 95.774552237798517
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				},
+				{
+					"target_actor": "StaticMeshActor_7",
+					"target_component": "StaticMeshComponent0",
+					"target_source_type": "static_mesh",
+					"cutter_actor": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+					"cutter_index": 1,
+					"boolean_backend": "Manifold3D",
+					"manifold_library_version": "3.5.0+37125da",
+					"bounds_intersect": false,
+					"expanded_bounds_intersect": false,
+					"center_distance": 2002.1479498770484,
+					"target_bounds":
+					{
+						"valid": true,
+						"min": [
+							-2310,
+							-50,
+							-5.0000000000002274
+						],
+						"max": [
+							-1110,
+							2450,
+							45.000000000000227
+						],
+						"center": [
+							-1710,
+							1200,
+							20
+						],
+						"extent": [
+							600,
+							1250,
+							25.000000000000227
+						],
+						"size": [
+							1200,
+							2500,
+							50.000000000000455
+						],
+						"diagonal": 2773.5356496717327
+					},
+					"cutter_bounds":
+					{
+						"valid": true,
+						"min": [
+							-240.62940038481941,
+							-79.902592629992256,
+							-0.14917373446173063
+						],
+						"max": [
+							151.47104975235948,
+							273.9625387319229,
+							311.64141714885341
+						],
+						"center": [
+							-44.579175316229964,
+							97.029973050965324,
+							155.74612170719584
+						],
+						"extent": [
+							196.05022506858944,
+							176.93256568095757,
+							155.89529544165757
+						],
+						"size": [
+							392.10045013717888,
+							353.86513136191513,
+							311.79059088331513
+						],
+						"diagonal": 613.33242760751739
+					},
+					"target_before":
+					{
+						"label": "StaticMeshActor_7/StaticMeshComponent0",
+						"source_type": "static_mesh",
+						"vertex_count": 26,
+						"triangle_count": 48,
+						"edge_count": 72,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 6370000,
+						"min_triangle_area": 7499.9999999999973,
+						"max_triangle_area": 375000.00000000012,
+						"signed_volume": -150000000.00000033,
+						"abs_volume": 150000000.00000033,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": -150000000.00000033,
+						"signed_volume_after_orientation_fix": -150000000.00000033,
+						"min_edge_length": 24.999999999999993,
+						"max_edge_length": 1386.5424623862048,
+						"mean_edge_length": 776.36811609604649,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-2310,
+								-50,
+								-5.0000000000002274
+							],
+							"max": [
+								-1110,
+								2450,
+								45.000000000000227
+							],
+							"center": [
+								-1710,
+								1200,
+								20
+							],
+							"extent": [
+								600,
+								1250,
+								25.000000000000227
+							],
+							"size": [
+								1200,
+								2500,
+								50.000000000000455
+							],
+							"diagonal": 2773.5356496717327
+						}
+					},
+					"target_render_sign": -1,
+					"min_renderable_edge_cm": 0.050000000000000003,
+					"cutter_diagnostics":
+					{
+						"label": "FromLZ_ReconstructedSolid_Press_01_Component_03",
+						"source_type": "excavate_cutter",
+						"vertex_count": 40,
+						"triangle_count": 76,
+						"edge_count": 114,
+						"boundary_edge_count": 0,
+						"non_manifold_edge_count": 0,
+						"inconsistent_orientation_edge_count": 0,
+						"invalid_triangle_count": 0,
+						"degenerate_triangle_count": 0,
+						"tiny_triangle_count": 0,
+						"duplicate_triangle_count": 0,
+						"surface_area": 707539.9605156465,
+						"min_triangle_area": 150.64314911639011,
+						"max_triangle_area": 63417.124731509692,
+						"signed_volume": 39553724.687032267,
+						"abs_volume": 39553724.687032267,
+						"orientation_reversed_for_boolean": false,
+						"signed_volume_before_orientation_fix": 39553724.687032267,
+						"signed_volume_after_orientation_fix": 39553724.687032267,
+						"min_edge_length": 3.9465688392872593,
+						"max_edge_length": 503.68927729492572,
+						"mean_edge_length": 237.29480171138866,
+						"euler_characteristic": 2,
+						"closed_two_manifold": true,
+						"bounds":
+						{
+							"valid": true,
+							"min": [
+								-240.62940038481941,
+								-79.902592629992256,
+								-0.14917373446173063
+							],
+							"max": [
+								151.47104975235948,
+								273.9625387319229,
+								311.64141714885341
+							],
+							"center": [
+								-44.579175316229964,
+								97.029973050965324,
+								155.74612170719584
+							],
+							"extent": [
+								196.05022506858944,
+								176.93256568095757,
+								155.89529544165757
+							],
+							"size": [
+								392.10045013717888,
+								353.86513136191513,
+								311.79059088331513
+							],
+							"diagonal": 613.33242760751739
+						}
+					},
+					"status": "skipped_bounds_no_intersection"
+				}
+			],
+			"status": "not_modified"
+		}
+	]
 }

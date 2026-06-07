@@ -111,10 +111,17 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 	FromLZImageOps::RemoveSmallComponents(Skel, Width, Height, /*MinArea*/ 6);
 	FromLZImageOps::SaveMaskPng(Skel, Width, Height, PressDir / TEXT("02_skeleton.png"), /*bInvertForDisplay*/ true);
 
+	// Per-pixel color-class map of the composite (red/green/blue/black/none).
+	// Step 3 uses it to keep short dangling branches that still correspond to
+	// source red/black marks; later steps reuse it for stroke color assignment.
+	TArray<uint8> ColorMap;
+	FromLZImageOps::BuildColorClassMap(RGBA, Width, Height, ColorMap);
+	const int32 ColorSampleRadius = 2;
+
 	// ---- Step 3: skeleton gap repair ---------------------------------------
 	// Connect mutual-nearest endpoints within --skeleton-gap-tol, prune connections
 	// that only close a small loop (--skeleton-small-loop-bbox-area-thresh), then
-	// trim short dangling branches. Mirrors Python cleanup_skeleton_endpoints.
+	// trim short dangling branches unless they come from red/black source pixels.
 	TArray<uint8> SkelConnected, SkelSmallLoopPruned, SkelClean;
 	FromLZImageOps::CleanupSkeletonEndpoints(
 		Skel, Width, Height,
@@ -122,16 +129,17 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 		/*ConnectThickness*/ 1,
 		/*SmallLoopBboxAreaThresh*/ 1500.0f,
 		/*BranchPruneMaxPixels*/ 0.0f, // 0 -> auto = max(30, 3*GapTol)
+		ColorMap,
+		ColorSampleRadius,
+		PressDir / TEXT("03a_red_black_connectors.png"),
+		PressDir / TEXT("03a_red_black_reconnected.png"),
+		PressDir / TEXT("03b_connector_prune_debug.json"),
 		SkelConnected, SkelSmallLoopPruned, SkelClean);
 	FromLZImageOps::SaveMaskPng(SkelConnected, Width, Height, PressDir / TEXT("03a_skeleton_connected.png"), /*bInvertForDisplay*/ true);
 	FromLZImageOps::SaveMaskPng(SkelSmallLoopPruned, Width, Height, PressDir / TEXT("03b_skeleton_small_loop_pruned.png"), /*bInvertForDisplay*/ true);
 	FromLZImageOps::SaveMaskPng(SkelClean, Width, Height, PressDir / TEXT("03_skeleton_clean.png"), /*bInvertForDisplay*/ true);
 
-	// Per-pixel color-class map of the composite (red/green/blue/black/none),
-	// used to color strokes and to keep RGB strokes from being merged together.
-	TArray<uint8> ColorMap;
-	FromLZImageOps::BuildColorClassMap(RGBA, Width, Height, ColorMap);
-	const int32 ColorSampleRadius = 2;
+	// The color map also keeps RGB strokes from being merged together.
 	const float EndpointTol = 3.0f;
 	const float ColorMinRunArc = 18.0f; // absorb short color "blips" at crossings into neighbors
 

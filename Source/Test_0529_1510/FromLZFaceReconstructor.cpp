@@ -2689,6 +2689,7 @@ namespace
 		auto SaveFaceAndSkippedSolid = [&](const FString& SolidError)
 		{
 			Result.Solid.Action = Result.Action;
+
 			Result.Solid.SelectedFaceId = Result.SelectedFaceId;
 			Result.Solid.CapWidth = Result.CapWidth;
 			Result.Solid.CapHeight = Result.CapHeight;
@@ -2705,6 +2706,13 @@ namespace
 			return Result;
 		}
 		Result.Solid.Action = Result.Action;
+		if (Result.Action.Equals(TEXT("skip"), ESearchCase::IgnoreCase) || Result.Action.Equals(TEXT("undetermined"), ESearchCase::IgnoreCase))
+		{
+			Result.Error = FString::Printf(TEXT("Component skipped by Step 9 action decision: %s"), *Result.Action);
+			SaveFaceAndSkippedSolid(FString::Printf(TEXT("Solid skipped because Step 9 action decision is %s"), *Result.Action));
+			return Result;
+		}
+
 
 		if (Result.Action == TEXT("excavate"))
 		{

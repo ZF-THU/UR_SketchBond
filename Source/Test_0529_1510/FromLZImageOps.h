@@ -36,13 +36,21 @@ namespace FromLZImageOps
 	// Step 3 skeleton gap repair (port of Python cleanup_skeleton_endpoints):
 	//   1. Connect mutual-nearest endpoint pairs whose gap <= GapTol (1px LINE_8).
 	//   2. Prune connections that only close a small loop (bbox area < SmallLoopBboxAreaThresh).
-	//   3. Trim dangling branches shorter than BranchPruneMaxPixels (<=0 -> auto = max(30, 3*GapTol)).
+	//   3. Trim dangling branches shorter than BranchPruneMaxPixels (<=0 -> auto = max(30, 3*GapTol)),
+	//      unless the branch samples as source red/black in SourceColorMap.
+	// Before the full-skeleton small-loop prune, a red/black protection pass treats
+	// each 03a connector as red on top of source red/black skeleton pixels. Connectors
+	// that participate in a red/black loop with bbox area >= SmallLoopBboxAreaThresh
+	// are kept even if the full-skeleton small-loop test would delete them.
 	// All masks are foreground = 255. OutConnected / OutSmallLoopPruned receive the
 	// intermediate stages for debug; pass them and ignore if not needed.
 	void CleanupSkeletonEndpoints(
 		const TArray<uint8>& Skel, int32 Width, int32 Height,
 		float GapTol, int32 ConnectThickness,
 		float SmallLoopBboxAreaThresh, float BranchPruneMaxPixels,
+		const TArray<uint8>& SourceColorMap, int32 SourceColorSampleRadius,
+		const FString& RedBlackConnectorsDebugPngPath, const FString& RedBlackReconnectedDebugPngPath,
+		const FString& ConnectorPruneDebugJsonPath,
 		TArray<uint8>& OutConnected, TArray<uint8>& OutSmallLoopPruned, TArray<uint8>& OutCleaned);
 
 	// A traced stroke is an ordered polyline of pixel coordinates (x, y).
@@ -129,8 +137,13 @@ namespace FromLZImageOps
 	{
 		bool bFound = false;
 		bool bUsedBlack = false;          // loop required black strokes to close
-		bool bHasInteriorGreen = false;   // a sufficiently large green segment lies inside the cap -> excavate
-		int32 InteriorGreenStrokeId = -1; // green stroke that passed the interior threshold test
+		bool bHasInteriorGreen = false;   // compatibility: true when Action == "excavate"
+		FString Action;                  // attach, excavate, or skip
+		FString ActionDecisionReason;
+		int32 LocalGreenStrokeCount = 0;
+		double GreenInsideTotalLength = 0.0;
+		double GreenOutsideTotalLength = 0.0;
+		int32 InteriorGreenStrokeId = -1; // compatibility/debug: best local green by inside length
 		int32 InteriorGreenInsidePoints = 0;
 		int32 InteriorGreenTotalPoints = 0;
 		double InteriorGreenInsideRatio = 0.0;
@@ -164,9 +177,10 @@ namespace FromLZImageOps
 	// their own endpoints, and a final fallback may combine remaining red strokes through the
 	// same all-black endpoint graph. Black strokes never define the initial component split.
 	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
-	// an Action.json is written to ActionPressDir/Component_%%/: "excavate" when one of that
-	// component's local green strokes lies inside the cap polygon, otherwise "attach". Returns
-	// the number of caps found and fills OutResults (one per Component_%%, in folder order).
+	// an Action.json is written to ActionPressDir/Component_%%/: local green stroke pixels are
+	// accumulated inside/outside the cap loop; inside > outside -> "excavate", outside > inside
+	// -> "attach", and ties or missing local green -> "skip". Returns the number of caps found
+	// and fills OutResults (one per Component_%%, in folder order).
 	// After planarization and connector insertion, graph endpoints within 5px are
 	// merged into shared nodes before the existing component extraction begins.
 	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float ConnectorTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults);
