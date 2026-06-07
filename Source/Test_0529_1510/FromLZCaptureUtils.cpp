@@ -1,7 +1,10 @@
 #include "FromLZCaptureUtils.h"
 
+#include "FromLZFaceReconstructor.h"
+
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
+#include "Components/PrimitiveComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Dom/JsonObject.h"
@@ -1172,19 +1175,9 @@ namespace FromLZActorMaterialId
 			}
 		};
 
-		if (SubjectActors.Num() > 0)
+		for (AActor* Actor : SubjectActors)
 		{
-			for (AActor* Actor : SubjectActors)
-			{
-				RasterizeActor(Actor);
-			}
-		}
-		else
-		{
-			for (TActorIterator<AActor> It(World); It; ++It)
-			{
-				RasterizeActor(*It);
-			}
+			RasterizeActor(Actor);
 		}
 
 		IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
@@ -1541,30 +1534,68 @@ static bool ActorNameOrLabelStartsWith(const AActor* Actor, const FString& Prefi
 		return false;
 	}
 
-	bool bMatch = Actor->GetName().StartsWith(Prefix);
+	bool bMatch = Actor->GetName().StartsWith(Prefix, ESearchCase::CaseSensitive);
 #if WITH_EDITOR
-	bMatch = bMatch || Actor->GetActorLabel().StartsWith(Prefix);
+	bMatch = bMatch || Actor->GetActorLabel().StartsWith(Prefix, ESearchCase::CaseSensitive);
 #endif
 	return bMatch;
 }
 
-static bool IsFromLZGeneratedActor(const AActor* Actor)
+static bool ActorNameOrLabelContains(const AActor* Actor, const FString& Text)
 {
 	if (!Actor)
 	{
 		return false;
 	}
 
-	bool bGenerated = Actor->GetName().StartsWith(TEXT("FromLZ_"));
+	bool bMatch = Actor->GetName().Contains(Text, ESearchCase::CaseSensitive);
 #if WITH_EDITOR
-	bGenerated = bGenerated || Actor->GetActorLabel().StartsWith(TEXT("FromLZ_"));
+	bMatch = bMatch || Actor->GetActorLabel().Contains(Text, ESearchCase::CaseSensitive);
 #endif
-	return bGenerated;
+	return bMatch;
 }
 
-static bool IsCaptureSubjectCandidate(const AActor* Actor, const APawn* Pawn)
+static bool ActorHasVisibleCaptureMeshComponent(AActor* Actor)
 {
-	return Actor && Actor != Pawn && !Actor->IsHidden() && !IsFromLZGeneratedActor(Actor);
+	if (!Actor)
+	{
+		return false;
+	}
+
+	TArray<UStaticMeshComponent*> StaticComponents;
+	Actor->GetComponents<UStaticMeshComponent>(StaticComponents);
+	for (UStaticMeshComponent* Component : StaticComponents)
+	{
+		if (Component && Component->IsRegistered() && Component->IsVisible() && Component->GetStaticMesh())
+		{
+			return true;
+		}
+	}
+
+	TArray<UProceduralMeshComponent*> ProceduralComponents;
+	Actor->GetComponents<UProceduralMeshComponent>(ProceduralComponents);
+	for (UProceduralMeshComponent* Component : ProceduralComponents)
+	{
+		if (!Component || !Component->IsRegistered() || !Component->IsVisible())
+		{
+			continue;
+		}
+
+		for (int32 SectionIndex = 0; SectionIndex < Component->GetNumSections(); ++SectionIndex)
+		{
+			if (Component->IsMeshSectionVisible(SectionIndex))
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+static bool IsCaptureSubjectCandidate(AActor* Actor, const APawn* Pawn)
+{
+	return Actor && Actor != Pawn && !Actor->IsHidden() && ActorHasVisibleCaptureMeshComponent(Actor);
 }
 
 static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<AActor*>& OutActors, FString& OutMode)
@@ -1576,31 +1607,45 @@ static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<A
 		return;
 	}
 
-	const FString CaptureNamePrefix(TEXT("Cube"));
+	int32 CubeSubjectCount = 0;
+	int32 PlaneSubjectCount = 0;
+	int32 Step11RuntimeSubjectCount = 0;
+	const FString CubeSubjectPrefix(TEXT("Cube"));
+	const FString PlaneSubjectToken(TEXT("Plane"));
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		AActor* Actor = *It;
-		if (IsCaptureSubjectCandidate(Actor, Pawn) && ActorNameOrLabelStartsWith(Actor, CaptureNamePrefix))
+		if (!IsCaptureSubjectCandidate(Actor, Pawn))
+		{
+			continue;
+		}
+
+		const bool bStep11RuntimeActor = FFromLZFaceReconstructor::IsStep11RuntimeActor(Actor);
+		const bool bCubeSubject = !bStep11RuntimeActor && ActorNameOrLabelStartsWith(Actor, CubeSubjectPrefix);
+		const bool bPlaneSubject = !bStep11RuntimeActor && ActorNameOrLabelContains(Actor, PlaneSubjectToken);
+		const bool bActiveStep11RuntimeSubject = FFromLZFaceReconstructor::IsStep11RuntimeActorActiveForCapture(Actor);
+		if (bCubeSubject || bPlaneSubject || bActiveStep11RuntimeSubject)
 		{
 			OutActors.Add(Actor);
+			if (bCubeSubject)
+			{
+				++CubeSubjectCount;
+			}
+			if (bPlaneSubject)
+			{
+				++PlaneSubjectCount;
+			}
+			if (bActiveStep11RuntimeSubject)
+			{
+				++Step11RuntimeSubjectCount;
+			}
 		}
 	}
 
 	if (OutActors.Num() > 0)
 	{
-		OutMode = TEXT("name_prefix_Cube");
-		return;
+		OutMode = FString::Printf(TEXT("base_scene_or_active_step11_runtime(cube=%d,plane=%d,step11=%d)"), CubeSubjectCount, PlaneSubjectCount, Step11RuntimeSubjectCount);
 	}
-
-	for (TActorIterator<AActor> It(World); It; ++It)
-	{
-		AActor* Actor = *It;
-		if (IsCaptureSubjectCandidate(Actor, Pawn))
-		{
-			OutActors.Add(Actor);
-		}
-	}
-	OutMode = TEXT("all_visible_excluding_FromLZ_generated");
 }
 
 static void ApplyCaptureSubjectActors(USceneCaptureComponent2D* SceneCapture, const TArray<AActor*>& SubjectActors)
@@ -1619,14 +1664,7 @@ static void ApplyCaptureSubjectActors(USceneCaptureComponent2D* SceneCapture, co
 		}
 	}
 
-	if (SceneCapture->ShowOnlyActors.Num() > 0)
-	{
-		SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
-	}
-	else
-	{
-		SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_LegacySceneCapture;
-	}
+	SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
 }
 
 static bool CaptureViewportDebugPng(FViewport* Viewport, const FString& OutputPath)

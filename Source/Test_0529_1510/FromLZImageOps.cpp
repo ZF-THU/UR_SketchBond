@@ -3135,6 +3135,7 @@ namespace FromLZImageOps
 	static constexpr float CapLoopGraphNodeSnapTol = 5.0f;
 	static constexpr double CapGeometryEpsilon = 1e-6;
 	static constexpr double CapEndpointDirectionArc = 5.0;
+	static constexpr double CapBorrowedLoopMinBboxArea = 1500.0;
 
 	struct FCapStrokeSplit
 	{
@@ -4000,6 +4001,8 @@ namespace FromLZImageOps
 		int32 Priority = 0;
 		int32 AnchorStrokeId = -1;
 		int32 EdgeCount = 0;
+		double LoopArea = 0.0;
+		double LoopBboxArea = 0.0;
 		TArray<int32> StrokeIds;
 		TArray<int32> RedStrokeIds;
 		TArray<int32> RealRedStrokeIds;
@@ -4051,6 +4054,32 @@ namespace FromLZImageOps
 			Sum += A.X * B.Y - B.X * A.Y;
 		}
 		return FMath::Abs(0.5 * Sum);
+	}
+
+	static double PolygonBboxArea(const FStroke& Poly)
+	{
+		if (Poly.Num() == 0)
+		{
+			return 0.0;
+		}
+
+		double MinX = TNumericLimits<double>::Max();
+		double MinY = TNumericLimits<double>::Max();
+		double MaxX = -TNumericLimits<double>::Max();
+		double MaxY = -TNumericLimits<double>::Max();
+		for (const FVector2D& P : Poly)
+		{
+			MinX = FMath::Min(MinX, double(P.X));
+			MinY = FMath::Min(MinY, double(P.Y));
+			MaxX = FMath::Max(MaxX, double(P.X));
+			MaxY = FMath::Max(MaxY, double(P.Y));
+		}
+
+		const int32 MinXi = FMath::FloorToInt(MinX);
+		const int32 MinYi = FMath::FloorToInt(MinY);
+		const int32 MaxXi = FMath::CeilToInt(MaxX);
+		const int32 MaxYi = FMath::CeilToInt(MaxY);
+		return double(MaxXi - MinXi + 1) * double(MaxYi - MinYi + 1);
 	}
 
 	static bool IsValidLoopPolygon(const FStroke& Poly)
@@ -4126,6 +4155,8 @@ namespace FromLZImageOps
 		{
 			return false;
 		}
+		Out.LoopArea = PolygonAbsArea(Out.Result.CapPolygon);
+		Out.LoopBboxArea = PolygonBboxArea(Out.Result.CapPolygon);
 		Out.Key = StrokeSetKey(Out.StrokeIds);
 		return !Out.Key.IsEmpty();
 	}
@@ -4288,6 +4319,16 @@ namespace FromLZImageOps
 		}
 	}
 
+	static bool IsRedOnlyLoopCandidate(const FLoopCandidate& Candidate)
+	{
+		return Candidate.Source == TEXT("red_only");
+	}
+
+	static bool IsBorrowedLoopCandidate(const FLoopCandidate& Candidate)
+	{
+		return Candidate.Source == TEXT("local_black") || Candidate.Source == TEXT("fallback_trace");
+	}
+
 	static void SelectLoopCandidates(TArray<FLoopCandidate>& Candidates, TArray<int32>& OutSelectedIndices)
 	{
 		OutSelectedIndices.Reset();
@@ -4304,30 +4345,46 @@ namespace FromLZImageOps
 		{
 			const FLoopCandidate& A = Candidates[AIndex];
 			const FLoopCandidate& B = Candidates[BIndex];
+			const bool bARedOnly = IsRedOnlyLoopCandidate(A);
+			const bool bBRedOnly = IsRedOnlyLoopCandidate(B);
 			if (A.Priority != B.Priority) { return A.Priority < B.Priority; }
 			if (A.BlackStrokeIds.Num() != B.BlackStrokeIds.Num()) { return A.BlackStrokeIds.Num() < B.BlackStrokeIds.Num(); }
+			if (bARedOnly && bBRedOnly)
+			{
+				if (FMath::Abs(A.LoopArea - B.LoopArea) > 1.0) { return A.LoopArea > B.LoopArea; }
+				if (A.SyntheticStrokeIds.Num() != B.SyntheticStrokeIds.Num()) { return A.SyntheticStrokeIds.Num() < B.SyntheticStrokeIds.Num(); }
+				if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
+			}
 			if (A.EdgeCount != B.EdgeCount) { return A.EdgeCount < B.EdgeCount; }
 			if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
 			if (A.AnchorStrokeId != B.AnchorStrokeId) { return A.AnchorStrokeId < B.AnchorStrokeId; }
 			return FCString::Strcmp(*A.Key, *B.Key) < 0;
 		});
 
-		TSet<int32> ConsumedRedStrokes;
+		TMap<int32, int32> ConsumedRedStrokeOwner;
 		for (int32 CandidateIndex : Order)
 		{
 			FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			if (IsBorrowedLoopCandidate(Candidate) && Candidate.LoopBboxArea < CapBorrowedLoopMinBboxArea)
+			{
+				Candidate.RejectReason = FString::Printf(TEXT("loop bbox area %.3f below %.3f"), Candidate.LoopBboxArea, CapBorrowedLoopMinBboxArea);
+				continue;
+			}
+
 			int32 ConflictingRed = -1;
+			int32 ConflictingOwner = -1;
 			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
 			{
-				if (ConsumedRedStrokes.Contains(RedStrokeId))
+				if (const int32* Owner = ConsumedRedStrokeOwner.Find(RedStrokeId))
 				{
 					ConflictingRed = RedStrokeId;
+					ConflictingOwner = *Owner;
 					break;
 				}
 			}
 			if (ConflictingRed >= 0)
 			{
-				Candidate.RejectReason = FString::Printf(TEXT("red stroke %d already selected by a stronger loop"), ConflictingRed);
+				Candidate.RejectReason = FString::Printf(TEXT("red stroke %d already selected by candidate %d"), ConflictingRed, ConflictingOwner);
 				continue;
 			}
 
@@ -4336,7 +4393,7 @@ namespace FromLZImageOps
 			OutSelectedIndices.Add(CandidateIndex);
 			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
 			{
-				ConsumedRedStrokes.Add(RedStrokeId);
+				ConsumedRedStrokeOwner.Add(RedStrokeId, CandidateIndex);
 			}
 		}
 	}
@@ -4384,6 +4441,8 @@ namespace FromLZImageOps
 			Json += FString::Printf(TEXT("    \"selected\": %s,\n"), C.bSelected ? TEXT("true") : TEXT("false"));
 			Json += FString::Printf(TEXT("    \"reason\": \"%s\",\n"), *JsonEscaped(C.RejectReason));
 			Json += FString::Printf(TEXT("    \"edge_count\": %d,\n"), C.EdgeCount);
+			Json += FString::Printf(TEXT("    \"loop_area\": %.3f,\n"), C.LoopArea);
+			Json += FString::Printf(TEXT("    \"loop_bbox_area\": %.3f,\n"), C.LoopBboxArea);
 			Json += FString::Printf(TEXT("    \"used_black\": %s,\n"), C.BlackStrokeIds.Num() > 0 ? TEXT("true") : TEXT("false"));
 			AppendIntArrayJson(Json, TEXT("stroke_ids"), C.StrokeIds, true);
 			AppendIntArrayJson(Json, TEXT("red_stroke_ids"), C.RedStrokeIds, true);

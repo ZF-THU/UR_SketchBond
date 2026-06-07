@@ -49,6 +49,7 @@ namespace
 	constexpr double Step11BooleanBoundsExpandCm = 1.0;
 	const FColor ReconstructedDebugBlue(0, 120, 255, 255);
 	static FString GActiveUndoPressId;
+	static TArray<FString> GActiveStep11PressStack;
 
 	struct FFaceInfo
 	{
@@ -3091,11 +3092,98 @@ namespace
 		return Name.IsEmpty() ? TEXT("Mesh") : Name;
 	}
 
-	static FName Step11PressTag(const FString& PressId)
+	static FName Step11GeneratedByPressTag(const FString& PressId)
 	{
-		return FName(*FString::Printf(TEXT("FromLZ_Press_%s"), *PressId));
+		return FName(*FString::Printf(TEXT("FromLZ_GeneratedBy_%s"), *PressId));
 	}
 
+	static FName Step11HiddenByPressTag(const FString& PressId)
+	{
+		return FName(*FString::Printf(TEXT("FromLZ_HiddenBy_%s"), *PressId));
+	}
+
+	static bool ComponentHasAnyStep11HiddenByTag(const UActorComponent* Component)
+	{
+		if (!Component)
+		{
+			return false;
+		}
+
+		static const FString HiddenByPrefix(TEXT("FromLZ_HiddenBy_Press_"));
+		for (const FName& Tag : Component->ComponentTags)
+		{
+			if (Tag.ToString().StartsWith(HiddenByPrefix, ESearchCase::CaseSensitive))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static bool ComponentHasActiveStep11GeneratedByTag(const UActorComponent* Component)
+	{
+		if (!Component)
+		{
+			return false;
+		}
+
+		for (const FString& PressId : GActiveStep11PressStack)
+		{
+			if (Component->ComponentTags.Contains(Step11GeneratedByPressTag(PressId)))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static void RefreshActiveUndoPressId()
+	{
+		GActiveUndoPressId = GActiveStep11PressStack.Num() > 0 ? GActiveStep11PressStack.Last() : FString();
+	}
+
+	static void RegisterActiveStep11Press(const FString& PressId)
+	{
+		if (PressId.IsEmpty())
+		{
+			return;
+		}
+
+		GActiveStep11PressStack.Remove(PressId);
+		GActiveStep11PressStack.Add(PressId);
+		RefreshActiveUndoPressId();
+	}
+
+	static FString PopActiveStep11Press()
+	{
+		if (GActiveStep11PressStack.Num() == 0)
+		{
+			RefreshActiveUndoPressId();
+			return FString();
+		}
+
+		const FString PressId = GActiveStep11PressStack.Last();
+		GActiveStep11PressStack.RemoveAt(GActiveStep11PressStack.Num() - 1);
+		RefreshActiveUndoPressId();
+		return PressId;
+	}
+
+	static bool ActorHasActiveStep11GeneratedByTag(const AActor* Actor)
+	{
+		if (!Actor)
+		{
+			return false;
+		}
+
+		for (const FString& PressId : GActiveStep11PressStack)
+		{
+			if (Actor->ActorHasTag(Step11GeneratedByPressTag(PressId)))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
 	static bool ActorHasAnyStep11RuntimeTag(const AActor* Actor)
 	{
 		return Actor && (
@@ -3958,18 +4046,33 @@ namespace
 			Actual.EndsWith(Expected, ESearchCase::CaseSensitive);
 	}
 
-	static int32 ScoreActorMaterialIdComponent(UPrimitiveComponent* Component, const FActorMaterialIdEntry& Entry)
+	static bool IsActorAllowedAsAttachMaterialSource(const AActor* Actor)
 	{
-		if (!Component)
+		if (!Actor || Actor->IsHidden() || Actor->ActorHasTag(ReconstructedFaceTag) || ActorIsStep11Cutter(Actor))
+		{
+			return false;
+		}
+
+		if (!ActorHasAnyStep11RuntimeTag(Actor))
+		{
+			return true;
+		}
+
+		const bool bAllowedRuntimeSource =
+			Actor->ActorHasTag(Step11ActionAttachTag) ||
+			Actor->ActorHasTag(Step11BooleanResultTag);
+		return bAllowedRuntimeSource && ActorHasActiveStep11GeneratedByTag(Actor);
+	}
+
+	static int32 ScoreActorMaterialIdComponent(UPrimitiveComponent* Component, const FActorMaterialIdEntry& Entry, const UPrimitiveComponent* SelfComponent)
+	{
+		if (!Component || Component == SelfComponent || !Component->IsRegistered() || !Component->IsVisible())
 		{
 			return -1;
 		}
 
 		AActor* Owner = Component->GetOwner();
-		if (!Owner ||
-			Owner->ActorHasTag(ReconstructedFaceTag) ||
-			Owner->ActorHasTag(ReconstructedSolidTag) ||
-			ActorHasAnyStep11RuntimeTag(Owner))
+		if (!IsActorAllowedAsAttachMaterialSource(Owner))
 		{
 			return -1;
 		}
@@ -4018,8 +4121,7 @@ namespace
 		}
 		return Score;
 	}
-
-	static UPrimitiveComponent* FindActorMaterialIdComponent(UWorld* World, const FActorMaterialIdEntry& Entry)
+	static UPrimitiveComponent* FindActorMaterialIdComponent(UWorld* World, const FActorMaterialIdEntry& Entry, const UPrimitiveComponent* SelfComponent)
 	{
 		if (!World)
 		{
@@ -4040,7 +4142,7 @@ namespace
 			Actor->GetComponents<UPrimitiveComponent>(Components);
 			for (UPrimitiveComponent* Component : Components)
 			{
-				const int32 Score = ScoreActorMaterialIdComponent(Component, Entry);
+				const int32 Score = ScoreActorMaterialIdComponent(Component, Entry, SelfComponent);
 				if (Score > BestScore)
 				{
 					BestComponent = Component;
@@ -4058,7 +4160,8 @@ namespace
 
 	static UMaterialInterface* ResolveAttachMaterialFromIdSelection(
 		UWorld* World,
-		const FReconstructedMesh& MeshData)
+		const FReconstructedMesh& MeshData,
+		const UPrimitiveComponent* SelfComponent)
 	{
 		const FAttachMaterialIdSelection& Selection = MeshData.AttachMaterialId;
 		if (!Selection.bLookupAttempted)
@@ -4077,13 +4180,29 @@ namespace
 			return nullptr;
 		}
 
-		UPrimitiveComponent* SourceComponent = FindActorMaterialIdComponent(World, Selection.Entry);
+		UPrimitiveComponent* SourceComponent = FindActorMaterialIdComponent(World, Selection.Entry, SelfComponent);
 		if (!SourceComponent)
 		{
+			if (!Selection.Entry.MaterialPath.IsEmpty())
+			{
+				if (UMaterialInterface* MaterialFromPath = LoadObject<UMaterialInterface>(nullptr, *Selection.Entry.MaterialPath))
+				{
+					UE_LOG(
+						LogTemp,
+						Log,
+						TEXT("Step10Diag: attach material inherited from id buffer material_path=%s after source component was unavailable; source_actor=%s source_component=%s attach_actor=%s."),
+						*Selection.Entry.MaterialPath,
+						*Selection.Entry.ActorName,
+						*Selection.Entry.ComponentName,
+						*MeshData.ActorName);
+					return MaterialFromPath;
+				}
+			}
+
 			UE_LOG(
 				LogTemp,
 				Warning,
-				TEXT("Step10Diag: attach material id matched actor=%s component=%s slot=%d, but source component was not found; fallback to vertex color attach_actor=%s."),
+				TEXT("Step10Diag: attach material id matched actor=%s component=%s slot=%d, but source component was not found and material_path could not be loaded; fallback to vertex color attach_actor=%s."),
 				*Selection.Entry.ActorName,
 				*Selection.Entry.ComponentName,
 				Selection.Entry.MaterialSlot,
@@ -4138,7 +4257,7 @@ namespace
 
 		if (MeshData.AttachMaterialId.bLookupAttempted)
 		{
-			return ResolveAttachMaterialFromIdSelection(World, MeshData);
+			return ResolveAttachMaterialFromIdSelection(World, MeshData, SelfComponent);
 		}
 
 		TArray<FVector> ProbePoints = MeshData.SourceMaterialProbePointsWorld;
@@ -4181,9 +4300,7 @@ namespace
 		for (TActorIterator<AActor> It(World); It; ++It)
 		{
 			AActor* Actor = *It;
-			if (!Actor || Actor->IsHidden() ||
-				Actor->ActorHasTag(ReconstructedFaceTag) ||
-				ActorHasAnyStep11RuntimeTag(Actor))
+			if (!IsActorAllowedAsAttachMaterialSource(Actor))
 			{
 				continue;
 			}
@@ -4756,7 +4873,8 @@ namespace
 	static UProceduralMeshComponent* CreateBooleanResultComponent(
 		AActor* Owner,
 		UStaticMeshComponent* SourceComponent,
-		const UE::Geometry::FDynamicMesh3& Mesh)
+		const UE::Geometry::FDynamicMesh3& Mesh,
+		const FString& PressId = FString())
 	{
 		if (!Owner || !SourceComponent)
 		{
@@ -4788,6 +4906,10 @@ namespace
 		}
 
 		ResultComponent->ComponentTags.AddUnique(Step11BooleanResultTag);
+		if (!PressId.IsEmpty())
+		{
+			ResultComponent->ComponentTags.AddUnique(Step11GeneratedByPressTag(PressId));
+		}
 		ResultComponent->SetMobility(EComponentMobility::Movable);
 		ResultComponent->SetCollisionEnabled(SourceComponent->GetCollisionEnabled());
 		ResultComponent->bUseAsyncCooking = false;
@@ -4851,7 +4973,7 @@ namespace
 		}
 
 		ResultActor->Tags.AddUnique(Step11BooleanResultTag);
-		ResultActor->Tags.AddUnique(Step11PressTag(PressId));
+		ResultActor->Tags.AddUnique(Step11GeneratedByPressTag(PressId));
 #if WITH_EDITOR
 		ResultActor->SetActorLabel(BaseName);
 #endif
@@ -4864,7 +4986,7 @@ namespace
 		}
 
 		MeshComponent->ComponentTags.AddUnique(Step11BooleanResultTag);
-		MeshComponent->ComponentTags.AddUnique(Step11PressTag(PressId));
+		MeshComponent->ComponentTags.AddUnique(Step11GeneratedByPressTag(PressId));
 		MeshComponent->SetMobility(EComponentMobility::Movable);
 		MeshComponent->SetCollisionEnabled(SourceComponent->GetCollisionEnabled());
 		MeshComponent->bUseAsyncCooking = false;
@@ -4912,7 +5034,7 @@ namespace
 			return;
 		}
 		Component->ComponentTags.AddUnique(Step11HiddenSourceTag);
-		Component->ComponentTags.AddUnique(Step11PressTag(PressId));
+		Component->ComponentTags.AddUnique(Step11HiddenByPressTag(PressId));
 		Component->SetVisibility(false, true);
 		Component->SetHiddenInGame(true, true);
 	}
@@ -4930,18 +5052,22 @@ namespace
 			return;
 		}
 
-		const FName PressTag = Step11PressTag(PressId);
+		const FName GeneratedByTag = Step11GeneratedByPressTag(PressId);
+		const FName HiddenByTag = Step11HiddenByPressTag(PressId);
 		const FString UndoDiagnosticPath = FPaths::ProjectSavedDir() / TEXT("2DDebug") / PressId / TEXT("11_undo_diagnostics.json");
 		TSharedRef<FJsonObject> UndoRoot = MakeShared<FJsonObject>();
-		UndoRoot->SetNumberField(TEXT("diagnostic_version"), 1);
+		UndoRoot->SetNumberField(TEXT("diagnostic_version"), 2);
 		UndoRoot->SetStringField(TEXT("press_id"), PressId);
 		UndoRoot->SetStringField(TEXT("active_undo_press_id"), GActiveUndoPressId);
+		UndoRoot->SetStringField(TEXT("generated_by_tag"), GeneratedByTag.ToString());
+		UndoRoot->SetStringField(TEXT("hidden_by_tag"), HiddenByTag.ToString());
 
 		TArray<AActor*> ActorsToDestroy;
 		TArray<UProceduralMeshComponent*> GeneratedComponents;
 		TArray<UPrimitiveComponent*> HiddenSourceComponents;
-		int32 SkippedOtherPressActorCount = 0;
-		int32 SkippedOtherPressComponentCount = 0;
+		int32 SkippedOtherGeneratedActorCount = 0;
+		int32 SkippedOtherGeneratedComponentCount = 0;
+		int32 SkippedOtherHiddenSourceComponentCount = 0;
 		for (TActorIterator<AActor> It(World); It; ++It)
 		{
 			AActor* Actor = *It;
@@ -4950,18 +5076,15 @@ namespace
 				continue;
 			}
 
-			const bool bCurrentPressActor = Actor->ActorHasTag(PressTag);
-			if (bCurrentPressActor && (
-				Actor->ActorHasTag(Step11BooleanResultTag) ||
-				Actor->ActorHasTag(Step11ActionAttachTag) ||
-				Actor->ActorHasTag(Step11ActionExcavateCutterTag)))
+			const bool bCurrentGeneratedActor = Actor->ActorHasTag(GeneratedByTag);
+			if (bCurrentGeneratedActor && ActorHasAnyStep11RuntimeTag(Actor))
 			{
 				ActorsToDestroy.Add(Actor);
 				continue;
 			}
-			if (!bCurrentPressActor && ActorHasAnyStep11RuntimeTag(Actor))
+			if (!bCurrentGeneratedActor && ActorHasAnyStep11RuntimeTag(Actor))
 			{
-				++SkippedOtherPressActorCount;
+				++SkippedOtherGeneratedActorCount;
 			}
 
 			TArray<UProceduralMeshComponent*> ProceduralComponents;
@@ -4970,13 +5093,15 @@ namespace
 			{
 				if (Component &&
 					Component->ComponentTags.Contains(Step11BooleanResultTag) &&
-					Component->ComponentTags.Contains(PressTag))
+					Component->ComponentTags.Contains(GeneratedByTag))
 				{
 					GeneratedComponents.Add(Component);
 				}
-				else if (Component && Component->ComponentTags.Contains(Step11BooleanResultTag))
+				else if (Component &&
+					Component->ComponentTags.Contains(Step11BooleanResultTag) &&
+					!Component->ComponentTags.Contains(HiddenByTag))
 				{
-					++SkippedOtherPressComponentCount;
+					++SkippedOtherGeneratedComponentCount;
 				}
 			}
 
@@ -4986,13 +5111,13 @@ namespace
 			{
 				if (Component &&
 					Component->ComponentTags.Contains(Step11HiddenSourceTag) &&
-					Component->ComponentTags.Contains(PressTag))
+					Component->ComponentTags.Contains(HiddenByTag))
 				{
 					HiddenSourceComponents.Add(Component);
 				}
 				else if (Component && Component->ComponentTags.Contains(Step11HiddenSourceTag))
 				{
-					++SkippedOtherPressComponentCount;
+					++SkippedOtherHiddenSourceComponentCount;
 				}
 			}
 		}
@@ -5015,28 +5140,35 @@ namespace
 		{
 			if (Component)
 			{
-				Component->SetVisibility(true, true);
-				Component->SetHiddenInGame(false, true);
-				Component->ComponentTags.Remove(Step11HiddenSourceTag);
-				Component->ComponentTags.Remove(PressTag);
+				Component->ComponentTags.Remove(HiddenByTag);
+				if (!ComponentHasAnyStep11HiddenByTag(Component))
+				{
+					Component->SetVisibility(true, true);
+					Component->SetHiddenInGame(false, true);
+					Component->ComponentTags.Remove(Step11HiddenSourceTag);
+				}
 			}
 		}
 		UndoRoot->SetNumberField(TEXT("destroyed_actor_count"), ActorsToDestroy.Num());
 		UndoRoot->SetNumberField(TEXT("destroyed_boolean_component_count"), GeneratedComponents.Num());
 		UndoRoot->SetNumberField(TEXT("restored_hidden_source_count"), HiddenSourceComponents.Num());
-		UndoRoot->SetNumberField(TEXT("skipped_other_press_actor_count"), SkippedOtherPressActorCount);
-		UndoRoot->SetNumberField(TEXT("skipped_other_press_component_count"), SkippedOtherPressComponentCount);
+		UndoRoot->SetNumberField(TEXT("skipped_other_press_actor_count"), SkippedOtherGeneratedActorCount);
+		UndoRoot->SetNumberField(TEXT("skipped_other_press_component_count"), SkippedOtherGeneratedComponentCount + SkippedOtherHiddenSourceComponentCount);
+		UndoRoot->SetNumberField(TEXT("skipped_other_generated_actor_count"), SkippedOtherGeneratedActorCount);
+		UndoRoot->SetNumberField(TEXT("skipped_other_generated_component_count"), SkippedOtherGeneratedComponentCount);
+		UndoRoot->SetNumberField(TEXT("skipped_other_hidden_source_component_count"), SkippedOtherHiddenSourceComponentCount);
 		SaveJsonObject(UndoRoot, UndoDiagnosticPath);
 		UE_LOG(
 			LogTemp,
 			Log,
-			TEXT("Step11: press-scoped restore press=%s restored %d hidden source component(s), removed %d boolean result component(s), destroyed %d current press actor(s), skipped_other_press_actors=%d skipped_other_press_components=%d."),
+			TEXT("Step11: press-scoped restore press=%s restored %d hidden-by source component(s), removed %d generated boolean result component(s), destroyed %d generated runtime actor(s), skipped_other_generated_actors=%d skipped_other_generated_components=%d skipped_other_hidden_sources=%d."),
 			*PressId,
 			HiddenSourceComponents.Num(),
 			GeneratedComponents.Num(),
 			ActorsToDestroy.Num(),
-			SkippedOtherPressActorCount,
-			SkippedOtherPressComponentCount);
+			SkippedOtherGeneratedActorCount,
+			SkippedOtherGeneratedComponentCount,
+			SkippedOtherHiddenSourceComponentCount);
 	}
 
 	static void ApplyStep11BooleanOperations(
@@ -5159,11 +5291,21 @@ namespace
 				{
 					continue;
 				}
-				if (Component->ComponentTags.Contains(Step11BooleanResultTag) ||
-					Actor->ActorHasTag(Step11ActionAttachTag))
+
+				const bool bBooleanResultComponent = Component->ComponentTags.Contains(Step11BooleanResultTag);
+				const bool bAttachProceduralComponent =
+					Actor->ActorHasTag(Step11ActionAttachTag) ||
+					Component->ComponentTags.Contains(Step11ActionAttachTag);
+				if (!bBooleanResultComponent && !bAttachProceduralComponent)
 				{
-					ProceduralTargetComponents.Add(Component);
+					continue;
 				}
+				if (!ActorHasActiveStep11GeneratedByTag(Actor) && !ComponentHasActiveStep11GeneratedByTag(Component))
+				{
+					continue;
+				}
+
+				ProceduralTargetComponents.Add(Component);
 			}
 		}
 
@@ -5739,8 +5881,20 @@ namespace
 				return;
 			}
 
-			GActiveUndoPressId = PressId;
-			const FName PressTag = Step11PressTag(PressId);
+			bool bHasRuntimeMesh = false;
+			for (const FReconstructedMesh& MeshData : Meshes)
+			{
+				if (MeshData.VerticesWorld.Num() >= 3 && MeshData.Triangles.Num() >= 3)
+				{
+					bHasRuntimeMesh = true;
+					break;
+				}
+			}
+			if (bHasRuntimeMesh)
+			{
+				RegisterActiveStep11Press(PressId);
+			}
+			const FName GeneratedByTag = Step11GeneratedByPressTag(PressId);
 			TSet<FString> AcceptedCutterActorNames;
 			const FString Step11DiagnosticJsonPath = DebugObjPath.IsEmpty()
 				? FString()
@@ -5772,7 +5926,7 @@ namespace
 				}
 
 				Actor->Tags.AddUnique(MeshData.Tag);
-				Actor->Tags.AddUnique(PressTag);
+				Actor->Tags.AddUnique(GeneratedByTag);
 				Actor->Tags.AddUnique(MeshData.bIsExcavateCutter ? Step11ActionExcavateCutterTag : Step11ActionAttachTag);
 #if WITH_EDITOR
 				Actor->SetActorLabel(MeshData.ActorName);
@@ -5783,7 +5937,7 @@ namespace
 				MeshComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 				MeshComponent->bUseAsyncCooking = false;
 				MeshComponent->SetCastShadow(false);
-				MeshComponent->ComponentTags.AddUnique(PressTag);
+				MeshComponent->ComponentTags.AddUnique(GeneratedByTag);
 				MeshComponent->ComponentTags.AddUnique(MeshData.bIsExcavateCutter ? Step11ActionExcavateCutterTag : Step11ActionAttachTag);
 				Actor->SetRootComponent(MeshComponent);
 				Actor->AddInstanceComponent(MeshComponent);
@@ -6017,6 +6171,29 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: processed %d component(s) for %s."), ComponentNames.Num(), *PressDir);
 }
 
+bool FFromLZFaceReconstructor::IsStep11RuntimeActor(const AActor* Actor)
+{
+	return ActorHasAnyStep11RuntimeTag(Actor);
+}
+
+bool FFromLZFaceReconstructor::IsStep11RuntimeActorActiveForCapture(const AActor* Actor)
+{
+	if (!Actor)
+	{
+		return false;
+	}
+
+	if (Actor->ActorHasTag(Step11ActionExcavateCutterTag))
+	{
+		return false;
+	}
+
+	const bool bCaptureRuntimeActor =
+		Actor->ActorHasTag(Step11ActionAttachTag) ||
+		Actor->ActorHasTag(Step11BooleanResultTag);
+	return bCaptureRuntimeActor && ActorHasActiveStep11GeneratedByTag(Actor);
+}
+
 void FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans(TWeakObjectPtr<UWorld> World)
 {
 	AsyncTask(ENamedThreads::GameThread, [World]()
@@ -6028,6 +6205,13 @@ void FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans(TWeakObjectPtr<UWorl
 			return;
 		}
 
-		RestoreStep11BooleanResults(WorldPtr, GActiveUndoPressId);
+		const FString PressId = PopActiveStep11Press();
+		if (PressId.IsEmpty())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Step11: no active press id; skipped restore."));
+			return;
+		}
+
+		RestoreStep11BooleanResults(WorldPtr, PressId);
 	});
 }

@@ -167,15 +167,17 @@ namespace FromLZImageOps
 
 	// Step 9: detect every red cap loop in one pipeline run and recover its extrusion.
 	// Real red/black polyline intersections are planarized into shared endpoints first.
-	// The planarized red strokes then form an exact-coordinate topology; only red nodes with
-	// degree 1 search their outward 180-degree half-plane for the nearest black polyline
-	// segment within ConnectorTol. The black stroke is split at the projection and an explicit
-	// red connector is added. Degree-2 loop/chain nodes, branches, and red interior vertices
-	// never initiate this search.
-	// Components are red-driven: red-only loops are
-	// selected first, remaining red candidates trace through all black strokes only to close
-	// their own endpoints, and a final fallback may combine remaining red strokes through the
-	// same all-black endpoint graph. Black strokes never define the initial component split.
+	// The planarized red strokes then form an exact-coordinate topology. Red degree-1
+	// nodes first search their outward 180-degree half-plane for red stroke/endpoint
+	// targets within ConnectorTol and add explicit red connectors. Remaining red
+	// dead ends then search black segments within ConnectorTol, splitting the black
+	// stroke at the projection and adding an explicit red connector. Degree-2
+	// loop/chain nodes, branches, and red interior vertices never initiate this search.
+	// Components are red-driven: red-only loops are selected first, then local black
+	// closures, then fallback red/black traces. Conflicting red-only loops prefer the
+	// larger cap area; local_black and fallback_trace keep the conservative ordering
+	// but reject loops whose bbox area is below 1500 px^2 before consuming red strokes.
+	// Black strokes never define the initial component split.
 	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
 	// an Action.json is written to ActionPressDir/Component_%%/: local green stroke pixels are
 	// accumulated inside/outside the cap loop; inside > outside -> "excavate", outside > inside
