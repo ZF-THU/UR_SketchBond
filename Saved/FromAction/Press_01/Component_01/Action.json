@@ -1,12 +1,12 @@
 {
   "action": "attach",
   "has_interior_green": false,
-  "local_green_count": 9,
-  "inside_green_total": 10.000,
-  "outside_green_total": 80.113,
-  "boundary_green_total": 10.000,
+  "local_green_count": 7,
+  "inside_green_total": 4.000,
+  "outside_green_total": 530.426,
+  "boundary_green_total": 2.000,
   "decision_reason": "outside_greater_than_inside",
-  "interior_green_stroke_id": 59,
-  "interior_green_inside_length": 7.000,
+  "interior_green_stroke_id": 137,
+  "interior_green_inside_length": 3.000,
   "interior_green_min_inside_length": 10.000
 }

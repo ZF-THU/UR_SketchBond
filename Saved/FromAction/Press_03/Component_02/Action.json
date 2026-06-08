@@ -1,0 +1,12 @@
+{
+  "action": "excavate",
+  "has_interior_green": true,
+  "local_green_count": 3,
+  "inside_green_total": 117.468,
+  "outside_green_total": 11.414,
+  "boundary_green_total": 9.414,
+  "decision_reason": "inside_greater_than_outside",
+  "interior_green_stroke_id": 11,
+  "interior_green_inside_length": 105.640,
+  "interior_green_min_inside_length": 10.000
+}

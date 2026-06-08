@@ -1,0 +1,14 @@
+{
+  "nodes": [
+    {"id": 0, "pos": [1742.50, 224.50]},
+    {"id": 1, "pos": [1469.50, 301.50]},
+    {"id": 2, "pos": [1469.00, 540.50]},
+    {"id": 3, "pos": [1737.50, 441.50]}
+  ],
+  "edges": [
+    {"stroke_id": 15, "u": 0, "v": 1, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 23, "u": 1, "v": 2, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 30, "u": 3, "v": 2, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 9, "u": 0, "v": 3, "color": "red", "synthetic": false, "kept": true}
+  ]
+}

@@ -1,13 +1,13 @@
 {
   "press": "Press_01",
-  "processed_at": "20260607_122821",
+  "processed_at": "20260607_234832",
   "has_capture": true,
-  "capture_stem": "FromLZ_20260607_122521",
-  "capture_png": "FromLZCaptures/FromLZ_20260607_122521.png",
-  "capture_json": "FromLZCaptures/FromLZ_20260607_122521.json",
-  "faces_png": "FromLZCaptures/FromLZ_20260607_122521_faces.png",
-  "faces_json": "FromLZCaptures/FromLZ_20260607_122521_faces.json",
-  "actor_material_png": "FromLZCaptures/FromLZ_20260607_122521_actor_material_id.png",
-  "actor_material_json": "FromLZCaptures/FromLZ_20260607_122521_actor_material_id.json",
+  "capture_stem": "FromLZ_20260607_234510",
+  "capture_png": "FromLZCaptures/FromLZ_20260607_234510.png",
+  "capture_json": "FromLZCaptures/FromLZ_20260607_234510.json",
+  "faces_png": "FromLZCaptures/FromLZ_20260607_234510_faces.png",
+  "faces_json": "FromLZCaptures/FromLZ_20260607_234510_faces.json",
+  "actor_material_png": "FromLZCaptures/FromLZ_20260607_234510_actor_material_id.png",
+  "actor_material_json": "FromLZCaptures/FromLZ_20260607_234510_actor_material_id.json",
   "sketch_png": "FromSketch/Sketch_01.png"
 }

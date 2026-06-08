@@ -1,0 +1,27 @@
+{
+  "nodes": [
+    {"id": 0, "pos": [1129.50, 430.00]},
+    {"id": 1, "pos": [1018.00, 582.00]},
+    {"id": 2, "pos": [1020.00, 587.00]},
+    {"id": 3, "pos": [1182.00, 623.00]},
+    {"id": 4, "pos": [1184.00, 637.00]},
+    {"id": 5, "pos": [1180.00, 643.00]},
+    {"id": 6, "pos": [1167.50, 645.00]},
+    {"id": 7, "pos": [636.00, 834.00]},
+    {"id": 8, "pos": [631.00, 829.00]},
+    {"id": 9, "pos": [629.00, 752.00]},
+    {"id": 10, "pos": [610.00, 565.00]}
+  ],
+  "edges": [
+    {"stroke_id": 27, "u": 0, "v": 1, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 52, "u": 2, "v": 3, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 53, "u": 3, "v": 4, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 54, "u": 4, "v": 5, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 55, "u": 5, "v": 6, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 80, "u": 6, "v": 7, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 81, "u": 7, "v": 8, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 82, "u": 8, "v": 9, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 41, "u": 10, "v": 9, "color": "red", "synthetic": false, "kept": true},
+    {"stroke_id": 26, "u": 0, "v": 10, "color": "red", "synthetic": false, "kept": true}
+  ]
+}
