@@ -1607,9 +1607,17 @@ static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<A
 		return;
 	}
 
+	const UCameraComponent* Camera = FFromLZCaptureUtils::FindFromLZCamera(Pawn);
+	const bool bHasCaptureCamera = IsValid(Camera);
+	const FVector CameraLocation = bHasCaptureCamera ? Camera->GetComponentLocation() : FVector::ZeroVector;
+
 	int32 CubeSubjectCount = 0;
 	int32 PlaneSubjectCount = 0;
 	int32 Step11RuntimeSubjectCount = 0;
+	int32 BboxAtOrBelowCameraKeptCount = 0;
+	int32 BboxAboveOutsideXYKeptCount = 0;
+	int32 BboxAboveInsideXYExcludedCount = 0;
+	int32 BboxCameraUnavailableKeptCount = 0;
 	const FString CubeSubjectPrefix(TEXT("Cube"));
 	const FString PlaneSubjectToken(TEXT("Plane"));
 	for (TActorIterator<AActor> It(World); It; ++It)
@@ -1626,6 +1634,40 @@ static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<A
 		const bool bActiveStep11RuntimeSubject = FFromLZFaceReconstructor::IsStep11RuntimeActorActiveForCapture(Actor);
 		if (bCubeSubject || bPlaneSubject || bActiveStep11RuntimeSubject)
 		{
+			if (bHasCaptureCamera)
+			{
+				FVector BoundsOrigin;
+				FVector BoundsExtent;
+				Actor->GetActorBounds(false, BoundsOrigin, BoundsExtent);
+				const FVector BoundsMin = BoundsOrigin - BoundsExtent;
+				const FVector BoundsMax = BoundsOrigin + BoundsExtent;
+				const bool bEntireActorAboveCamera = BoundsMin.Z > CameraLocation.Z;
+				const bool bCameraInsideBoundsXY =
+					CameraLocation.X >= BoundsMin.X &&
+					CameraLocation.X <= BoundsMax.X &&
+					CameraLocation.Y >= BoundsMin.Y &&
+					CameraLocation.Y <= BoundsMax.Y;
+
+				if (bEntireActorAboveCamera && bCameraInsideBoundsXY)
+				{
+					++BboxAboveInsideXYExcludedCount;
+					continue;
+				}
+
+				if (bEntireActorAboveCamera)
+				{
+					++BboxAboveOutsideXYKeptCount;
+				}
+				else
+				{
+					++BboxAtOrBelowCameraKeptCount;
+				}
+			}
+			else
+			{
+				++BboxCameraUnavailableKeptCount;
+			}
+
 			OutActors.Add(Actor);
 			if (bCubeSubject)
 			{
@@ -1644,7 +1686,15 @@ static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<A
 
 	if (OutActors.Num() > 0)
 	{
-		OutMode = FString::Printf(TEXT("base_scene_or_active_step11_runtime(cube=%d,plane=%d,step11=%d)"), CubeSubjectCount, PlaneSubjectCount, Step11RuntimeSubjectCount);
+		OutMode = FString::Printf(
+			TEXT("base_scene_or_active_step11_runtime(cube=%d,plane=%d,step11=%d,bbox_at_or_below_kept=%d,bbox_above_outside_xy_kept=%d,bbox_above_inside_xy_excluded=%d,bbox_camera_unavailable_kept=%d)"),
+			CubeSubjectCount,
+			PlaneSubjectCount,
+			Step11RuntimeSubjectCount,
+			BboxAtOrBelowCameraKeptCount,
+			BboxAboveOutsideXYKeptCount,
+			BboxAboveInsideXYExcludedCount,
+			BboxCameraUnavailableKeptCount);
 	}
 }
 
