@@ -1,171 +1,30 @@
 {
 	"component": "Component_01",
-	"action": "attach",
-	"polygon_key": "cap_polygon_translated",
-	"success": true,
-	"error": "",
-	"actor_name": "FromLZ_ReconstructedFace_Press_01_Component_01",
-	"cap_width": 2576,
-	"cap_height": 1724,
-	"faces_width": 2576,
-	"faces_height": 1724,
-	"cap_mask_pixels": 44723,
-	"min_overlap_pixels": 2237,
+	"action": "",
+	"polygon_key": "",
+	"success": false,
+	"error": "Failed to decode faces png: ../../../../UE_Proj/Test_0609/Saved/FromLZCaptures/FromLZ_20260610_211310_debug_depth_lap_faces.png",
+	"actor_name": "",
+	"cap_width": 0,
+	"cap_height": 0,
+	"faces_width": 0,
+	"faces_height": 0,
+	"cap_mask_pixels": 0,
+	"min_overlap_pixels": 0,
 	"green_line_vector_2d": [
-		0.0059522755062573762,
-		0.99998228505123921
+		0,
+		0
 	],
-	"green_line_vectors_2d": [
-		[
-			0.0059522755062573762,
-			0.99998228505123921
-		]
-	],
+	"green_line_vectors_2d": [],
 	"normal_parallel_threshold_degrees": 30,
 	"preferred_normal_angle_threshold_degrees": 10,
-	"selected_face_id": 0,
+	"selected_face_id": -1,
 	"selected_plane_hit_3d": [
-		400.75459641186643,
-		-365.3370828763409,
-		-0.26160099673512605
+		0,
+		0,
+		0
 	],
-	"candidates": [
-		{
-			"face_id": 0,
-			"overlap_pixels": 44420,
-			"overlap_ratio": 0.99322496254723525,
-			"mask_centroid_2d": [
-				547.56796488068437,
-				1197.9203737055379
-			],
-			"has_plane_hit": true,
-			"plane_hit_3d": [
-				400.75459641186643,
-				-365.3370828763409,
-				-0.26160099673512605
-			],
-			"distance_to_camera": 1708.3447577678892,
-			"has_projected_normal": true,
-			"projected_normal_2d": [
-				-0.00064349025535487281,
-				0.9999997929601242
-			],
-			"normal_green_angle_degrees": 0.37791155719181363,
-			"normal_parallel_pass": true
-		}
-	],
-	"mesh_vertices_world": [
-		[
-			-1762.54,
-			-1148.7059999999999,
-			-3.1389999999999998
-		],
-		[
-			413.17200000000003,
-			-1876.482,
-			-1.7250000000000001
-		],
-		[
-			2156.5790000000002,
-			3375.6439999999998,
-			5.1100000000000003
-		],
-		[
-			1183.212,
-			3701.2350000000001,
-			4.4770000000000003
-		],
-		[
-			1184.9280000000001,
-			1709.796,
-			2.5329999999999999
-		],
-		[
-			598.98900000000003,
-			-52.555,
-			0.23899999999999999
-		],
-		[
-			-599.58600000000001,
-			-49.082000000000001,
-			-0.92900000000000005
-		],
-		[
-			-602.06799999999998,
-			2347.29,
-			1.4099999999999999
-		],
-		[
-			-1056.5409999999999,
-			978.15999999999997,
-			-0.372
-		],
-		[
-			-1055.1479999999999,
-			114.143,
-			-1.214
-		],
-		[
-			-1110.8130000000001,
-			-47.896000000000001,
-			-1.427
-		],
-		[
-			-1396.586,
-			-46.247999999999998,
-			-1.7050000000000001
-		]
-	],
-	"mesh_triangles": [
-		[
-			11,
-			0,
-			1
-		],
-		[
-			2,
-			3,
-			4
-		],
-		[
-			1,
-			2,
-			4
-		],
-		[
-			1,
-			4,
-			5
-		],
-		[
-			1,
-			5,
-			6
-		],
-		[
-			6,
-			7,
-			8
-		],
-		[
-			6,
-			8,
-			9
-		],
-		[
-			1,
-			6,
-			9
-		],
-		[
-			1,
-			9,
-			10
-		],
-		[
-			1,
-			10,
-			11
-		]
-	]
+	"candidates": [],
+	"mesh_vertices_world": [],
+	"mesh_triangles": []
 }

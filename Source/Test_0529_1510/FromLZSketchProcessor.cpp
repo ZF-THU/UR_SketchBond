@@ -183,6 +183,11 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 		if (bHasCapture)
 		{
 			FString CaptureStem = FPaths::GetBaseFilename(CapturePng); // FromLZ_<timestamp>
+			// Defense in depth: strip companion-output suffixes if one ever leaks past FindLatestPng.
+			if (CaptureStem.EndsWith(TEXT("_faces_debug")))
+			{
+				CaptureStem.LeftChopInline(12);
+			}
 			if (CaptureStem.EndsWith(TEXT("_faces")))
 			{
 				CaptureStem.LeftChopInline(6);
@@ -281,6 +286,11 @@ FString FFromLZSketchProcessor::FindLatestPng(const FString& Directory, bool bEx
 	{
 		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_faces")))
 		{
+			continue;
+		}
+		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_faces_debug")))
+		{
+			// Companion debug image written after _faces.png; never an input.
 			continue;
 		}
 		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_actor_material_id")))

@@ -51,4 +51,7 @@ public:
 
 	// Synchronous entry point (runs on the calling thread). Returns true on success.
 	static bool ProcessComposite(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, TWeakObjectPtr<UWorld> World);
+
+private:
+	static bool ProcessCompositeWithGeneration(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, int32 SessionGeneration, TWeakObjectPtr<UWorld> World);
 };

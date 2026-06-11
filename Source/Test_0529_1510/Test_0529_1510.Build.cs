@@ -11,7 +11,7 @@ public class Test_0529_1510 : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "Json", "JsonUtilities", "ImageWrapper", "RenderCore", "ProceduralMeshComponent", "GeometryCore" });
 
-		PrivateDependencyModuleNames.AddRange(new string[] {  });
+		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 
 		string ManifoldPath = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "..", "ThirdParty", "Manifold", "manifold"));
 		PublicIncludePaths.Add(Path.Combine(ManifoldPath, "include"));

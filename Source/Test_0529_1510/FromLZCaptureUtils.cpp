@@ -1,6 +1,7 @@
 #include "FromLZCaptureUtils.h"
 
 #include "FromLZFaceReconstructor.h"
+#include "FromLZSketchBoard.h"
 
 #include "Camera/CameraComponent.h"
 #include "Camera/PlayerCameraManager.h"
@@ -483,6 +484,95 @@ namespace FromLZFaces
 	}
 }
 
+// 5x7 bitmap font for digits 0-9. Each row's bits 4..0 = columns left..right.
+static const uint8 DigitGlyph5x7[10][7] = {
+	{ 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E }, // 0
+	{ 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E }, // 1
+	{ 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F }, // 2
+	{ 0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E }, // 3
+	{ 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 }, // 4
+	{ 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E }, // 5
+	{ 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E }, // 6
+	{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 }, // 7
+	{ 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E }, // 8
+	{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C }, // 9
+};
+
+static void DrawDigitGlyph(TArray<FColor>& Buf, int32 W, int32 H, int32 X, int32 Y, int32 Scale, int32 Digit, FColor TextColor)
+{
+	if (Digit < 0 || Digit > 9 || Scale <= 0) { return; }
+	for (int32 row = 0; row < 7; ++row)
+	{
+		const uint8 RowBits = DigitGlyph5x7[Digit][row];
+		for (int32 col = 0; col < 5; ++col)
+		{
+			if (((RowBits >> (4 - col)) & 1) == 0) { continue; }
+			for (int32 dy = 0; dy < Scale; ++dy)
+			{
+				const int32 Py = Y + row * Scale + dy;
+				if (Py < 0 || Py >= H) { continue; }
+				for (int32 dx = 0; dx < Scale; ++dx)
+				{
+					const int32 Px = X + col * Scale + dx;
+					if (Px < 0 || Px >= W) { continue; }
+					Buf[Py * W + Px] = TextColor;
+				}
+			}
+		}
+	}
+}
+
+// Draw an integer label centered at (CenterX, CenterY) into Buf with a filled background
+// rectangle so the digits stay readable on top of dimmed face colors.
+static void DrawIntegerLabel(TArray<FColor>& Buf, int32 W, int32 H, int32 CenterX, int32 CenterY, int32 Scale, int32 Value, FColor TextColor, FColor BgColor)
+{
+	if (Scale <= 0) { return; }
+	int32 DigitsBuf[10];
+	int32 NumDigits = 0;
+	int32 V = Value < 0 ? 0 : Value;
+	if (V == 0)
+	{
+		DigitsBuf[NumDigits++] = 0;
+	}
+	else
+	{
+		int32 Tmp[10];
+		int32 N = 0;
+		while (V > 0 && N < 10) { Tmp[N++] = V % 10; V /= 10; }
+		for (int32 k = N - 1; k >= 0; --k) { DigitsBuf[NumDigits++] = Tmp[k]; }
+	}
+
+	const int32 GlyphW = 5;
+	const int32 GlyphH = 7;
+	const int32 Spacing = 1;
+	const int32 TotalW = NumDigits * GlyphW * Scale + (NumDigits > 0 ? (NumDigits - 1) * Spacing * Scale : 0);
+	const int32 TotalH = GlyphH * Scale;
+	const int32 Pad = Scale;
+	int32 X0 = CenterX - TotalW / 2;
+	int32 Y0 = CenterY - TotalH / 2;
+	X0 = FMath::Clamp(X0, Pad, FMath::Max(Pad, W - TotalW - Pad));
+	Y0 = FMath::Clamp(Y0, Pad, FMath::Max(Pad, H - TotalH - Pad));
+
+	for (int32 dy = -Pad; dy < TotalH + Pad; ++dy)
+	{
+		const int32 Py = Y0 + dy;
+		if (Py < 0 || Py >= H) { continue; }
+		for (int32 dx = -Pad; dx < TotalW + Pad; ++dx)
+		{
+			const int32 Px = X0 + dx;
+			if (Px < 0 || Px >= W) { continue; }
+			Buf[Py * W + Px] = BgColor;
+		}
+	}
+
+	int32 Cursor = X0;
+	for (int32 k = 0; k < NumDigits; ++k)
+	{
+		DrawDigitGlyph(Buf, W, H, Cursor, Y0, Scale, DigitsBuf[k], TextColor);
+		Cursor += (GlyphW + Spacing) * Scale;
+	}
+}
+
 // Segments the captured depth/normal buffers into planar faces, derives each face's
 // corner key points (2D), unprojects them to 3D world coordinates, and writes a
 // color-coded faces PNG plus a faces JSON. Reuses the already-read-back buffers.
@@ -802,6 +892,83 @@ static bool SaveNormalFaces(
 		bSavedPng = FFileHelper::SaveArrayToFile(TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())), *FacesPngPath);
 	}
 	const bool bSavedJson = FFileHelper::SaveStringToFile(Json, *FacesJsonPath);
+
+	// === Debug companion: dimmed face colors + decimal face_id text label per region. ===
+	// Helps disambiguate palette hue-bucket collisions (faces 0..4 are all reds, 5..9 oranges, etc.)
+	// from real flood-fill merges (a single label sprawling across multiple physical surfaces).
+	{
+		TArray<FColor> OutDebug;
+		OutDebug.SetNumUninitialized(NumPx);
+		for (int32 i = 0; i < NumPx; ++i)
+		{
+			const FColor& C = Out[i];
+			OutDebug[i] = FColor(
+				static_cast<uint8>(static_cast<int32>(C.R) * 6 / 10 + 102),
+				static_cast<uint8>(static_cast<int32>(C.G) * 6 / 10 + 102),
+				static_cast<uint8>(static_cast<int32>(C.B) * 6 / 10 + 102),
+				255);
+		}
+
+		// For each face find the in-region pixel closest to its 2D centroid; this is the
+		// label anchor (avoids placing digits outside concave regions like L-shapes).
+		TArray<FVector2D> Centroids2D;
+		Centroids2D.SetNum(NumFaces);
+		TArray<int32> LabelAnchorIdx;
+		LabelAnchorIdx.SetNum(NumFaces);
+		TArray<double> BestAnchorDistSq;
+		BestAnchorDistSq.SetNum(NumFaces);
+		for (int32 f = 0; f < NumFaces; ++f)
+		{
+			const double Inv = Cnt[f] > 0 ? 1.0 / static_cast<double>(Cnt[f]) : 0.0;
+			Centroids2D[f] = SumPx[f] * Inv;
+			LabelAnchorIdx[f] = FirstPixel[f];
+			BestAnchorDistSq[f] = TNumericLimits<double>::Max();
+		}
+		for (int32 i = 0; i < NumPx; ++i)
+		{
+			const int32 fl = FaceLabel[i];
+			if (fl < 0) { continue; }
+			const int32 px = i % W;
+			const int32 py = i / W;
+			const double dx = static_cast<double>(px) - Centroids2D[fl].X;
+			const double dy = static_cast<double>(py) - Centroids2D[fl].Y;
+			const double D = dx * dx + dy * dy;
+			if (D < BestAnchorDistSq[fl]) { BestAnchorDistSq[fl] = D; LabelAnchorIdx[fl] = i; }
+		}
+
+		const int32 LabelScale = 3;
+		const FColor LabelTextColor(0, 0, 0, 255);
+		const FColor LabelBgColor(255, 255, 255, 255);
+		for (int32 f = 0; f < NumFaces; ++f)
+		{
+			const int32 Idx = LabelAnchorIdx[f];
+			if (Idx < 0) { continue; }
+			const int32 cx = Idx % W;
+			const int32 cy = Idx / W;
+			DrawIntegerLabel(OutDebug, W, H, cx, cy, LabelScale, f, LabelTextColor, LabelBgColor);
+		}
+
+		TSharedPtr<IImageWrapper> IWDebug = IWM.CreateImageWrapper(EImageFormat::PNG);
+		if (IWDebug.IsValid())
+		{
+			IWDebug->SetRaw(OutDebug.GetData(), OutDebug.Num() * sizeof(FColor), W, H, ERGBFormat::BGRA, 8);
+			const TArray64<uint8>& DebugCompressed = IWDebug->GetCompressed();
+			FString DebugPngPath = FacesPngPath;
+			DebugPngPath.RemoveFromEnd(TEXT(".png"));
+			DebugPngPath += TEXT("_debug.png");
+			const bool bSavedDebug = FFileHelper::SaveArrayToFile(
+				TArrayView<const uint8>(DebugCompressed.GetData(), static_cast<int32>(DebugCompressed.Num())),
+				*DebugPngPath);
+			if (bSavedDebug)
+			{
+				UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: saved face-id debug png -> %s"), *DebugPngPath);
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: failed to save face-id debug png to %s"), *DebugPngPath);
+			}
+		}
+	}
 
 	if (bSavedPng && bSavedJson)
 	{
@@ -2177,7 +2344,20 @@ static bool CaptureLineArtPng(
 	USceneCaptureComponent2D* SCC = NewObject<USceneCaptureComponent2D>(const_cast<APawn*>(Pawn), NAME_None, RF_Transient);
 	SCC->bCaptureEveryFrame = false;
 	SCC->bCaptureOnMovement = false;
-	SCC->bAlwaysPersistRenderingState = true;
+	// Do NOT persist TAA / temporal history across the two CaptureScene() calls
+	// below (depth then normal). Otherwise the normal pass blends with the depth
+	// pass's stale history and smears silhouettes of newly added foreground
+	// geometry over 2-3 pixels, diluting the 3x3 Sobel/Laplacian response below
+	// the edge thresholds.
+	SCC->bAlwaysPersistRenderingState = false;
+	// Disable engine-level smoothing so SCS_SceneDepth and SCS_Normal readbacks
+	// stay pixel-sharp at silhouettes. Without these, UE5's default scene capture
+	// pipeline runs TAA / temporal upsampling and edge AA, widening 1-pixel depth
+	// and normal discontinuities into 2-3 pixel ramps that the 3x3 edge kernels
+	// in this function cannot recover.
+	SCC->ShowFlags.SetTemporalAA(false);
+	SCC->ShowFlags.SetAntiAliasing(false);
+	SCC->ShowFlags.SetMotionBlur(false);
 	SCC->SetWorldTransform(CaptureView.Transform);
 	if (!ConfigureSceneCaptureFromCaptureView(SCC, CaptureView))
 	{
@@ -2241,8 +2421,8 @@ static bool CaptureLineArtPng(
 		const int32 H = Size.Y;
 
 		// Tunable edge-detection thresholds.
-		const float DepthRelThreshold = 0.03f; // relative depth gradient (gradient / depth)
-		const float NormalThreshold = 0.6f;    // normal gradient magnitude
+		const float DepthRelThreshold = 0.0015f; // relative depth gradient (gradient / depth)
+		const float NormalThreshold = 0.3f;    // normal gradient magnitude
 
 		auto SampleDepth = [&](int32 x, int32 y) -> float
 		{
@@ -2307,6 +2487,130 @@ static bool CaptureLineArtPng(
 				TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())),
 				*OutputPath
 			);
+		}
+
+		// Debug visualisations of the raw G-buffer reads. These let us inspect
+		// directly whether silhouettes are pixel-sharp or smeared by engine AA.
+		//   _debug_depth.png  : grayscale, linearly normalised over finite depth.
+		//   _debug_normal.png : world-space normal encoded as RGB = N*0.5 + 0.5.
+		//   _debug_depth_lap.png : magnitude of the slant-invariant 2nd derivative
+		//                        used by the line-art (red = above DepthRelThreshold).
+		//   _debug_normal_grad.png : Sobel magnitude of the normal field used by
+		//                        the line-art (red = above NormalThreshold).
+		{
+			const FString DebugBase = FPaths::Combine(FPaths::GetPath(OutputPath), FPaths::GetBaseFilename(OutputPath));
+			const int32 Num = W * H;
+
+			// --- Depth visualisation (auto-ranged grayscale) ---
+			{
+				float MinD = TNumericLimits<float>::Max();
+				float MaxD = -TNumericLimits<float>::Max();
+				for (int32 i = 0; i < Num; ++i)
+				{
+					const float D = Depth[i];
+					if (FMath::IsFinite(D) && D > 0.f)
+					{
+						MinD = FMath::Min(MinD, D);
+						MaxD = FMath::Max(MaxD, D);
+					}
+				}
+				if (!(MaxD > MinD))
+				{
+					MinD = 0.f;
+					MaxD = FMath::Max(MaxD, 1.f);
+				}
+				const float InvRange = 1.f / FMath::Max(MaxD - MinD, KINDA_SMALL_NUMBER);
+				TArray<FColor> DepthVis;
+				DepthVis.SetNumUninitialized(Num);
+				for (int32 i = 0; i < Num; ++i)
+				{
+					const float D = Depth[i];
+					float T = 0.f;
+					if (FMath::IsFinite(D) && D > 0.f)
+					{
+						T = FMath::Clamp((D - MinD) * InvRange, 0.f, 1.f);
+					}
+					const uint8 G = static_cast<uint8>(FMath::RoundToInt(T * 255.f));
+					DepthVis[i] = FColor(G, G, G, 255);
+				}
+				SaveFColorPng(DepthVis, W, H, DebugBase + TEXT("_debug_depth.png"), TEXT("debug depth"));
+				UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: depth viz range [%.2f, %.2f] -> %s_debug_depth.png"), MinD, MaxD, *DebugBase);
+			}
+
+			// --- Normal visualisation (RGB = N*0.5 + 0.5) ---
+			{
+				TArray<FColor> NormalVis;
+				NormalVis.SetNumUninitialized(Num);
+				for (int32 i = 0; i < Num; ++i)
+				{
+					FVector3f Nn = Normal[i];
+					if (!Nn.IsNearlyZero())
+					{
+						Nn = Nn.GetSafeNormal();
+					}
+					const int32 R = FMath::Clamp(FMath::RoundToInt((Nn.X * 0.5f + 0.5f) * 255.f), 0, 255);
+					const int32 G = FMath::Clamp(FMath::RoundToInt((Nn.Y * 0.5f + 0.5f) * 255.f), 0, 255);
+					const int32 B = FMath::Clamp(FMath::RoundToInt((Nn.Z * 0.5f + 0.5f) * 255.f), 0, 255);
+					NormalVis[i] = FColor(static_cast<uint8>(R), static_cast<uint8>(G), static_cast<uint8>(B), 255);
+				}
+				SaveFColorPng(NormalVis, W, H, DebugBase + TEXT("_debug_normal.png"), TEXT("debug normal"));
+			}
+
+			// --- Depth-Laplacian magnitude (relative) -------------------------
+			// Same operator as the line-art branch above; values >= threshold are
+			// painted red so the firing locus is obvious.
+			{
+				TArray<FColor> LapVis;
+				LapVis.SetNumUninitialized(Num);
+				for (int32 y = 0; y < H; ++y)
+				{
+					for (int32 x = 0; x < W; ++x)
+					{
+						const float Dc = SampleDepth(x, y);
+						const float DevX = FMath::Abs(2.f * Dc - SampleDepth(x - 1, y) - SampleDepth(x + 1, y));
+						const float DevY = FMath::Abs(2.f * Dc - SampleDepth(x, y - 1) - SampleDepth(x, y + 1));
+						const float DevD1 = FMath::Abs(2.f * Dc - SampleDepth(x - 1, y - 1) - SampleDepth(x + 1, y + 1));
+						const float DevD2 = FMath::Abs(2.f * Dc - SampleDepth(x + 1, y - 1) - SampleDepth(x - 1, y + 1));
+						const float Rel = FMath::Max(FMath::Max(DevX, DevY), FMath::Max(DevD1, DevD2)) / FMath::Max(Dc, 1.f);
+						// Visualise on a logarithmic-ish ramp so subthreshold structure is visible.
+						const float Vis = FMath::Clamp(Rel / FMath::Max(DepthRelThreshold * 2.f, KINDA_SMALL_NUMBER), 0.f, 1.f);
+						const uint8 G = static_cast<uint8>(FMath::RoundToInt(Vis * 255.f));
+						LapVis[y * W + x] = (Rel > DepthRelThreshold)
+							? FColor(255, 0, 0, 255)
+							: FColor(G, G, G, 255);
+					}
+				}
+				SaveFColorPng(LapVis, W, H, DebugBase + TEXT("_debug_depth_lap.png"), TEXT("debug depth laplacian"));
+			}
+
+			// --- Normal-gradient (Sobel) magnitude ---------------------------
+			{
+				TArray<FColor> GradVis;
+				GradVis.SetNumUninitialized(Num);
+				for (int32 y = 0; y < H; ++y)
+				{
+					for (int32 x = 0; x < W; ++x)
+					{
+						const FVector3f N00 = SampleNormal(x - 1, y - 1);
+						const FVector3f N10 = SampleNormal(x, y - 1);
+						const FVector3f N20 = SampleNormal(x + 1, y - 1);
+						const FVector3f N01 = SampleNormal(x - 1, y);
+						const FVector3f N21 = SampleNormal(x + 1, y);
+						const FVector3f N02 = SampleNormal(x - 1, y + 1);
+						const FVector3f N12 = SampleNormal(x, y + 1);
+						const FVector3f N22 = SampleNormal(x + 1, y + 1);
+						const FVector3f Ngx = -N00 - 2.f * N01 - N02 + N20 + 2.f * N21 + N22;
+						const FVector3f Ngy = -N00 - 2.f * N10 - N20 + N02 + 2.f * N12 + N22;
+						const float NormalGrad = FMath::Sqrt(Ngx.SizeSquared() + Ngy.SizeSquared());
+						const float Vis = FMath::Clamp(NormalGrad / FMath::Max(NormalThreshold * 2.f, KINDA_SMALL_NUMBER), 0.f, 1.f);
+						const uint8 G = static_cast<uint8>(FMath::RoundToInt(Vis * 255.f));
+						GradVis[y * W + x] = (NormalGrad > NormalThreshold)
+							? FColor(255, 0, 0, 255)
+							: FColor(G, G, G, 255);
+					}
+				}
+				SaveFColorPng(GradVis, W, H, DebugBase + TEXT("_debug_normal_grad.png"), TEXT("debug normal gradient"));
+			}
 		}
 	}
 	else
@@ -2499,9 +2803,14 @@ static bool CompleteCaptureFromPawn(
 
 	CaptureFromLZCameraDebugPng(Pawn, CameraComponent, CaptureView, OutputPaths.DebugFromLZCameraPngPath);
 
-	if (CaptureLineArtPng(Pawn, CameraComponent, CaptureView, SubjectActors, SubjectMode, OutputPaths.PngPath, OutputPaths.DebugTransformsJsonPath))
+	const bool bLineArtSaved = CaptureLineArtPng(Pawn, CameraComponent, CaptureView, SubjectActors, SubjectMode, OutputPaths.PngPath, OutputPaths.DebugTransformsJsonPath);
+	if (bLineArtSaved)
 	{
 		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ saved json to %s and line-art png to %s"), *OutputPaths.JsonPath, *OutputPaths.PngPath);
+		if (GEngine && GEngine->GameViewport)
+		{
+			FFromLZSketchBoard::ShowForCapture(Pawn->GetWorld(), GEngine->GameViewport, OutputPaths.PngPath);
+		}
 	}
 	else
 	{
@@ -2582,6 +2891,21 @@ bool FFromLZCaptureUtils::BeginCaptureFromWorld(const UWorld* World, FViewport* 
 
 	UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: no player controller with a capturable pawn was found."));
 	return false;
+}
+
+void FFromLZCaptureUtils::CancelPendingCapture()
+{
+	if (!GPendingFromLZCapture)
+	{
+		return;
+	}
+
+	if (GPendingFromLZCapture->ProjectionOverride)
+	{
+		GPendingFromLZCapture->ProjectionOverride->Restore();
+	}
+	GPendingFromLZCapture.Reset();
+	UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: pending capture canceled."));
 }
 
 void FFromLZCaptureUtils::NotifyViewportDrawn(const UWorld* World, FViewport* Viewport)

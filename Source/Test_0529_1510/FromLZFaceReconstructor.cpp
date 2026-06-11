@@ -1,5 +1,6 @@
 #include "FromLZFaceReconstructor.h"
 #include "FromLZManifoldBoolean.h"
+#include "FromLZSessionReset.h"
 
 #include "Algo/Reverse.h"
 #include "Async/Async.h"
@@ -45,6 +46,7 @@ namespace
 	constexpr int32 SolidTargetMaxLoopPoints = 384;
 	constexpr int32 MinSolidDepthSamples = 3;
 	constexpr double ExcavationCutterNormalScale = 1.2;
+	constexpr double ExcavationCutterCapScale = 1.1;
 	constexpr double Step11BooleanMinRenderableEdgeCm = 0.05;
 	constexpr double Step11BooleanBoundsExpandCm = 1.0;
 	const FColor ReconstructedDebugBlue(0, 120, 255, 255);
@@ -1939,6 +1941,26 @@ namespace
 			Sum += P;
 		}
 		return Points.Num() > 0 ? Sum / double(Points.Num()) : FVector::ZeroVector;
+	}
+
+	static void ScaleVerticesPerpendicularToAxis(TArray<FVector>& Vertices, const FVector& Axis, double Scale)
+	{
+		const FVector UnitAxis = Axis.GetSafeNormal();
+		if (Vertices.Num() == 0 || UnitAxis.IsNearlyZero() || !FMath::IsFinite(Scale) || FMath::IsNearlyEqual(Scale, 1.0))
+		{
+			return;
+		}
+
+		const FVector Anchor = AverageVector(Vertices);
+		const double DeltaScale = Scale - 1.0;
+		for (FVector& Vertex : Vertices)
+		{
+			const FVector Offset = Vertex - Anchor;
+			const double ParallelDist = FVector::DotProduct(Offset, UnitAxis);
+			const FVector Parallel = UnitAxis * ParallelDist;
+			const FVector Perp = Offset - Parallel;
+			Vertex = Anchor + Parallel + Perp * (1.0 + DeltaScale);
+		}
 	}
 
 	static void ScaleVerticesAlongAxis(TArray<FVector>& Vertices, const FVector& Axis, double Scale)
@@ -5182,6 +5204,7 @@ namespace
 		DiagnosticsRoot->SetStringField(TEXT("boolean_backend"), FFromLZManifoldBoolean::BackendName());
 		DiagnosticsRoot->SetStringField(TEXT("manifold_library_version"), FFromLZManifoldBoolean::LibraryVersion());
 		DiagnosticsRoot->SetNumberField(TEXT("excavation_cutter_normal_scale"), ExcavationCutterNormalScale);
+		DiagnosticsRoot->SetNumberField(TEXT("excavation_cutter_cap_scale"), ExcavationCutterCapScale);
 		DiagnosticsRoot->SetNumberField(TEXT("min_renderable_edge_cm"), Step11BooleanMinRenderableEdgeCm);
 
 		TArray<TSharedPtr<FJsonValue>> InputMeshDiagnostics;
@@ -5861,10 +5884,17 @@ namespace
 		TWeakObjectPtr<UWorld> WorldPtr,
 		TArray<FReconstructedMesh> Meshes,
 		FString DebugObjPath = FString(),
-		FString PressId = FString())
+		FString PressId = FString(),
+		int32 SessionGeneration = INDEX_NONE)
 	{
-		AsyncTask(ENamedThreads::GameThread, [WorldPtr, Meshes = MoveTemp(Meshes), DebugObjPath = MoveTemp(DebugObjPath), PressId = MoveTemp(PressId)]() mutable
+		AsyncTask(ENamedThreads::GameThread, [WorldPtr, Meshes = MoveTemp(Meshes), DebugObjPath = MoveTemp(DebugObjPath), PressId = MoveTemp(PressId), SessionGeneration]() mutable
 		{
+			if (SessionGeneration != INDEX_NONE && !FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
+			{
+				UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: skipped stale runtime mesh spawn on the game thread for press=%s."), *PressId);
+				return;
+			}
+
 			UWorld* World = WorldPtr.Get();
 			if (!World)
 			{
@@ -5959,19 +5989,84 @@ namespace
 					LocalVertices.Add(V - Origin);
 				}
 
+				// Build flat-shaded geometry: each input triangle is expanded into its
+				// own three vertices carrying that triangle's outward face normal.
+				// We do NOT emit a reversed-winding back triangle here: the solid is
+				// closed (cap + reverse cap + sides) so the interior is never visible
+				// from outside, and emitting back-faces at the same depth as the front
+				// causes z-fighting whenever the assigned material is two-sided
+				// (M_Color_Inst), letting the inward-normal back triangle win and
+				// producing inverted GBuffer normals (e.g. olive -Z on the top cap).
+				//
+				// IMPORTANT WINDING NOTE: BuildSolidMeshTriangles emits triangles such
+				// that Cross(VB-VA, VC-VA) points OUTWARD (top cap = +Z, side wall =
+				// horizontal-outward, source cap = -Z). UE's UProceduralMeshComponent
+				// rasterizer treats CCW-from-camera as FRONT face, which means the
+				// front face actually ends up on the side OPPOSITE to that math cross
+				// direction. Submitting the indices in the original (A,B,C) order
+				// therefore renders the inside-out shell (top cap culled when viewed
+				// from above, sides showing only their interior face). To make the
+				// solid render with its outside visible we submit the REVERSED
+				// winding (A,C,B) but keep the vertex normal pointing along the
+				// original outward cross direction so the GBuffer Normal pass still
+				// encodes the geometric outward direction.
+				//
+				// This replaces the previous shared-vertex + single MeshData.Normal
+				// init pattern, which made every face (cap, reverse cap, sides) share
+				// the cap's OrientedNormal and broke GBuffer Normal output /
+				// _faces.png flood-fill (side walls inherited the cap's Z-up direction).
+				TArray<FVector> ExpandedVertices;
 				TArray<FVector> Normals;
-				Normals.Init(MeshData.Normal.GetSafeNormal(), LocalVertices.Num());
+				TArray<int32> DrawTriangles;
+				const int32 InputTriCount = MeshData.Triangles.Num() / 3;
+				const int32 ExpandedCapacity = InputTriCount * 3;
+				ExpandedVertices.Reserve(ExpandedCapacity);
+				Normals.Reserve(ExpandedCapacity);
+				DrawTriangles.Reserve(ExpandedCapacity);
+
+				const FVector FallbackNormal = MeshData.Normal.GetSafeNormal();
+				for (int32 ti = 0; ti + 2 < MeshData.Triangles.Num(); ti += 3)
+				{
+					const int32 IA = MeshData.Triangles[ti];
+					const int32 IB = MeshData.Triangles[ti + 1];
+					const int32 IC = MeshData.Triangles[ti + 2];
+					if (!LocalVertices.IsValidIndex(IA) ||
+						!LocalVertices.IsValidIndex(IB) ||
+						!LocalVertices.IsValidIndex(IC))
+					{
+						continue;
+					}
+
+					const FVector& VA = LocalVertices[IA];
+					const FVector& VB = LocalVertices[IB];
+					const FVector& VC = LocalVertices[IC];
+
+					FVector FaceNormal = FVector::CrossProduct(VB - VA, VC - VA).GetSafeNormal();
+					if (FaceNormal.IsNearlyZero())
+					{
+						FaceNormal = FallbackNormal;
+					}
+
+					// Emit reversed winding (VA, VC, VB) so UE PMC renders the
+					// outward side; vertex normal still encodes the original
+					// outward cross direction.
+					const int32 BaseFront = ExpandedVertices.Num();
+					ExpandedVertices.Add(VA); Normals.Add(FaceNormal);
+					ExpandedVertices.Add(VC); Normals.Add(FaceNormal);
+					ExpandedVertices.Add(VB); Normals.Add(FaceNormal);
+					DrawTriangles.Add(BaseFront);
+					DrawTriangles.Add(BaseFront + 1);
+					DrawTriangles.Add(BaseFront + 2);
+				}
 
 				TArray<FVector2D> UV0;
-				UV0.Init(FVector2D::ZeroVector, LocalVertices.Num());
+				UV0.Init(FVector2D::ZeroVector, ExpandedVertices.Num());
 
 				TArray<FColor> Colors;
-				Colors.Init(MeshData.Color, LocalVertices.Num());
+				Colors.Init(MeshData.Color, ExpandedVertices.Num());
 
 				TArray<FProcMeshTangent> Tangents;
-				TArray<int32> DrawTriangles;
-				AppendDoubleSidedTriangles(MeshData.Triangles, DrawTriangles);
-				MeshComponent->CreateMeshSection(0, LocalVertices, DrawTriangles, Normals, UV0, Colors, Tangents, false);
+				MeshComponent->CreateMeshSection(0, ExpandedVertices, DrawTriangles, Normals, UV0, Colors, Tangents, false);
 
 				if (MeshData.bIsExcavateCutter && AcceptedCutterActorNames.Contains(MeshData.ActorName))
 				{
@@ -6009,8 +6104,14 @@ namespace
 	}
 }
 
-void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FString& ActionPressDir, TWeakObjectPtr<UWorld> World)
+void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FString& ActionPressDir, TWeakObjectPtr<UWorld> World, int32 SessionGeneration)
 {
+	if (SessionGeneration != INDEX_NONE && !FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
+	{
+		UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: skipped stale press %s because the session generation changed before processing started."), *FPaths::GetCleanFilename(PressDir));
+		return;
+	}
+
 	const FString PressId = FPaths::GetCleanFilename(PressDir);
 	TArray<FString> ComponentNames;
 	IFileManager::Get().IterateDirectory(*PressDir, [&ComponentNames](const TCHAR* InPath, bool bIsDir) -> bool
@@ -6029,7 +6130,7 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 
 	if (ComponentNames.Num() == 0)
 	{
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: no component folders found in %s"), *PressDir);
 		return;
 	}
@@ -6038,19 +6139,19 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (!LoadCaptureRef(PressDir, Inputs))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, TEXT("Failed to read capture_ref.json or resolve capture/faces paths"));
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		return;
 	}
 	if (!DecodePngToRGBA(Inputs.FacesPngPath, Inputs.FacesRGBA, Inputs.FacesWidth, Inputs.FacesHeight))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to decode faces png: %s"), *Inputs.FacesPngPath));
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		return;
 	}
 	if (!LoadFacesJson(Inputs.FacesJsonPath, Inputs.Faces, Inputs.FacesProjection))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to read faces json: %s"), *Inputs.FacesJsonPath));
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		return;
 	}
 	if (!Inputs.ActorMaterialPngPath.IsEmpty() && !Inputs.ActorMaterialJsonPath.IsEmpty())
@@ -6086,14 +6187,14 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (!LoadCameraJson(Inputs.CaptureJsonPath, Inputs.Camera, CameraLoadError))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, CameraLoadError);
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		return;
 	}
 	FString ProjectionValidationError;
 	if (!ValidateProjectionMetadata(Inputs, ProjectionValidationError))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, ProjectionValidationError);
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		return;
 	}
 	UE_LOG(
@@ -6112,7 +6213,7 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (!BuildFaceLookups(Inputs, FaceLookupError))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FaceLookupError);
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId);
+		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
 		return;
 	}
 
@@ -6152,13 +6253,20 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 			if (SolidMesh.bIsExcavateCutter)
 			{
 				ScaleVerticesAlongAxis(SolidMesh.VerticesWorld, SolidMesh.Normal, ExcavationCutterNormalScale);
+				ScaleVerticesPerpendicularToAxis(SolidMesh.VerticesWorld, SolidMesh.Normal, ExcavationCutterCapScale);
 			}
 			SolidMesh.Color = SolidMesh.bIsExcavateCutter ? FColor(0, 120, 255, 80) : ReconstructedDebugBlue;
 			MeshesToSpawn.Add(MoveTemp(SolidMesh));
 		}
 	}
 
-	SpawnMeshesOnGameThread(World, MoveTemp(MeshesToSpawn), PressDir / TEXT("10_reconstruction_scene.obj"), PressId);
+	if (SessionGeneration != INDEX_NONE && !FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
+	{
+		UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: skipped stale runtime spawn for press %s because the session generation changed after reconstruction."), *PressId);
+		return;
+	}
+
+	SpawnMeshesOnGameThread(World, MoveTemp(MeshesToSpawn), PressDir / TEXT("10_reconstruction_scene.obj"), PressId, SessionGeneration);
 	UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: processed %d component(s) for %s."), ComponentNames.Num(), *PressDir);
 }
 
@@ -6205,4 +6313,84 @@ void FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans(TWeakObjectPtr<UWorl
 
 		RestoreStep11BooleanResults(WorldPtr, PressId);
 	});
+}
+
+void FFromLZFaceReconstructor::ResetAllRuntimeState(TWeakObjectPtr<UWorld> World)
+{
+	UWorld* WorldPtr = World.Get();
+	if (!WorldPtr)
+	{
+		return;
+	}
+
+	TArray<FString> ActivePresses = GActiveStep11PressStack;
+	for (int32 Index = ActivePresses.Num() - 1; Index >= 0; --Index)
+	{
+		RestoreStep11BooleanResults(WorldPtr, ActivePresses[Index]);
+	}
+
+	TArray<AActor*> RuntimeActorsToDestroy;
+	for (TActorIterator<AActor> It(WorldPtr); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (Actor && ActorHasAnyStep11RuntimeTag(Actor))
+		{
+			RuntimeActorsToDestroy.Add(Actor);
+		}
+	}
+	for (AActor* Actor : RuntimeActorsToDestroy)
+	{
+		if (Actor)
+		{
+			Actor->Destroy();
+		}
+	}
+
+	for (TActorIterator<AActor> It(WorldPtr); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (!Actor)
+		{
+			continue;
+		}
+
+		TArray<UPrimitiveComponent*> PrimitiveComponents;
+		Actor->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+		for (UPrimitiveComponent* Component : PrimitiveComponents)
+		{
+			if (!Component)
+			{
+				continue;
+			}
+			if (Component->ComponentTags.Contains(Step11HiddenSourceTag))
+			{
+				Component->SetVisibility(true, true);
+				Component->SetHiddenInGame(false, true);
+				Component->ComponentTags.Remove(Step11HiddenSourceTag);
+			}
+
+			for (int32 TagIndex = Component->ComponentTags.Num() - 1; TagIndex >= 0; --TagIndex)
+			{
+				const FString TagString = Component->ComponentTags[TagIndex].ToString();
+				if (TagString.StartsWith(TEXT("FromLZ_HiddenBy_Press_"), ESearchCase::CaseSensitive) ||
+					TagString.StartsWith(TEXT("FromLZ_GeneratedBy_Press_"), ESearchCase::CaseSensitive))
+				{
+					Component->ComponentTags.RemoveAt(TagIndex);
+				}
+			}
+		}
+
+		for (int32 TagIndex = Actor->Tags.Num() - 1; TagIndex >= 0; --TagIndex)
+		{
+			const FString TagString = Actor->Tags[TagIndex].ToString();
+			if (TagString.StartsWith(TEXT("FromLZ_GeneratedBy_Press_"), ESearchCase::CaseSensitive))
+			{
+				Actor->Tags.RemoveAt(TagIndex);
+			}
+		}
+	}
+
+	GActiveStep11PressStack.Reset();
+	RefreshActiveUndoPressId();
+	UE_LOG(LogTemp, Log, TEXT("Step11: reset all runtime state."));
 }

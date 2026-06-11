@@ -1,0 +1,15 @@
+{
+	"diagnostic_version": 2,
+	"press_id": "Press_02",
+	"active_undo_press_id": "",
+	"generated_by_tag": "FromLZ_GeneratedBy_Press_02",
+	"hidden_by_tag": "FromLZ_HiddenBy_Press_02",
+	"destroyed_actor_count": 3,
+	"destroyed_boolean_component_count": 0,
+	"restored_hidden_source_count": 1,
+	"skipped_other_press_actor_count": 0,
+	"skipped_other_press_component_count": 0,
+	"skipped_other_generated_actor_count": 0,
+	"skipped_other_generated_component_count": 0,
+	"skipped_other_hidden_source_component_count": 0
+}

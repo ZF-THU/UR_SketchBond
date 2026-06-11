@@ -2,7 +2,9 @@
 
 #include "FromLZCaptureUtils.h"
 #include "FromLZFaceReconstructor.h"
+#include "FromLZSketchBoard.h"
 #include "FromLZSketchProcessor.h"
+#include "FromLZSessionReset.h"
 #include "Engine/GameInstance.h"
 #include "InputCoreTypes.h"
 
@@ -17,6 +19,7 @@ void UFromLZGameViewportClient::Init(FWorldContext& WorldContext, UGameInstance*
 void UFromLZGameViewportClient::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
+	FFromLZSessionReset::Tick(GetWorld());
 	FFromLZCaptureUtils::CompletePendingCapture(GetWorld(), Viewport);
 }
 
@@ -28,9 +31,21 @@ void UFromLZGameViewportClient::Draw(FViewport* InViewport, FCanvas* SceneCanvas
 
 bool UFromLZGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 {
+	if (FFromLZSessionReset::IsResetPending())
+	{
+		return true;
+	}
+
 	if (EventArgs.Event == IE_Pressed)
 	{
-		if (EventArgs.Key == EKeys::Enter)
+		if (EventArgs.Key == EKeys::B)
+		{
+			if (FFromLZSketchBoard::RestoreIfMinimized())
+			{
+				return true;
+			}
+		}
+		else if (EventArgs.Key == EKeys::Enter)
 		{
 			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ invoked from viewport input. Key=%s"), *EventArgs.Key.ToString());
 			FFromLZCaptureUtils::BeginCaptureFromWorld(GetWorld(), Viewport);
@@ -42,8 +57,15 @@ bool UFromLZGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 		}
 		else if (EventArgs.Key == EKeys::SpaceBar)
 		{
-			UE_LOG(LogTemp, Log, TEXT("ProcessSketch invoked from viewport input. Key=%s"), *EventArgs.Key.ToString());
-			FFromLZSketchProcessor::ProcessLatestSketch(GetWorld());
+			if (FFromLZSketchBoard::SaveCurrentSketchAndProceed(GetWorld()))
+			{
+				return true;
+			}
+			else
+			{
+				UE_LOG(LogTemp, Log, TEXT("ProcessSketch invoked from viewport input. Key=%s"), *EventArgs.Key.ToString());
+				FFromLZSketchProcessor::ProcessLatestSketch(GetWorld());
+			}
 		}
 	}
 

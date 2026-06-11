@@ -3,6 +3,8 @@
 #include "Async/Async.h"
 #include "FromLZFaceReconstructor.h"
 #include "FromLZImageOps.h"
+#include "FromLZPressNaming.h"
+#include "FromLZSessionReset.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/DateTime.h"
@@ -18,19 +20,32 @@ void FFromLZSketch2DProcessor::ProcessCompositeAsync(TArray<uint8> RGBA, int32 W
 	const FString DebugDirCopy = DebugDir;
 	const FSketchSourceInfo SourceCopy = Source;
 	const TWeakObjectPtr<UWorld> WorldCopy(World);
+	const int32 SessionGeneration = FFromLZSessionReset::GetSessionGeneration();
 	TArray<uint8> Pixels = MoveTemp(RGBA);
 
-	Async(EAsyncExecution::ThreadPool, [Pixels = MoveTemp(Pixels), Width, Height, DebugDirCopy, SourceCopy, WorldCopy]() mutable
+	FFromLZSessionReset::NotifyCompositeTaskStarted();
+	Async(EAsyncExecution::ThreadPool, [Pixels = MoveTemp(Pixels), Width, Height, DebugDirCopy, SourceCopy, WorldCopy, SessionGeneration]() mutable
 	{
-		FFromLZSketch2DProcessor::ProcessComposite(Pixels, Width, Height, DebugDirCopy, SourceCopy, WorldCopy);
+		FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(Pixels, Width, Height, DebugDirCopy, SourceCopy, SessionGeneration, WorldCopy);
+		FFromLZSessionReset::NotifyCompositeTaskFinished();
 	});
 }
 
 bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, TWeakObjectPtr<UWorld> World)
 {
+	return ProcessCompositeWithGeneration(RGBA, Width, Height, DebugDir, Source, FFromLZSessionReset::GetSessionGeneration(), World);
+}
+
+bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, int32 SessionGeneration, TWeakObjectPtr<UWorld> World)
+{
 	if (Width <= 0 || Height <= 0 || RGBA.Num() < Width * Height * 4)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("Sketch2D: invalid input (%dx%d, %d bytes)"), Width, Height, RGBA.Num());
+		return false;
+	}
+	if (!FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
+	{
+		UE_LOG(LogTemp, Log, TEXT("Sketch2D: skipped stale composite because the session generation changed before processing started."));
 		return false;
 	}
 
@@ -38,20 +53,7 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 
 	// Each pipeline run (one Space press) gets its own Press_## folder. Number continues
 	// from the highest existing Press_* so runs accumulate across restarts.
-	int32 MaxPress = 0;
-	IFileManager::Get().IterateDirectory(*DebugDir, [&MaxPress](const TCHAR* InPath, bool bIsDir) -> bool
-	{
-		if (bIsDir)
-		{
-			const FString Name = FPaths::GetCleanFilename(FString(InPath));
-			if (Name.StartsWith(TEXT("Press_")))
-			{
-				MaxPress = FMath::Max(MaxPress, FCString::Atoi(*Name.RightChop(6)));
-			}
-		}
-		return true;
-	});
-	const FString PressName = FString::Printf(TEXT("Press_%02d"), MaxPress + 1);
+	const FString PressName = FFromLZPressNaming::MakePressName(FFromLZPressNaming::GetNextPressIndex(DebugDir));
 	const FString PressDir = DebugDir / PressName;
 	IFileManager::Get().MakeDirectory(*PressDir, true);
 
@@ -227,7 +229,12 @@ bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32
 		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 50.0f, Width, Height, PressDir, ActionPressDir, Caps);
 
 	// ---- Step 10: per-component action -> face-mask overlap -> runtime face rebuild --
-	FFromLZFaceReconstructor::ProcessPress(PressDir, ActionPressDir, World);
+	if (!FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
+	{
+		UE_LOG(LogTemp, Log, TEXT("Sketch2D: skipped stale Step10/11 reconstruction because the session generation changed during processing."));
+		return false;
+	}
+	FFromLZFaceReconstructor::ProcessPress(PressDir, ActionPressDir, World, SessionGeneration);
 
 	const double Elapsed = FPlatformTime::Seconds() - StartTime;
 	UE_LOG(LogTemp, Log, TEXT("Sketch2D: steps 1-10 done in %.3fs (%dx%d): %d merged strokes; %d cap component(s) -> %s"),

@@ -2,6 +2,8 @@
 
 #include "Test_0529_1510.h"
 
+#include "FromLZSessionReset.h"
+
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
@@ -45,6 +47,13 @@ public:
 		{
 			FM.MakeDirectory(*(SavedDir / Sub), /*Tree*/ true);
 		}
+
+		FFromLZSessionReset::Initialize();
+	}
+
+	virtual void ShutdownModule() override
+	{
+		FFromLZSessionReset::Shutdown();
 	}
 };
 
