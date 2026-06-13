@@ -3135,6 +3135,7 @@ namespace FromLZImageOps
 	static constexpr float CapLoopGraphNodeSnapTol = 5.0f;
 	static constexpr double CapGeometryEpsilon = 1e-6;
 	static constexpr double CapEndpointDirectionArc = 5.0;
+	static constexpr double CapRedOnlyLoopMinBboxArea = 1000.0;
 	static constexpr double CapBorrowedLoopMinBboxArea = 1500.0;
 
 	struct FCapStrokeSplit
@@ -4003,6 +4004,12 @@ namespace FromLZImageOps
 		int32 EdgeCount = 0;
 		double LoopArea = 0.0;
 		double LoopBboxArea = 0.0;
+		double SyntheticMaxLength = 0.0;
+		double BlackTotalLength = 0.0;
+		bool bHasValidLocalGreenAction = false;
+		FString GreenPrefilterReason;
+		TArray<int32> LocalGreenStrokeIds;
+		double GreenBoundaryLength = 0.0;
 		TArray<int32> StrokeIds;
 		TArray<int32> RedStrokeIds;
 		TArray<int32> RealRedStrokeIds;
@@ -4087,6 +4094,8 @@ namespace FromLZImageOps
 		return Poly.Num() >= 4 && PolygonAbsArea(Poly) > 1.0;
 	}
 
+	static double StrokeArcLength(const FColoredStroke& Stroke);
+
 	static bool MakeLoopCandidateFromCycle(
 		const TArray<FColoredStroke>& Strokes,
 		const CapOps::FGraph& G,
@@ -4150,6 +4159,22 @@ namespace FromLZImageOps
 		}
 
 		Out.Result.bUsedBlack = Out.BlackStrokeIds.Num() > 0;
+		for (int32 StrokeId : Out.SyntheticStrokeIds)
+		{
+			if (Strokes.IsValidIndex(StrokeId))
+			{
+				Out.SyntheticMaxLength = FMath::Max(
+					Out.SyntheticMaxLength,
+					StrokeArcLength(Strokes[StrokeId]));
+			}
+		}
+		for (int32 StrokeId : Out.BlackStrokeIds)
+		{
+			if (Strokes.IsValidIndex(StrokeId))
+			{
+				Out.BlackTotalLength += StrokeArcLength(Strokes[StrokeId]);
+			}
+		}
 		BuildPolygon(Strokes.GetData(), G, Cycle, Out.Result.CapPolygon, Out.Result.CapNodes);
 		if (!IsValidLoopPolygon(Out.Result.CapPolygon))
 		{
@@ -4348,15 +4373,20 @@ namespace FromLZImageOps
 			const bool bARedOnly = IsRedOnlyLoopCandidate(A);
 			const bool bBRedOnly = IsRedOnlyLoopCandidate(B);
 			if (A.Priority != B.Priority) { return A.Priority < B.Priority; }
-			if (A.BlackStrokeIds.Num() != B.BlackStrokeIds.Num()) { return A.BlackStrokeIds.Num() < B.BlackStrokeIds.Num(); }
+			if (!FMath::IsNearlyEqual(A.SyntheticMaxLength, B.SyntheticMaxLength, 1e-6))
+			{
+				return A.SyntheticMaxLength < B.SyntheticMaxLength;
+			}
+			if (!FMath::IsNearlyEqual(A.BlackTotalLength, B.BlackTotalLength, 1e-6))
+			{
+				return A.BlackTotalLength < B.BlackTotalLength;
+			}
 			if (bARedOnly && bBRedOnly)
 			{
 				if (FMath::Abs(A.LoopArea - B.LoopArea) > 1.0) { return A.LoopArea > B.LoopArea; }
-				if (A.SyntheticStrokeIds.Num() != B.SyntheticStrokeIds.Num()) { return A.SyntheticStrokeIds.Num() < B.SyntheticStrokeIds.Num(); }
-				if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
 			}
-			if (A.EdgeCount != B.EdgeCount) { return A.EdgeCount < B.EdgeCount; }
 			if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
+			if (A.EdgeCount != B.EdgeCount) { return A.EdgeCount < B.EdgeCount; }
 			if (A.AnchorStrokeId != B.AnchorStrokeId) { return A.AnchorStrokeId < B.AnchorStrokeId; }
 			return FCString::Strcmp(*A.Key, *B.Key) < 0;
 		});
@@ -4365,6 +4395,21 @@ namespace FromLZImageOps
 		for (int32 CandidateIndex : Order)
 		{
 			FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			if (!Candidate.bHasValidLocalGreenAction)
+			{
+				Candidate.RejectReason = Candidate.GreenPrefilterReason.IsEmpty()
+					? TEXT("candidate has no valid local green action")
+					: Candidate.GreenPrefilterReason;
+				continue;
+			}
+			if (IsRedOnlyLoopCandidate(Candidate) && Candidate.LoopBboxArea < CapRedOnlyLoopMinBboxArea)
+			{
+				Candidate.RejectReason = FString::Printf(
+					TEXT("red-only loop bbox area %.3f below %.3f"),
+					Candidate.LoopBboxArea,
+					CapRedOnlyLoopMinBboxArea);
+				continue;
+			}
 			if (IsBorrowedLoopCandidate(Candidate) && Candidate.LoopBboxArea < CapBorrowedLoopMinBboxArea)
 			{
 				Candidate.RejectReason = FString::Printf(TEXT("loop bbox area %.3f below %.3f"), Candidate.LoopBboxArea, CapBorrowedLoopMinBboxArea);
@@ -4443,7 +4488,17 @@ namespace FromLZImageOps
 			Json += FString::Printf(TEXT("    \"edge_count\": %d,\n"), C.EdgeCount);
 			Json += FString::Printf(TEXT("    \"loop_area\": %.3f,\n"), C.LoopArea);
 			Json += FString::Printf(TEXT("    \"loop_bbox_area\": %.3f,\n"), C.LoopBboxArea);
+			Json += FString::Printf(TEXT("    \"synthetic_max_length\": %.3f,\n"), C.SyntheticMaxLength);
+			Json += FString::Printf(TEXT("    \"black_total_length\": %.3f,\n"), C.BlackTotalLength);
+			Json += FString::Printf(TEXT("    \"has_valid_local_green_action\": %s,\n"), C.bHasValidLocalGreenAction ? TEXT("true") : TEXT("false"));
+			Json += FString::Printf(TEXT("    \"green_prefilter_reason\": \"%s\",\n"), *JsonEscaped(C.GreenPrefilterReason));
+			Json += FString::Printf(TEXT("    \"prefiltered_action\": \"%s\",\n"), *JsonEscaped(C.Result.Action));
+			Json += FString::Printf(TEXT("    \"prefiltered_action_reason\": \"%s\",\n"), *JsonEscaped(C.Result.ActionDecisionReason));
+			Json += FString::Printf(TEXT("    \"prefiltered_side_length\": %.3f,\n"), C.Result.SideLength);
+			Json += FString::Printf(TEXT("    \"prefiltered_inside_green_total\": %.3f,\n"), C.Result.GreenInsideTotalLength);
+			Json += FString::Printf(TEXT("    \"prefiltered_outside_green_total\": %.3f,\n"), C.Result.GreenOutsideTotalLength);
 			Json += FString::Printf(TEXT("    \"used_black\": %s,\n"), C.BlackStrokeIds.Num() > 0 ? TEXT("true") : TEXT("false"));
+			AppendIntArrayJson(Json, TEXT("local_green_stroke_ids"), C.LocalGreenStrokeIds, true);
 			AppendIntArrayJson(Json, TEXT("stroke_ids"), C.StrokeIds, true);
 			AppendIntArrayJson(Json, TEXT("red_stroke_ids"), C.RedStrokeIds, true);
 			AppendIntArrayJson(Json, TEXT("real_red_stroke_ids"), C.RealRedStrokeIds, true);
@@ -5116,6 +5171,112 @@ namespace FromLZImageOps
 		for (const FVector2D& P : Out.CapPolygon) { Out.CapPolygonTranslated.Add(P + Out.SideVector); }
 	}
 
+	static void PrefilterLoopCandidateByLocalGreen(
+		FLoopCandidate& Candidate,
+		const TArray<FColoredStroke>& Strokes,
+		const TArray<int32>& AllGreen,
+		double GreenSelectToleranceSquared,
+		int32 Width,
+		int32 Height)
+	{
+		Candidate.bHasValidLocalGreenAction = false;
+		Candidate.GreenPrefilterReason.Reset();
+		Candidate.LocalGreenStrokeIds.Reset();
+		Candidate.GreenBoundaryLength = 0.0;
+
+		TArray<FVector2D> CandidateRedPoints;
+		for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+		{
+			if (Strokes.IsValidIndex(RedStrokeId))
+			{
+				CandidateRedPoints.Append(Strokes[RedStrokeId].Points);
+			}
+		}
+		if (CandidateRedPoints.Num() == 0)
+		{
+			Candidate.GreenPrefilterReason = TEXT("candidate has no real red points for local green discovery");
+			return;
+		}
+
+		for (int32 GreenStrokeId : AllGreen)
+		{
+			if (!Strokes.IsValidIndex(GreenStrokeId))
+			{
+				continue;
+			}
+			const FStroke& GreenPoints = Strokes[GreenStrokeId].Points;
+			if (GreenPoints.Num() == 0)
+			{
+				continue;
+			}
+
+			bool bNear = false;
+			for (const FVector2D& RedPoint : CandidateRedPoints)
+			{
+				if (FVector2D::DistSquared(RedPoint, GreenPoints[0]) <= GreenSelectToleranceSquared ||
+					FVector2D::DistSquared(RedPoint, GreenPoints.Last()) <= GreenSelectToleranceSquared)
+				{
+					bNear = true;
+					break;
+				}
+			}
+			if (bNear)
+			{
+				Candidate.LocalGreenStrokeIds.Add(GreenStrokeId);
+			}
+		}
+
+		if (Candidate.LocalGreenStrokeIds.Num() == 0)
+		{
+			Candidate.GreenPrefilterReason = TEXT("candidate has no local green stroke within the selection tolerance");
+			return;
+		}
+
+		FCapExtrusionResult EvaluatedResult = Candidate.Result;
+		ApplyGreenSideForCap(Strokes, AllGreen, Candidate.LocalGreenStrokeIds, EvaluatedResult);
+		if (EvaluatedResult.SideChainStrokeIds.Num() == 0 ||
+			EvaluatedResult.SideVector.SizeSquared() <= 1e-8)
+		{
+			Candidate.Result = MoveTemp(EvaluatedResult);
+			Candidate.GreenPrefilterReason = TEXT("local green exists but no valid non-zero green chain was traced");
+			return;
+		}
+
+		const FGreenActionStats ActionStats = MeasureLocalGreenAction(
+			EvaluatedResult.CapPolygon,
+			Strokes,
+			Candidate.LocalGreenStrokeIds,
+			Width,
+			Height);
+		EvaluatedResult.Action = ActionStats.Action;
+		EvaluatedResult.ActionDecisionReason = ActionStats.DecisionReason;
+		EvaluatedResult.LocalGreenStrokeCount = ActionStats.LocalGreenCount;
+		EvaluatedResult.GreenInsideTotalLength = ActionStats.InsideLength;
+		EvaluatedResult.GreenOutsideTotalLength = ActionStats.OutsideLength;
+		EvaluatedResult.bHasInteriorGreen = EvaluatedResult.Action == TEXT("excavate");
+		if (ActionStats.bHasBestInterior)
+		{
+			EvaluatedResult.InteriorGreenStrokeId = ActionStats.BestInterior.StrokeId;
+			EvaluatedResult.InteriorGreenInsidePoints = ActionStats.BestInterior.InsidePoints;
+			EvaluatedResult.InteriorGreenTotalPoints = ActionStats.BestInterior.TotalPoints;
+			EvaluatedResult.InteriorGreenInsideRatio = ActionStats.BestInterior.InsideRatio;
+			EvaluatedResult.InteriorGreenInsideLength = ActionStats.BestInterior.InsideLength;
+			EvaluatedResult.InteriorGreenStrokeLength = ActionStats.BestInterior.StrokeLength;
+		}
+
+		Candidate.Result = MoveTemp(EvaluatedResult);
+		Candidate.GreenBoundaryLength = ActionStats.BoundaryLength;
+		Candidate.bHasValidLocalGreenAction =
+			Candidate.Result.Action == TEXT("attach") ||
+			Candidate.Result.Action == TEXT("excavate");
+		Candidate.GreenPrefilterReason = Candidate.bHasValidLocalGreenAction
+			? TEXT("valid_local_green_action")
+			: FString::Printf(
+				TEXT("local green action is not attach/excavate: %s (%s)"),
+				*Candidate.Result.Action,
+				*Candidate.Result.ActionDecisionReason);
+	}
+
 	int32 RecoverCapExtrusionsPerComponent(const TArray<FColoredStroke>& Strokes, float ConnectorTol, float BlackSelectTol, int32 Width, int32 Height, const FString& PressDir, const FString& ActionPressDir, TArray<FCapExtrusionResult>& OutResults)
 	{
 		using namespace CapOps;
@@ -5173,6 +5334,16 @@ namespace FromLZImageOps
 
 		TArray<FLoopCandidate> Candidates;
 		CollectRedFirstLoopCandidates(TraceStrokes, RedIdx, BlackIdx, CapLoopGraphNodeSnapTol, FirstSyntheticStrokeId, Candidates);
+		for (FLoopCandidate& Candidate : Candidates)
+		{
+			PrefilterLoopCandidateByLocalGreen(
+				Candidate,
+				TraceStrokes,
+				GreenIdx,
+				SelTol2,
+				Width,
+				Height);
+		}
 
 		TArray<int32> SelectedCandidateIndices;
 		SelectLoopCandidates(Candidates, SelectedCandidateIndices);
@@ -5207,48 +5378,7 @@ namespace FromLZImageOps
 				SaveGraphJson(TraceStrokes, SelectedGraph, All, CompDir / TEXT("09b_caploop_pruned_graph.json"));
 			}
 
-			// Every local green is an independent discovery seed. Recover its full chain
-			// from both ends, select the longest unique path, then orient that path from
-			// the endpoint nearest the cap toward the endpoint farthest from the cap.
-			TArray<FVector2D> CompRedPts;
-			for (int32 r : Candidate.RealRedStrokeIds) { CompRedPts.Append(TraceStrokes[r].Points); }
-			TArray<int32> LocalGreen;
-			for (int32 g : GreenIdx)
-			{
-				const FStroke& GP = TraceStrokes[g].Points;
-				if (GP.Num() == 0) { continue; }
-				bool bNear = false;
-				for (const FVector2D& RP : CompRedPts)
-				{
-					if (FVector2D::DistSquared(RP, GP[0]) <= SelTol2 || FVector2D::DistSquared(RP, GP.Last()) <= SelTol2)
-					{
-						bNear = true; break;
-					}
-				}
-				if (bNear) { LocalGreen.Add(g); }
-			}
-			ApplyGreenSideForCap(TraceStrokes, GreenIdx, LocalGreen, R);
-
 			SaveCapExtrusionPng(TraceStrokes, R, Width, Height, CompDir / TEXT("09_cap_extrusion.png"));
-
-			// Action test: only this component's local green strokes vote. Green pixels
-			// on the cap boundary count as both inside and outside.
-			const FGreenActionStats ActionStats = MeasureLocalGreenAction(R.CapPolygon, TraceStrokes, LocalGreen, Width, Height);
-			R.Action = ActionStats.Action;
-			R.ActionDecisionReason = ActionStats.DecisionReason;
-			R.LocalGreenStrokeCount = ActionStats.LocalGreenCount;
-			R.GreenInsideTotalLength = ActionStats.InsideLength;
-			R.GreenOutsideTotalLength = ActionStats.OutsideLength;
-			R.bHasInteriorGreen = R.Action == TEXT("excavate");
-			if (ActionStats.bHasBestInterior)
-			{
-				R.InteriorGreenStrokeId = ActionStats.BestInterior.StrokeId;
-				R.InteriorGreenInsidePoints = ActionStats.BestInterior.InsidePoints;
-				R.InteriorGreenTotalPoints = ActionStats.BestInterior.TotalPoints;
-				R.InteriorGreenInsideRatio = ActionStats.BestInterior.InsideRatio;
-				R.InteriorGreenInsideLength = ActionStats.BestInterior.InsideLength;
-				R.InteriorGreenStrokeLength = ActionStats.BestInterior.StrokeLength;
-			}
 			SaveCapExtrusionJson(R, CompDir / TEXT("09_cap_extrusion.json"));
 
 			const FString ActionCompDir = ActionPressDir / FString::Printf(TEXT("Component_%02d"), i + 1);
@@ -5271,7 +5401,7 @@ namespace FromLZImageOps
 				R.LocalGreenStrokeCount,
 				R.GreenInsideTotalLength,
 				R.GreenOutsideTotalLength,
-				ActionStats.BoundaryLength,
+				Candidate.GreenBoundaryLength,
 				*JsonEscaped(R.ActionDecisionReason),
 				R.InteriorGreenStrokeId,
 				R.InteriorGreenInsideLength,

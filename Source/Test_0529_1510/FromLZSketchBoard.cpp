@@ -255,7 +255,7 @@ namespace
 
 		void Stamp(const FIntPoint& P)
 		{
-			const int32 Radius = Tool == ESketchBoardTool::Eraser ? 10 : 3;
+			const int32 Radius = Tool == ESketchBoardTool::Eraser ? 10 : 1;
 			uint8 R = 255;
 			uint8 G = 255;
 			uint8 B = 255;

@@ -86,11 +86,9 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 
 	// ---- Step 1: preprocess -------------------------------------------------
 	// Non-white -> foreground (replaces grayscale+Gaussian+Otsu for the colored composite),
-	// then morphological close + 2x2 dilate, then remove small components (Python preprocess()).
+	// then remove small components without changing the source-stroke topology.
 	TArray<uint8> Bin;
 	FromLZImageOps::BinarizeNonWhite(RGBA, Width, Height, /*WhiteThreshold*/ 240, Bin);
-	FromLZImageOps::MorphClose(Bin, Width, Height, /*Kernel*/ 3, /*Iterations*/ 1);
-	FromLZImageOps::Dilate2x2(Bin, Width, Height, /*Iterations*/ 1);
 	FromLZImageOps::RemoveSmallComponents(Bin, Width, Height, /*MinArea*/ 12);
 
 	// 00_input is the raw composite (saved for reference), 01_binary is the cleaned mask.
@@ -127,7 +125,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	TArray<uint8> SkelConnected, SkelSmallLoopPruned, SkelClean;
 	FromLZImageOps::CleanupSkeletonEndpoints(
 		Skel, Width, Height,
-		/*GapTol*/ 50.0f,
+		/*GapTol*/ 20.0f,
 		/*ConnectThickness*/ 1,
 		/*SmallLoopBboxAreaThresh*/ 1500.0f,
 		/*BranchPruneMaxPixels*/ 0.0f, // 0 -> auto = max(30, 3*GapTol)
@@ -143,7 +141,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 
 	// The color map also keeps RGB strokes from being merged together.
 	const float EndpointTol = 3.0f;
-	const float ColorMinRunArc = 18.0f; // absorb short color "blips" at crossings into neighbors
+	const float ColorMinRunArc = 3.0f; // absorb short color "blips" at crossings into neighbors
 
 	// ---- Step 4: stroke tracing + color classification --------------------
 	// Crossing-number node classification + 8-connected polyline tracing, then
@@ -226,7 +224,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	// topology nodes with degree 1 forward to black polyline segments within 20px.
 	TArray<FromLZImageOps::FCapExtrusionResult> Caps;
 	const int32 NumCaps = FromLZImageOps::RecoverCapExtrusionsPerComponent(
-		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 50.0f, Width, Height, PressDir, ActionPressDir, Caps);
+		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 20.0f, Width, Height, PressDir, ActionPressDir, Caps);
 
 	// ---- Step 10: per-component action -> face-mask overlap -> runtime face rebuild --
 	if (!FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))

@@ -60,10 +60,10 @@ protected:
 	float YawSpeed = 1.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Camera|Rotation")
-	float MinPitch = -85.0f;
+	float MinPitch = -89.0f;
 
 	UPROPERTY(EditAnywhere, Category = "Camera|Rotation")
-	float MaxPitch = -15.0f;
+	float MaxPitch = +89.0f;
 
 	bool bIsPitchLookActive = false;
 };

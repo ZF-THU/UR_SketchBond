@@ -45,6 +45,10 @@ namespace
 	constexpr double SolidRdpTolerancePixels = 1.25;
 	constexpr int32 SolidTargetMaxLoopPoints = 384;
 	constexpr int32 MinSolidDepthSamples = 3;
+	constexpr double CapBBoxRegularizationFillRatio = 0.70;
+	constexpr double CapBBoxDegenerateAreaTolerance = 1e-6;
+	constexpr double FaceBBoxSquareRelativeTolerance = 0.01;
+	constexpr int32 CapBBoxDebugImageSize = 1024;
 	constexpr double ExcavationCutterNormalScale = 1.2;
 	constexpr double ExcavationCutterCapScale = 1.1;
 	constexpr double Step11BooleanMinRenderableEdgeCm = 0.05;
@@ -168,6 +172,45 @@ namespace
 		double ReprojectionErrorPixels = 0.0;
 	};
 
+	struct FCapBBoxRegularizationResult
+	{
+		bool bAttempted = false;
+		bool bApplied = false;
+		bool bFallbackToOriginal = false;
+		int32 SelectedFaceId = -1;
+		FString Action;
+		FString SourcePolygonKey;
+		FString CopiedPolygonKey;
+		FString SelectedGeometry = TEXT("original");
+		FString RejectionReason;
+		double FillRatioThreshold = CapBBoxRegularizationFillRatio;
+		double CapArea = 0.0;
+		double CapBaseBBoxArea = 0.0;
+		double CapBaseBBoxRatio = 0.0;
+		bool bCapBaseBBoxPassed = false;
+		bool bCapMinimumBBoxComputed = false;
+		double CapMinimumBBoxArea = 0.0;
+		double CapMinimumBBoxRatio = 0.0;
+		bool bCapMinimumBBoxPassed = false;
+		FVector FaceOriginWorld = FVector::ZeroVector;
+		FVector FaceNormalWorld = FVector::UpVector;
+		FVector FaceAxisUWorld = FVector::RightVector;
+		FVector FaceAxisVWorld = FVector::ForwardVector;
+		FVector2D OriginalSourceToCopiedDeltaPixels = FVector2D::ZeroVector;
+		TArray<FVector2D> FaceBoundaryUV;
+		TArray<FVector2D> FaceHullUV;
+		TArray<FVector2D> FaceBBoxUV;
+		TArray<FVector2D> OriginalCapUV;
+		TArray<FVector2D> OriginalCapHullUV;
+		TArray<FVector2D> CapBaseBBoxUV;
+		TArray<FVector2D> CapMinimumBBoxUV;
+		TArray<FVector2D> FinalCapUV;
+		TArray<FVector> OriginalCapWorld;
+		TArray<FVector> CapBaseBBoxWorld;
+		TArray<FVector> CapMinimumBBoxWorld;
+		TArray<FVector> FinalCapWorld;
+	};
+
 	struct FSolidReconstructionResult
 	{
 		FString ComponentName;
@@ -218,6 +261,7 @@ namespace
 		TArray<FVector> MeshVerticesWorld;
 		TArray<int32> MeshTriangles;
 		FVector MeshNormal = FVector::UpVector;
+		FCapBBoxRegularizationResult CapBBoxRegularization;
 	};
 
 	struct FComponentResult
@@ -2179,6 +2223,15 @@ namespace
 		SetVectorArrayField(Root, TEXT("copied_loop_world"), Result.CopiedLoopWorld);
 		SetVectorArrayField(Root, TEXT("mesh_vertices_world"), Result.MeshVerticesWorld);
 		SetTriangleArrayField(Root, TEXT("mesh_triangles"), Result.MeshTriangles);
+		Root->SetBoolField(TEXT("cap_bbox_regularization_attempted"), Result.CapBBoxRegularization.bAttempted);
+		Root->SetBoolField(TEXT("cap_bbox_regularization_applied"), Result.CapBBoxRegularization.bApplied);
+		Root->SetBoolField(TEXT("cap_bbox_regularization_fallback_to_original"), Result.CapBBoxRegularization.bFallbackToOriginal);
+		Root->SetStringField(TEXT("cap_bbox_regularization_reason"), Result.CapBBoxRegularization.RejectionReason);
+		Root->SetStringField(TEXT("cap_bbox_selected_geometry"), Result.CapBBoxRegularization.SelectedGeometry);
+		Root->SetNumberField(TEXT("cap_bbox_fill_ratio"), Result.CapBBoxRegularization.CapBaseBBoxRatio);
+		Root->SetNumberField(TEXT("cap_bbox_fill_ratio_threshold"), Result.CapBBoxRegularization.FillRatioThreshold);
+		Root->SetNumberField(TEXT("cap_base_bbox_ratio"), Result.CapBBoxRegularization.CapBaseBBoxRatio);
+		Root->SetNumberField(TEXT("cap_minimum_bbox_ratio"), Result.CapBBoxRegularization.CapMinimumBBoxRatio);
 
 		SaveJsonObject(Root, Path);
 	}
@@ -2215,6 +2268,692 @@ namespace
 		const FVector2D Base = B - Dir * HeadLen;
 		DrawLineRGBA(RGBA, Width, Height, B, Base + Perp * HeadHalf, Color, Radius);
 		DrawLineRGBA(RGBA, Width, Height, B, Base - Perp * HeadHalf, Color, Radius);
+	}
+
+	static bool IsFiniteVector2D(const FVector2D& Value)
+	{
+		return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y);
+	}
+
+	static bool IsFiniteVector(const FVector& Value)
+	{
+		return FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y) && FMath::IsFinite(Value.Z);
+	}
+
+	static double Cross2D(const FVector2D& A, const FVector2D& B, const FVector2D& C)
+	{
+		const FVector2D AB = B - A;
+		const FVector2D AC = C - A;
+		return AB.X * AC.Y - AB.Y * AC.X;
+	}
+
+	static double SignedPolygonAreaForRegularization(const TArray<FVector2D>& Polygon)
+	{
+		if (Polygon.Num() < 3)
+		{
+			return 0.0;
+		}
+
+		double TwiceArea = 0.0;
+		for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+		{
+			const FVector2D& A = Polygon[Index];
+			const FVector2D& B = Polygon[(Index + 1) % Polygon.Num()];
+			TwiceArea += A.X * B.Y - A.Y * B.X;
+		}
+		return 0.5 * TwiceArea;
+	}
+
+	static bool BuildConvexHull2D(const TArray<FVector2D>& Points, TArray<FVector2D>& OutHull)
+	{
+		OutHull.Reset();
+		TArray<FVector2D> Sorted;
+		for (const FVector2D& Point : Points)
+		{
+			if (IsFiniteVector2D(Point))
+			{
+				Sorted.Add(Point);
+			}
+		}
+		Sorted.Sort([](const FVector2D& A, const FVector2D& B)
+		{
+			if (!FMath::IsNearlyEqual(A.X, B.X, 1e-9))
+			{
+				return A.X < B.X;
+			}
+			return A.Y < B.Y;
+		});
+
+		TArray<FVector2D> Unique;
+		for (const FVector2D& Point : Sorted)
+		{
+			if (Unique.Num() == 0 || FVector2D::Distance(Unique.Last(), Point) > 1e-7)
+			{
+				Unique.Add(Point);
+			}
+		}
+		if (Unique.Num() < 3)
+		{
+			return false;
+		}
+
+		TArray<FVector2D> Lower;
+		for (const FVector2D& Point : Unique)
+		{
+			while (Lower.Num() >= 2 && Cross2D(Lower[Lower.Num() - 2], Lower.Last(), Point) <= 1e-9)
+			{
+				Lower.Pop();
+			}
+			Lower.Add(Point);
+		}
+
+		TArray<FVector2D> Upper;
+		for (int32 Index = Unique.Num() - 1; Index >= 0; --Index)
+		{
+			const FVector2D& Point = Unique[Index];
+			while (Upper.Num() >= 2 && Cross2D(Upper[Upper.Num() - 2], Upper.Last(), Point) <= 1e-9)
+			{
+				Upper.Pop();
+			}
+			Upper.Add(Point);
+		}
+
+		Lower.Pop();
+		Upper.Pop();
+		OutHull = MoveTemp(Lower);
+		OutHull.Append(Upper);
+		return OutHull.Num() >= 3 && FMath::Abs(SignedPolygonAreaForRegularization(OutHull)) > CapBBoxDegenerateAreaTolerance;
+	}
+
+	struct FMinimumAreaBBox2D
+	{
+		bool bValid = false;
+		FVector2D AxisX = FVector2D(1.0, 0.0);
+		FVector2D AxisY = FVector2D(0.0, 1.0);
+		double MinX = 0.0;
+		double MaxX = 0.0;
+		double MinY = 0.0;
+		double MaxY = 0.0;
+		double Area = 0.0;
+	};
+
+	static bool ComputeMinimumAreaBBox2D(const TArray<FVector2D>& Hull, FMinimumAreaBBox2D& OutBBox)
+	{
+		OutBBox = FMinimumAreaBBox2D();
+		double BestArea = TNumericLimits<double>::Max();
+		for (int32 Index = 0; Index < Hull.Num(); ++Index)
+		{
+			FVector2D AxisX = Hull[(Index + 1) % Hull.Num()] - Hull[Index];
+			if (!AxisX.Normalize())
+			{
+				continue;
+			}
+			const FVector2D AxisY(-AxisX.Y, AxisX.X);
+			double MinX = TNumericLimits<double>::Max();
+			double MaxX = -TNumericLimits<double>::Max();
+			double MinY = TNumericLimits<double>::Max();
+			double MaxY = -TNumericLimits<double>::Max();
+			for (const FVector2D& Point : Hull)
+			{
+				const double X = FVector2D::DotProduct(Point, AxisX);
+				const double Y = FVector2D::DotProduct(Point, AxisY);
+				MinX = FMath::Min(MinX, X);
+				MaxX = FMath::Max(MaxX, X);
+				MinY = FMath::Min(MinY, Y);
+				MaxY = FMath::Max(MaxY, Y);
+			}
+			const double Area = (MaxX - MinX) * (MaxY - MinY);
+			if (Area < BestArea)
+			{
+				BestArea = Area;
+				OutBBox.bValid = Area > CapBBoxDegenerateAreaTolerance;
+				OutBBox.AxisX = AxisX;
+				OutBBox.AxisY = AxisY;
+				OutBBox.MinX = MinX;
+				OutBBox.MaxX = MaxX;
+				OutBBox.MinY = MinY;
+				OutBBox.MaxY = MaxY;
+				OutBBox.Area = Area;
+			}
+		}
+		return OutBBox.bValid;
+	}
+
+	static bool BuildTemporaryFaceBasis(
+		const FFaceInfo& Face,
+		const FCameraInfo& Camera,
+		FVector& OutNormal,
+		FVector& OutAxisX,
+		FVector& OutAxisY)
+	{
+		OutNormal = Face.Normal.GetSafeNormal();
+		if (OutNormal.IsNearlyZero())
+		{
+			return false;
+		}
+
+		OutAxisX = Camera.Right - OutNormal * FVector::DotProduct(Camera.Right, OutNormal);
+		if (!OutAxisX.Normalize())
+		{
+			const FVector Fallback = FMath::Abs(OutNormal.Z) < 0.9 ? FVector::UpVector : FVector::ForwardVector;
+			OutAxisX = Fallback - OutNormal * FVector::DotProduct(Fallback, OutNormal);
+			if (!OutAxisX.Normalize())
+			{
+				return false;
+			}
+		}
+		OutAxisY = FVector::CrossProduct(OutNormal, OutAxisX).GetSafeNormal();
+		return !OutAxisY.IsNearlyZero();
+	}
+
+	static FVector2D WorldPointToFaceUV(
+		const FVector& Point,
+		const FVector& Origin,
+		const FVector& AxisU,
+		const FVector& AxisV)
+	{
+		const FVector Delta = Point - Origin;
+		return FVector2D(
+			FVector::DotProduct(Delta, AxisU),
+			FVector::DotProduct(Delta, AxisV));
+	}
+
+	static FVector FaceUVToWorld(
+		const FVector2D& UV,
+		const FVector& Origin,
+		const FVector& AxisU,
+		const FVector& AxisV)
+	{
+		return Origin + AxisU * UV.X + AxisV * UV.Y;
+	}
+
+	static void ComputeAxisAlignedBounds(
+		const TArray<FVector2D>& Points,
+		double& OutMinU,
+		double& OutMaxU,
+		double& OutMinV,
+		double& OutMaxV)
+	{
+		OutMinU = TNumericLimits<double>::Max();
+		OutMaxU = -TNumericLimits<double>::Max();
+		OutMinV = TNumericLimits<double>::Max();
+		OutMaxV = -TNumericLimits<double>::Max();
+		for (const FVector2D& Point : Points)
+		{
+			OutMinU = FMath::Min(OutMinU, Point.X);
+			OutMaxU = FMath::Max(OutMaxU, Point.X);
+			OutMinV = FMath::Min(OutMinV, Point.Y);
+			OutMaxV = FMath::Max(OutMaxV, Point.Y);
+		}
+	}
+
+	static TArray<FVector2D> MakeBBoxCorners(double MinU, double MaxU, double MinV, double MaxV)
+	{
+		TArray<FVector2D> Corners;
+		Corners.Reserve(4);
+		Corners.Emplace(MinU, MinV);
+		Corners.Emplace(MaxU, MinV);
+		Corners.Emplace(MaxU, MaxV);
+		Corners.Emplace(MinU, MaxV);
+		return Corners;
+	}
+
+	static TArray<FVector2D> MakeOrientedBBoxCorners(const FMinimumAreaBBox2D& BBox)
+	{
+		TArray<FVector2D> Corners;
+		if (!BBox.bValid)
+		{
+			return Corners;
+		}
+		Corners.Reserve(4);
+		Corners.Add(BBox.AxisX * BBox.MinX + BBox.AxisY * BBox.MinY);
+		Corners.Add(BBox.AxisX * BBox.MaxX + BBox.AxisY * BBox.MinY);
+		Corners.Add(BBox.AxisX * BBox.MaxX + BBox.AxisY * BBox.MaxY);
+		Corners.Add(BBox.AxisX * BBox.MinX + BBox.AxisY * BBox.MaxY);
+		return Corners;
+	}
+
+	static bool ConvertFaceUVLoopToWorld(
+		const TArray<FVector2D>& UVLoop,
+		const FVector& Origin,
+		const FVector& AxisU,
+		const FVector& AxisV,
+		TArray<FVector>& OutWorld)
+	{
+		OutWorld.Reset();
+		OutWorld.Reserve(UVLoop.Num());
+		for (const FVector2D& UV : UVLoop)
+		{
+			const FVector World = FaceUVToWorld(UV, Origin, AxisU, AxisV);
+			if (!IsFiniteVector(World))
+			{
+				OutWorld.Reset();
+				return false;
+			}
+			OutWorld.Add(World);
+		}
+		return OutWorld.Num() == UVLoop.Num();
+	}
+
+	static void SetRegularizationFallback(FCapBBoxRegularizationResult& Debug, const FString& Reason)
+	{
+		Debug.bApplied = false;
+		Debug.bFallbackToOriginal = true;
+		Debug.SelectedGeometry = TEXT("original");
+		Debug.RejectionReason = Reason;
+		Debug.FinalCapUV = Debug.OriginalCapUV;
+		Debug.FinalCapWorld = Debug.OriginalCapWorld;
+	}
+
+	static bool RegularizeCapToFaceBBox(
+		const FFaceInfo& Face,
+		const FCommonInputs& Inputs,
+		const FVector2D& OriginalDeltaPixels,
+		const TArray<FVector>& OriginalCapWorld,
+		TArray<FVector>& OutFinalCapWorld,
+		FCapBBoxRegularizationResult& OutDebug)
+	{
+		OutDebug = FCapBBoxRegularizationResult();
+		OutDebug.bAttempted = true;
+		OutDebug.FaceOriginWorld = Face.PlanePoint;
+		OutDebug.FaceNormalWorld = Face.Normal.GetSafeNormal();
+		OutDebug.OriginalSourceToCopiedDeltaPixels = OriginalDeltaPixels;
+		OutDebug.OriginalCapWorld = OriginalCapWorld;
+		OutFinalCapWorld = OriginalCapWorld;
+
+		if (Face.KeyPoints3D.Num() < 3 || OriginalCapWorld.Num() < 3)
+		{
+			SetRegularizationFallback(OutDebug, TEXT("face or cap has fewer than three points"));
+			return false;
+		}
+
+		FVector FaceNormal;
+		FVector TempX;
+		FVector TempY;
+		if (!BuildTemporaryFaceBasis(Face, Inputs.Camera, FaceNormal, TempX, TempY))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("failed to build a temporary face-plane basis"));
+			return false;
+		}
+
+		TArray<FVector2D> FaceTemp;
+		for (const FVector& Point : Face.KeyPoints3D)
+		{
+			if (!IsFiniteVector(Point))
+			{
+				SetRegularizationFallback(OutDebug, TEXT("face boundary contains a non-finite world point"));
+				return false;
+			}
+			FaceTemp.Add(WorldPointToFaceUV(Point, Face.PlanePoint, TempX, TempY));
+		}
+
+		TArray<FVector2D> TempHull;
+		if (!BuildConvexHull2D(FaceTemp, TempHull))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("face boundary convex hull is degenerate"));
+			return false;
+		}
+
+		FMinimumAreaBBox2D TempBBox;
+		if (!ComputeMinimumAreaBBox2D(TempHull, TempBBox))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("face minimum-area oriented bbox is degenerate"));
+			return false;
+		}
+
+		const double Width = TempBBox.MaxX - TempBBox.MinX;
+		const double Height = TempBBox.MaxY - TempBBox.MinY;
+		FVector2D AxisU2D = TempBBox.AxisX;
+		FVector2D AxisV2D = TempBBox.AxisY;
+		const double MaxExtent = FMath::Max(Width, Height);
+		const bool bNearlySquare =
+			MaxExtent > SMALL_NUMBER &&
+			FMath::Abs(Width - Height) / MaxExtent <= FaceBBoxSquareRelativeTolerance;
+		if (Height > Width && !bNearlySquare)
+		{
+			Swap(AxisU2D, AxisV2D);
+		}
+		else if (bNearlySquare)
+		{
+			const FVector WorldAxisX = (TempX * TempBBox.AxisX.X + TempY * TempBBox.AxisX.Y).GetSafeNormal();
+			const FVector WorldAxisY = (TempX * TempBBox.AxisY.X + TempY * TempBBox.AxisY.Y).GetSafeNormal();
+			FVector2D ProjectedX;
+			FVector2D ProjectedY;
+			const bool bProjectedX = ProjectSignedWorldDirectionToImage(
+				Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, WorldAxisX, ProjectedX);
+			const bool bProjectedY = ProjectSignedWorldDirectionToImage(
+				Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, WorldAxisY, ProjectedY);
+			const double HorizontalX = bProjectedX ? FMath::Abs(ProjectedX.GetSafeNormal().X) : -1.0;
+			const double HorizontalY = bProjectedY ? FMath::Abs(ProjectedY.GetSafeNormal().X) : -1.0;
+			if (HorizontalY > HorizontalX)
+			{
+				Swap(AxisU2D, AxisV2D);
+			}
+		}
+
+		FVector AxisU = (TempX * AxisU2D.X + TempY * AxisU2D.Y).GetSafeNormal();
+		if (AxisU.IsNearlyZero())
+		{
+			SetRegularizationFallback(OutDebug, TEXT("face bbox U axis is invalid"));
+			return false;
+		}
+		FVector AxisV = FVector::CrossProduct(FaceNormal, AxisU).GetSafeNormal();
+		if (AxisV.IsNearlyZero())
+		{
+			SetRegularizationFallback(OutDebug, TEXT("face bbox V axis is invalid"));
+			return false;
+		}
+
+		FVector2D ProjectedU;
+		if (ProjectSignedWorldDirectionToImage(
+			Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight, AxisU, ProjectedU) &&
+			ProjectedU.X < 0.0)
+		{
+			AxisU *= -1.0;
+			AxisV *= -1.0;
+		}
+		if (FVector::DotProduct(FVector::CrossProduct(AxisU, AxisV), FaceNormal) < 0.0)
+		{
+			AxisV *= -1.0;
+		}
+
+		OutDebug.FaceAxisUWorld = AxisU;
+		OutDebug.FaceAxisVWorld = AxisV;
+		for (const FVector& Point : Face.KeyPoints3D)
+		{
+			OutDebug.FaceBoundaryUV.Add(WorldPointToFaceUV(Point, Face.PlanePoint, AxisU, AxisV));
+		}
+		if (!BuildConvexHull2D(OutDebug.FaceBoundaryUV, OutDebug.FaceHullUV))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("face hull became invalid in stabilized UV coordinates"));
+			return false;
+		}
+
+		double FaceMinU, FaceMaxU, FaceMinV, FaceMaxV;
+		ComputeAxisAlignedBounds(OutDebug.FaceBoundaryUV, FaceMinU, FaceMaxU, FaceMinV, FaceMaxV);
+		OutDebug.FaceBBoxUV = MakeBBoxCorners(FaceMinU, FaceMaxU, FaceMinV, FaceMaxV);
+
+		for (const FVector& Point : OriginalCapWorld)
+		{
+			if (!IsFiniteVector(Point))
+			{
+				SetRegularizationFallback(OutDebug, TEXT("cap contains a non-finite world point"));
+				return false;
+			}
+			OutDebug.OriginalCapUV.Add(WorldPointToFaceUV(Point, Face.PlanePoint, AxisU, AxisV));
+		}
+
+		OutDebug.CapArea = FMath::Abs(SignedPolygonAreaForRegularization(OutDebug.OriginalCapUV));
+		double CapMinU, CapMaxU, CapMinV, CapMaxV;
+		ComputeAxisAlignedBounds(OutDebug.OriginalCapUV, CapMinU, CapMaxU, CapMinV, CapMaxV);
+		OutDebug.CapBaseBBoxArea = (CapMaxU - CapMinU) * (CapMaxV - CapMinV);
+		if (!FMath::IsFinite(OutDebug.CapArea) ||
+			!FMath::IsFinite(OutDebug.CapBaseBBoxArea) ||
+			OutDebug.CapArea <= CapBBoxDegenerateAreaTolerance ||
+			OutDebug.CapBaseBBoxArea <= CapBBoxDegenerateAreaTolerance)
+		{
+			SetRegularizationFallback(OutDebug, TEXT("cap polygon or cap base bbox area is degenerate"));
+			return false;
+		}
+
+		OutDebug.CapBaseBBoxRatio = OutDebug.CapArea / OutDebug.CapBaseBBoxArea;
+		OutDebug.CapBaseBBoxUV = MakeBBoxCorners(CapMinU, CapMaxU, CapMinV, CapMaxV);
+		if (!ConvertFaceUVLoopToWorld(
+			OutDebug.CapBaseBBoxUV,
+			Face.PlanePoint,
+			AxisU,
+			AxisV,
+			OutDebug.CapBaseBBoxWorld))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("cap base bbox UV-to-world conversion produced a non-finite point"));
+			return false;
+		}
+
+		OutDebug.bCapBaseBBoxPassed = OutDebug.CapBaseBBoxRatio >= OutDebug.FillRatioThreshold;
+		if (OutDebug.bCapBaseBBoxPassed)
+		{
+			OutDebug.bApplied = true;
+			OutDebug.bFallbackToOriginal = false;
+			OutDebug.SelectedGeometry = TEXT("cap_base_bbox");
+			OutDebug.FinalCapUV = OutDebug.CapBaseBBoxUV;
+			OutDebug.FinalCapWorld = OutDebug.CapBaseBBoxWorld;
+			OutFinalCapWorld = OutDebug.FinalCapWorld;
+			return true;
+		}
+
+		OutDebug.bCapMinimumBBoxComputed = true;
+		if (!BuildConvexHull2D(OutDebug.OriginalCapUV, OutDebug.OriginalCapHullUV))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("cap base bbox failed and cap convex hull is degenerate"));
+			return false;
+		}
+
+		FMinimumAreaBBox2D CapMinimumBBox;
+		if (!ComputeMinimumAreaBBox2D(OutDebug.OriginalCapHullUV, CapMinimumBBox))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("cap base bbox failed and cap minimum-area bbox is degenerate"));
+			return false;
+		}
+
+		OutDebug.CapMinimumBBoxArea = CapMinimumBBox.Area;
+		if (!FMath::IsFinite(OutDebug.CapMinimumBBoxArea) ||
+			OutDebug.CapMinimumBBoxArea <= CapBBoxDegenerateAreaTolerance)
+		{
+			SetRegularizationFallback(OutDebug, TEXT("cap minimum-area bbox has invalid area"));
+			return false;
+		}
+
+		OutDebug.CapMinimumBBoxRatio = OutDebug.CapArea / OutDebug.CapMinimumBBoxArea;
+		OutDebug.CapMinimumBBoxUV = MakeOrientedBBoxCorners(CapMinimumBBox);
+		if (!ConvertFaceUVLoopToWorld(
+			OutDebug.CapMinimumBBoxUV,
+			Face.PlanePoint,
+			AxisU,
+			AxisV,
+			OutDebug.CapMinimumBBoxWorld))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("cap minimum bbox UV-to-world conversion produced a non-finite point"));
+			return false;
+		}
+
+		OutDebug.bCapMinimumBBoxPassed = OutDebug.CapMinimumBBoxRatio >= OutDebug.FillRatioThreshold;
+		if (OutDebug.bCapMinimumBBoxPassed)
+		{
+			OutDebug.bApplied = true;
+			OutDebug.bFallbackToOriginal = false;
+			OutDebug.SelectedGeometry = TEXT("cap_minimum_bbox");
+			OutDebug.FinalCapUV = OutDebug.CapMinimumBBoxUV;
+			OutDebug.FinalCapWorld = OutDebug.CapMinimumBBoxWorld;
+			OutFinalCapWorld = OutDebug.FinalCapWorld;
+			return true;
+		}
+
+		OutDebug.bApplied = false;
+		OutDebug.bFallbackToOriginal = false;
+		OutDebug.SelectedGeometry = TEXT("original");
+		OutDebug.RejectionReason = TEXT("cap base bbox and cap minimum bbox fill ratios are below the configured threshold");
+		OutDebug.FinalCapUV = OutDebug.OriginalCapUV;
+		OutDebug.FinalCapWorld = OutDebug.OriginalCapWorld;
+		return false;
+	}
+
+	static TArray<FVector2D> MapUVPointsToDebugImage(
+		const TArray<FVector2D>& Points,
+		double MinU,
+		double MaxU,
+		double MinV,
+		double MaxV,
+		int32 ImageSize)
+	{
+		const double Margin = 64.0;
+		const double SpanU = FMath::Max(MaxU - MinU, 1e-6);
+		const double SpanV = FMath::Max(MaxV - MinV, 1e-6);
+		const double Scale = FMath::Min(
+			(double(ImageSize) - 2.0 * Margin) / SpanU,
+			(double(ImageSize) - 2.0 * Margin) / SpanV);
+		const double CenterU = 0.5 * (MinU + MaxU);
+		const double CenterV = 0.5 * (MinV + MaxV);
+		const FVector2D ImageCenter(0.5 * double(ImageSize), 0.5 * double(ImageSize));
+
+		TArray<FVector2D> Mapped;
+		Mapped.Reserve(Points.Num());
+		for (const FVector2D& Point : Points)
+		{
+			Mapped.Emplace(
+				ImageCenter.X + (Point.X - CenterU) * Scale,
+				ImageCenter.Y - (Point.Y - CenterV) * Scale);
+		}
+		return Mapped;
+	}
+
+	static void AccumulateUVBounds(
+		const TArray<FVector2D>& Points,
+		double& InOutMinU,
+		double& InOutMaxU,
+		double& InOutMinV,
+		double& InOutMaxV)
+	{
+		for (const FVector2D& Point : Points)
+		{
+			InOutMinU = FMath::Min(InOutMinU, Point.X);
+			InOutMaxU = FMath::Max(InOutMaxU, Point.X);
+			InOutMinV = FMath::Min(InOutMinV, Point.Y);
+			InOutMaxV = FMath::Max(InOutMaxV, Point.Y);
+		}
+	}
+
+	static bool SaveCapBBoxDebugPng(
+		const FCapBBoxRegularizationResult& Debug,
+		const FString& Path,
+		bool bOverview)
+	{
+		const int32 Size = CapBBoxDebugImageSize;
+		TArray<uint8> RGBA;
+		RGBA.SetNumUninitialized(Size * Size * 4);
+		for (int32 Pixel = 0; Pixel < Size * Size; ++Pixel)
+		{
+			const int32 Offset = Pixel * 4;
+			RGBA[Offset + 0] = 24;
+			RGBA[Offset + 1] = 24;
+			RGBA[Offset + 2] = 28;
+			RGBA[Offset + 3] = 255;
+		}
+
+		double MinU = TNumericLimits<double>::Max();
+		double MaxU = -TNumericLimits<double>::Max();
+		double MinV = TNumericLimits<double>::Max();
+		double MaxV = -TNumericLimits<double>::Max();
+		if (bOverview)
+		{
+			AccumulateUVBounds(Debug.FaceBoundaryUV, MinU, MaxU, MinV, MaxV);
+			AccumulateUVBounds(Debug.FaceBBoxUV, MinU, MaxU, MinV, MaxV);
+		}
+		AccumulateUVBounds(Debug.OriginalCapUV, MinU, MaxU, MinV, MaxV);
+		AccumulateUVBounds(Debug.CapBaseBBoxUV, MinU, MaxU, MinV, MaxV);
+		AccumulateUVBounds(Debug.CapMinimumBBoxUV, MinU, MaxU, MinV, MaxV);
+		AccumulateUVBounds(Debug.FinalCapUV, MinU, MaxU, MinV, MaxV);
+		if (!FMath::IsFinite(MinU) || !FMath::IsFinite(MaxU) ||
+			!FMath::IsFinite(MinV) || !FMath::IsFinite(MaxV))
+		{
+			return false;
+		}
+
+		const double PadU = FMath::Max((MaxU - MinU) * 0.08, 1e-3);
+		const double PadV = FMath::Max((MaxV - MinV) * 0.08, 1e-3);
+		MinU -= PadU;
+		MaxU += PadU;
+		MinV -= PadV;
+		MaxV += PadV;
+
+		auto Map = [&](const TArray<FVector2D>& Points)
+		{
+			return MapUVPointsToDebugImage(Points, MinU, MaxU, MinV, MaxV, Size);
+		};
+
+		if (bOverview)
+		{
+			DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.FaceBoundaryUV), FColor(90, 90, 96, 255), 2);
+			DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.FaceHullUV), FColor(210, 210, 210, 255), 1);
+			DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.FaceBBoxUV), FColor(0, 210, 220, 255), 1);
+		}
+		DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.OriginalCapUV), FColor(255, 70, 70, 255), 2);
+		DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.CapBaseBBoxUV), FColor(255, 210, 0, 255), 2);
+		DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.CapMinimumBBoxUV), FColor(190, 80, 255, 255), 2);
+		DrawClosedPolylineRGBA(RGBA, Size, Size, Map(Debug.FinalCapUV), FColor(40, 240, 100, 255), 2);
+
+		const TArray<FVector2D> OriginUV = { FVector2D::ZeroVector };
+		const FVector2D OriginPixel = Map(OriginUV)[0];
+		const double AxisLengthUV = 0.15 * FMath::Max(MaxU - MinU, MaxV - MinV);
+		DrawArrowRGBA(
+			RGBA, Size, Size, OriginPixel,
+			Map(TArray<FVector2D>{ FVector2D(AxisLengthUV, 0.0) })[0],
+			FColor(255, 80, 80, 255), 2);
+		DrawArrowRGBA(
+			RGBA, Size, Size, OriginPixel,
+			Map(TArray<FVector2D>{ FVector2D(0.0, AxisLengthUV) })[0],
+			FColor(80, 160, 255, 255), 2);
+		return SaveRGBAToPng(RGBA, Size, Size, Path);
+	}
+
+	static void SaveCapBBoxRegularizationJson(
+		const FCapBBoxRegularizationResult& Debug,
+		const FString& Path,
+		bool bWorldOnly)
+	{
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetBoolField(TEXT("attempted"), Debug.bAttempted);
+		Root->SetBoolField(TEXT("regularization_applied"), Debug.bApplied);
+		Root->SetBoolField(TEXT("fallback_to_original"), Debug.bFallbackToOriginal);
+		Root->SetNumberField(TEXT("selected_face_id"), Debug.SelectedFaceId);
+		Root->SetStringField(TEXT("action"), Debug.Action);
+		Root->SetStringField(TEXT("source_polygon_key"), Debug.SourcePolygonKey);
+		Root->SetStringField(TEXT("copied_polygon_key"), Debug.CopiedPolygonKey);
+		Root->SetStringField(TEXT("selected_geometry"), Debug.SelectedGeometry);
+		Root->SetStringField(TEXT("rejection_reason"), Debug.RejectionReason);
+		Root->SetNumberField(TEXT("fill_ratio_threshold"), Debug.FillRatioThreshold);
+		Root->SetNumberField(TEXT("cap_area"), Debug.CapArea);
+		Root->SetNumberField(TEXT("cap_bbox_area"), Debug.CapBaseBBoxArea);
+		Root->SetNumberField(TEXT("fill_ratio"), Debug.CapBaseBBoxRatio);
+		Root->SetNumberField(TEXT("cap_base_bbox_area"), Debug.CapBaseBBoxArea);
+		Root->SetNumberField(TEXT("cap_base_bbox_ratio"), Debug.CapBaseBBoxRatio);
+		Root->SetBoolField(TEXT("cap_base_bbox_passed"), Debug.bCapBaseBBoxPassed);
+		Root->SetBoolField(TEXT("cap_minimum_bbox_computed"), Debug.bCapMinimumBBoxComputed);
+		Root->SetNumberField(TEXT("cap_minimum_bbox_area"), Debug.CapMinimumBBoxArea);
+		Root->SetNumberField(TEXT("cap_minimum_bbox_ratio"), Debug.CapMinimumBBoxRatio);
+		Root->SetBoolField(TEXT("cap_minimum_bbox_passed"), Debug.bCapMinimumBBoxPassed);
+		Root->SetArrayField(TEXT("original_source_to_copied_delta_pixels"), JsonVector2D(Debug.OriginalSourceToCopiedDeltaPixels)->AsArray());
+		Root->SetArrayField(TEXT("face_origin_world"), JsonVector(Debug.FaceOriginWorld)->AsArray());
+		Root->SetArrayField(TEXT("face_normal_world"), JsonVector(Debug.FaceNormalWorld)->AsArray());
+		Root->SetArrayField(TEXT("face_axis_u_world"), JsonVector(Debug.FaceAxisUWorld)->AsArray());
+		Root->SetArrayField(TEXT("face_axis_v_world"), JsonVector(Debug.FaceAxisVWorld)->AsArray());
+		if (!bWorldOnly)
+		{
+			SetVector2DArrayField(Root, TEXT("face_boundary_uv"), Debug.FaceBoundaryUV);
+			SetVector2DArrayField(Root, TEXT("face_convex_hull_uv"), Debug.FaceHullUV);
+			SetVector2DArrayField(Root, TEXT("face_oriented_bbox_uv"), Debug.FaceBBoxUV);
+			SetVector2DArrayField(Root, TEXT("original_cap_uv"), Debug.OriginalCapUV);
+			SetVector2DArrayField(Root, TEXT("original_cap_convex_hull_uv"), Debug.OriginalCapHullUV);
+			SetVector2DArrayField(Root, TEXT("cap_bbox_uv"), Debug.CapBaseBBoxUV);
+			SetVector2DArrayField(Root, TEXT("cap_base_bbox_uv"), Debug.CapBaseBBoxUV);
+			SetVector2DArrayField(Root, TEXT("cap_minimum_bbox_uv"), Debug.CapMinimumBBoxUV);
+			SetVector2DArrayField(Root, TEXT("final_cap_uv"), Debug.FinalCapUV);
+		}
+		SetVectorArrayField(Root, TEXT("original_cap_world"), Debug.OriginalCapWorld);
+		SetVectorArrayField(Root, TEXT("cap_bbox_world"), Debug.CapBaseBBoxWorld);
+		SetVectorArrayField(Root, TEXT("cap_base_bbox_world"), Debug.CapBaseBBoxWorld);
+		SetVectorArrayField(Root, TEXT("cap_minimum_bbox_world"), Debug.CapMinimumBBoxWorld);
+		SetVectorArrayField(Root, TEXT("final_cap_world"), Debug.FinalCapWorld);
+		SaveJsonObject(Root, Path);
+	}
+
+	static void SaveCapBBoxRegularizationDebug(
+		const FCapBBoxRegularizationResult& Debug,
+		const FString& OutputDir)
+	{
+		SaveCapBBoxDebugPng(Debug, OutputDir / TEXT("10_cap_face_uv_overview.png"), true);
+		SaveCapBBoxDebugPng(Debug, OutputDir / TEXT("10_cap_face_uv_detail.png"), false);
+		SaveCapBBoxRegularizationJson(Debug, OutputDir / TEXT("10_cap_bbox_regularization.json"), false);
+		SaveCapBBoxRegularizationJson(Debug, OutputDir / TEXT("10_cap_bbox_regularization_world.json"), true);
 	}
 
 	// Debug overlay: the cap-connected green lines (green) and every candidate face's
@@ -2459,6 +3198,7 @@ namespace
 		const FString& SourcePolygonKey,
 		const FString& CopiedPolygonKey,
 		const FString& PressDir,
+		const FString& OutputDir,
 		int32 CapWidth,
 		int32 CapHeight,
 		double ScaleX,
@@ -2530,6 +3270,55 @@ namespace
 			}
 			Result.SourceLoopWorld.Add(Hit);
 		}
+
+		const TArray<FVector2D> OriginalSourceLoop2D = Result.SourceLoop2D;
+		const TArray<FVector2D> OriginalCopiedLoop2D = Result.CopiedTargetLoop2D;
+		const TArray<FVector> OriginalSourceLoopWorld = Result.SourceLoopWorld;
+		TArray<FVector> RegularizedSourceLoopWorld;
+		const bool bRegularizationApplied = RegularizeCapToFaceBBox(
+			SelectedFace,
+			Inputs,
+			Result.SourceToCopiedVector2D,
+			OriginalSourceLoopWorld,
+			RegularizedSourceLoopWorld,
+			Result.CapBBoxRegularization);
+		Result.CapBBoxRegularization.SelectedFaceId = SelectedFace.Id;
+		Result.CapBBoxRegularization.Action = Action;
+		Result.CapBBoxRegularization.SourcePolygonKey = SourcePolygonKey;
+		Result.CapBBoxRegularization.CopiedPolygonKey = CopiedPolygonKey;
+		if (bRegularizationApplied)
+		{
+			Result.SourceLoopWorld = MoveTemp(RegularizedSourceLoopWorld);
+			Result.SourceLoop2D.Reset();
+			Result.CopiedTargetLoop2D.Reset();
+			bool bProjectionValid = true;
+			for (const FVector& WorldPoint : Result.SourceLoopWorld)
+			{
+				FVector2D SourcePixel;
+				if (!ProjectWorldToImageOrthographic(
+					Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
+					WorldPoint, SourcePixel) ||
+					!IsFiniteVector2D(SourcePixel))
+				{
+					bProjectionValid = false;
+					break;
+				}
+				Result.SourceLoop2D.Add(SourcePixel);
+				Result.CopiedTargetLoop2D.Add(SourcePixel + Result.SourceToCopiedVector2D);
+			}
+
+			if (!bProjectionValid || Result.SourceLoop2D.Num() != 4 || Result.CopiedTargetLoop2D.Num() != 4)
+			{
+				Result.SourceLoop2D = OriginalSourceLoop2D;
+				Result.CopiedTargetLoop2D = OriginalCopiedLoop2D;
+				Result.SourceLoopWorld = OriginalSourceLoopWorld;
+				SetRegularizationFallback(
+					Result.CapBBoxRegularization,
+					TEXT("regularized bbox corners failed orthographic reprojection; restored original cap"));
+			}
+		}
+		SaveCapBBoxRegularizationDebug(Result.CapBBoxRegularization, OutputDir);
+
 		Result.SourceMaterialProbePointsWorld = Result.SourceLoopWorld;
 		Result.SourceMaterialProbePointsWorld.Add(AverageVector(Result.SourceLoopWorld));
 
@@ -3082,6 +3871,7 @@ namespace
 			Result.Solid.SourcePolygonKey,
 			Result.Solid.CopiedPolygonKey,
 			PressDir,
+			ComponentDir,
 			Result.CapWidth,
 			Result.CapHeight,
 			ScaleX,

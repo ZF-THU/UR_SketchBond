@@ -183,8 +183,8 @@ namespace FromLZImageOps
 	// loop/chain nodes, branches, and red interior vertices never initiate this search.
 	// Components are red-driven: red-only loops are selected first, then local black
 	// closures, then fallback red/black traces. Conflicting red-only loops prefer the
-	// larger cap area; local_black and fallback_trace keep the conservative ordering
-	// but reject loops whose bbox area is below 1500 px^2 before consuming red strokes.
+	// larger cap area. Red-only loops below 1000 px^2 bbox area are rejected;
+	// local_black and fallback_trace reject loops below 1500 px^2 before consuming red strokes.
 	// Black strokes never define the initial component split.
 	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
 	// an Action.json is written to ActionPressDir/Component_%%/: local green stroke pixels are

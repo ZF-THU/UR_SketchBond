@@ -10,6 +10,34 @@
 
 namespace
 {
+	bool IsCaptureMainPngFilename(const FString& Filename)
+	{
+		const FString BaseName = FPaths::GetBaseFilename(Filename);
+		if (FPaths::GetExtension(Filename, false) != TEXT("png") ||
+			BaseName.Len() != 22 ||
+			!BaseName.StartsWith(TEXT("FromLZ_"), ESearchCase::CaseSensitive) ||
+			BaseName[15] != TCHAR('_'))
+		{
+			return false;
+		}
+
+		for (int32 Index = 7; Index < 15; ++Index)
+		{
+			if (!FChar::IsDigit(BaseName[Index]))
+			{
+				return false;
+			}
+		}
+		for (int32 Index = 16; Index < 22; ++Index)
+		{
+			if (!FChar::IsDigit(BaseName[Index]))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
 	// Center-aligned crop/pad of an RGBA buffer to exactly (DstW x DstH). The image
 	// center is preserved: an axis larger than the target is cropped equally on both
 	// sides, an axis smaller is padded with white. No scaling is performed.
@@ -82,7 +110,7 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 	UE_LOG(LogTemp, Log, TEXT("ProcessSketch: sketch=%s (%dx%d)"), *SketchPng, SW, SH);
 
 	// 2) Latest captured line-art (black lines on white) from FromLZCaptures.
-	const FString CapturePng = FindLatestPng(CaptureDir, /*bExcludeFacesPng*/ true);
+	const FString CapturePng = FindLatestPng(CaptureDir, /*bRequireCaptureMainPng*/ true);
 	TArray<uint8> CapturePixels;
 	int32 CW = 0;
 	int32 CH = 0;
@@ -183,19 +211,6 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 		if (bHasCapture)
 		{
 			FString CaptureStem = FPaths::GetBaseFilename(CapturePng); // FromLZ_<timestamp>
-			// Defense in depth: strip companion-output suffixes if one ever leaks past FindLatestPng.
-			if (CaptureStem.EndsWith(TEXT("_faces_debug")))
-			{
-				CaptureStem.LeftChopInline(12);
-			}
-			if (CaptureStem.EndsWith(TEXT("_faces")))
-			{
-				CaptureStem.LeftChopInline(6);
-			}
-			if (CaptureStem.EndsWith(TEXT("_actor_material_id")))
-			{
-				CaptureStem.LeftChopInline(18);
-			}
 			Source.CaptureStem = CaptureStem;
 			Source.CapturePngRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT(".png");
 			Source.CaptureJsonRel = TEXT("FromLZCaptures/") + CaptureStem + TEXT(".json");
@@ -269,7 +284,7 @@ bool FFromLZSketchProcessor::SaveRGBAToPng(const TArray<uint8>& RGBAPixels, int3
 	);
 }
 
-FString FFromLZSketchProcessor::FindLatestPng(const FString& Directory, bool bExcludeFacesPng)
+FString FFromLZSketchProcessor::FindLatestPng(const FString& Directory, bool bRequireCaptureMainPng)
 {
 	TArray<FString> Filenames;
 	IFileManager::Get().FindFiles(Filenames, *(Directory / TEXT("*.png")), true, false);
@@ -284,23 +299,17 @@ FString FFromLZSketchProcessor::FindLatestPng(const FString& Directory, bool bEx
 
 	for (const FString& Filename : Filenames)
 	{
-		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_faces")))
-		{
-			continue;
-		}
-		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_faces_debug")))
-		{
-			// Companion debug image written after _faces.png; never an input.
-			continue;
-		}
-		if (bExcludeFacesPng && FPaths::GetBaseFilename(Filename).EndsWith(TEXT("_actor_material_id")))
+		if (bRequireCaptureMainPng && !IsCaptureMainPngFilename(Filename))
 		{
 			continue;
 		}
 
 		const FString FullPath = Directory / Filename;
 		const FFileStatData Stat = IFileManager::Get().GetStatData(*FullPath);
-		if (Stat.ModificationTime > LatestTime)
+		const FString CurrentFilename = FPaths::GetCleanFilename(LatestPath);
+		if (Stat.ModificationTime > LatestTime ||
+			(Stat.ModificationTime == LatestTime &&
+				Filename.Compare(CurrentFilename, ESearchCase::CaseSensitive) > 0))
 		{
 			LatestTime = Stat.ModificationTime;
 			LatestPath = FullPath;
