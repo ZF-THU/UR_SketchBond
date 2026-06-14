@@ -34,7 +34,12 @@ namespace FromLZImageOps
 	void ZhangSuenThinning(const TArray<uint8>& In, int32 Width, int32 Height, TArray<uint8>& OutSkel, int32 MaxIter = 100);
 
 	// Step 3 skeleton gap repair (port of Python cleanup_skeleton_endpoints):
-	//   1. Connect mutual-nearest endpoint pairs whose gap <= GapTol (1px LINE_8).
+	//   1. Connect mutual-nearest endpoint pairs whose gap <= GapTol and whose
+	//      outward endpoint directions both face the other endpoint within 60 degrees.
+	//      Unmatched endpoints may also connect to the closest skeleton segment in
+	//      the same outward +/-60-degree cone.
+	//      Remaining endpoints then use a directed pool fallback: source <=60 degrees,
+	//      target <=100 degrees, nearest target wins, and a successful pair consumes both.
 	//   2. Prune connections that only close a small loop (bbox area < SmallLoopBboxAreaThresh).
 	//   3. Trim dangling branches shorter than BranchPruneMaxPixels (<=0 -> auto = max(30, 3*GapTol)),
 	//      unless the branch samples as source red/black in SourceColorMap.
@@ -171,6 +176,16 @@ namespace FromLZImageOps
 		TArray<FVector2D> SideCandidateVectors;
 		TArray<FVector2D> SideCandidateStarts;
 		TArray<FVector2D> SideCandidateEnds;
+
+		bool bFaceEvaluationValid = false;
+		FString FaceEvaluationSourcePolygon;
+		FString FaceEvaluationRejectReason;
+		int32 FaceEvaluationCapMaskPixels = 0;
+		int32 PreselectedFaceId = -1;
+		int32 PreselectedFaceOverlapPixels = 0;
+		double PreselectedFaceOverlapRatio = 0.0;
+		double PreselectedFaceNormalSideAngleDegrees = -1.0;
+		double PreselectedFaceDistanceToCamera = 0.0;
 	};
 
 	// Step 9: detect every red cap loop in one pipeline run and recover its extrusion.
@@ -182,9 +197,12 @@ namespace FromLZImageOps
 	// stroke at the projection and adding an explicit red connector. Degree-2
 	// loop/chain nodes, branches, and red interior vertices never initiate this search.
 	// Components are red-driven: red-only loops are selected first, then local black
-	// closures, then fallback red/black traces. Conflicting red-only loops prefer the
-	// larger cap area. Red-only loops below 1000 px^2 bbox area are rejected;
-	// local_black and fallback_trace reject loops below 1500 px^2 before consuming red strokes.
+	// closures, then fallback red/black traces. Before consuming red strokes, every
+	// candidate must have a valid local-green action and a source polygon that covers
+	// at least 70% of one captured face whose projected normal is within 30 degrees
+	// of the unoriented green side vector and whose plane can be intersected. Conflicting
+	// red-only loops prefer the larger cap area. Red-only loops below 1000 px^2 bbox
+	// area are rejected; local_black and fallback_trace reject loops below 1500 px^2.
 	// Black strokes never define the initial component split.
 	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
 	// an Action.json is written to ActionPressDir/Component_%%/: local green stroke pixels are

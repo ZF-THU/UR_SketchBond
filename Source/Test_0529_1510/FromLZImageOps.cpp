@@ -1,4 +1,5 @@
 #include "FromLZImageOps.h"
+#include "FromLZFaceReconstructor.h"
 
 #include "Algo/Reverse.h"
 #include "Async/ParallelFor.h"
@@ -641,6 +642,35 @@ namespace FromLZImageOps
 		// ---- 1. mutual-nearest endpoint pairs within GapTol --------------------
 		const int32 E = EndpointsBefore.Num();
 		const double Tol2 = double(GapTol) * double(GapTol);
+		constexpr double EndpointForwardCosThreshold = 0.5; // cos(60 degrees)
+		constexpr double RelaxedTargetCosThreshold = -0.17364817766693033; // cos(100 degrees)
+		auto AngleDegreesFromDot = [](double Dot) -> double
+		{
+			return FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0, 1.0)));
+		};
+		TArray<FVector2D> EndpointForward;
+		EndpointForward.Init(FVector2D::ZeroVector, E);
+		for (int32 i = 0; i < E; ++i)
+		{
+			const FIntPoint& Endpoint = EndpointsBefore[i];
+			int32 Neighbors[8];
+			const int32 Degree = SkelGraph::SafeNeighbors(
+				Work.GetData(), Width, Height, Endpoint.X, Endpoint.Y, Neighbors);
+			if (Degree != 1)
+			{
+				continue;
+			}
+
+			const FIntPoint Interior(Neighbors[0] % Width, Neighbors[0] / Width);
+			FVector2D Forward(
+				double(Endpoint.X - Interior.X),
+				double(Endpoint.Y - Interior.Y));
+			if (Forward.Normalize())
+			{
+				EndpointForward[i] = Forward;
+			}
+		}
+
 		TArray<int32> NearestJ;   // best partner index for endpoint i, or -1
 		TArray<double> NearestD2;
 		NearestJ.Init(-1, E);
@@ -660,6 +690,24 @@ namespace FromLZImageOps
 				{
 					continue;
 				}
+				if (EndpointForward[i].IsNearlyZero() || EndpointForward[j].IsNearlyZero())
+				{
+					continue;
+				}
+
+				FVector2D ToTarget(
+					double(EndpointsBefore[j].X - EndpointsBefore[i].X),
+					double(EndpointsBefore[j].Y - EndpointsBefore[i].Y));
+				if (!ToTarget.Normalize())
+				{
+					continue;
+				}
+				const FVector2D ToSource = -ToTarget;
+				if (FVector2D::DotProduct(EndpointForward[i], ToTarget) < EndpointForwardCosThreshold ||
+					FVector2D::DotProduct(EndpointForward[j], ToSource) < EndpointForwardCosThreshold)
+				{
+					continue;
+				}
 				if (D2 < NearestD2[i])
 				{
 					NearestD2[i] = D2;
@@ -675,6 +723,10 @@ namespace FromLZImageOps
 			FIntPoint P1;
 			TArray<FIntPoint> LinePts;
 			TArray<FIntPoint> AddedPts;
+			double GapLength = 0.0;
+			double SourceAngleDegrees = -1.0;
+			double TargetAngleDegrees = -1.0;
+			FString TargetType = TEXT("endpoint");
 			bool bRbAltPath = false;
 			int32 RbAltPathPixels = 0;
 			int64 RbBboxArea = -1;
@@ -702,17 +754,195 @@ namespace FromLZImageOps
 				continue;
 			}
 			FConn Conn;
+			Conn.Source = TEXT("strict_endpoint_to_endpoint");
 			Conn.P0 = EndpointsBefore[i];
 			Conn.P1 = EndpointsBefore[j];
+			FVector2D ToTarget(
+				double(Conn.P1.X - Conn.P0.X),
+				double(Conn.P1.Y - Conn.P0.Y));
+			ToTarget.Normalize();
+			Conn.SourceAngleDegrees = AngleDegreesFromDot(
+				FVector2D::DotProduct(EndpointForward[i], ToTarget));
+			Conn.TargetAngleDegrees = AngleDegreesFromDot(
+				FVector2D::DotProduct(EndpointForward[j], -ToTarget));
 			Connections.Add(MoveTemp(Conn));
 			Used[i] = true;
 			Used[j] = true;
+		}
+
+		// Remaining endpoints may face the middle of a nearby skeleton segment rather
+		// than another degree-1 pixel. Project them onto the closest segment in the
+		// endpoint's outward half-plane, matching the Step 9 connector strategy.
+		for (int32 i = 0; i < E; ++i)
+		{
+			if (Used[i])
+			{
+				continue;
+			}
+
+			const FIntPoint Endpoint = EndpointsBefore[i];
+			const FVector2D Forward = EndpointForward[i];
+			if (Forward.IsNearlyZero())
+			{
+				continue;
+			}
+
+			double BestD2 = TNumericLimits<double>::Max();
+			FVector2D BestPoint = FVector2D::ZeroVector;
+			const int32 SearchRadius = FMath::CeilToInt(GapTol);
+			const int32 MinX = FMath::Max(0, Endpoint.X - SearchRadius);
+			const int32 MaxX = FMath::Min(Width - 1, Endpoint.X + SearchRadius);
+			const int32 MinY = FMath::Max(0, Endpoint.Y - SearchRadius);
+			const int32 MaxY = FMath::Min(Height - 1, Endpoint.Y + SearchRadius);
+
+			for (int32 y = MinY; y <= MaxY; ++y)
+			{
+				for (int32 x = MinX; x <= MaxX; ++x)
+				{
+					if (Work[y * Width + x] == 0)
+					{
+						continue;
+					}
+
+					int32 SegmentNeighbors[8];
+					const int32 SegmentDegree = SkelGraph::SafeNeighbors(
+						Work.GetData(), Width, Height, x, y, SegmentNeighbors);
+					const int32 AIdx = y * Width + x;
+					for (int32 n = 0; n < SegmentDegree; ++n)
+					{
+						const int32 BIdx = SegmentNeighbors[n];
+						if (BIdx <= AIdx || AIdx == Endpoint.Y * Width + Endpoint.X ||
+							BIdx == Endpoint.Y * Width + Endpoint.X)
+						{
+							continue;
+						}
+
+						const FVector2D SegmentStart{ double(x), double(y) };
+						const FVector2D SegmentEnd{ double(BIdx % Width), double(BIdx / Width) };
+						const FVector2D Segment = SegmentEnd - SegmentStart;
+						const double SegmentLen2 = Segment.SizeSquared();
+						if (SegmentLen2 <= 1e-8)
+						{
+							continue;
+						}
+
+						const FVector2D EndpointPos{ double(Endpoint.X), double(Endpoint.Y) };
+						const double T = FMath::Clamp(
+							FVector2D::DotProduct(EndpointPos - SegmentStart, Segment) / SegmentLen2,
+							0.0, 1.0);
+						const FVector2D CandidatePoint = SegmentStart + Segment * T;
+						const FVector2D Delta = CandidatePoint - EndpointPos;
+						const double D2 = Delta.SizeSquared();
+						if (D2 <= 1.0 || D2 > Tol2 || D2 >= BestD2)
+						{
+							continue;
+						}
+						FVector2D TargetDirection = Delta;
+						if (!TargetDirection.Normalize() ||
+							FVector2D::DotProduct(TargetDirection, Forward) < EndpointForwardCosThreshold)
+						{
+							continue;
+						}
+
+						BestD2 = D2;
+						BestPoint = CandidatePoint;
+					}
+				}
+			}
+
+			if (BestD2 == TNumericLimits<double>::Max())
+			{
+				continue;
+			}
+
+			FConn Conn;
+			Conn.Source = TEXT("strict_endpoint_to_segment");
+			Conn.P0 = Endpoint;
+			Conn.P1 = FIntPoint(FMath::RoundToInt(BestPoint.X), FMath::RoundToInt(BestPoint.Y));
+			Conn.GapLength = FMath::Sqrt(BestD2);
+			FVector2D ToTarget = BestPoint - FVector2D(double(Endpoint.X), double(Endpoint.Y));
+			ToTarget.Normalize();
+			Conn.SourceAngleDegrees = AngleDegreesFromDot(
+				FVector2D::DotProduct(Forward, ToTarget));
+			Conn.TargetType = TEXT("segment");
+			Connections.Add(MoveTemp(Conn));
+			Used[i] = true;
+		}
+
+		// Final directed endpoint fallback. The source must still face the target
+		// within 60 degrees, while the target may accept an approach up to 100 degrees.
+		// Endpoints are visited in the stable FindEndpoints scan order. A successful
+		// pair consumes both endpoints immediately; an unmatched source remains
+		// available as a target for later sources.
+		for (int32 i = 0; i < E; ++i)
+		{
+			if (Used[i] || EndpointForward[i].IsNearlyZero())
+			{
+				continue;
+			}
+
+			int32 BestJ = -1;
+			double BestD2 = TNumericLimits<double>::Max();
+			double BestSourceAngle = -1.0;
+			double BestTargetAngle = -1.0;
+			for (int32 j = 0; j < E; ++j)
+			{
+				if (i == j || Used[j] || EndpointForward[j].IsNearlyZero())
+				{
+					continue;
+				}
+
+				const double Dx = double(EndpointsBefore[j].X - EndpointsBefore[i].X);
+				const double Dy = double(EndpointsBefore[j].Y - EndpointsBefore[i].Y);
+				const double D2 = Dx * Dx + Dy * Dy;
+				if (D2 <= 1e-8 || D2 > Tol2 || D2 >= BestD2)
+				{
+					continue;
+				}
+
+				FVector2D ToTarget(Dx, Dy);
+				ToTarget.Normalize();
+				const double SourceDot = FVector2D::DotProduct(EndpointForward[i], ToTarget);
+				const double TargetDot = FVector2D::DotProduct(EndpointForward[j], -ToTarget);
+				if (SourceDot < EndpointForwardCosThreshold ||
+					TargetDot < RelaxedTargetCosThreshold)
+				{
+					continue;
+				}
+
+				BestJ = j;
+				BestD2 = D2;
+				BestSourceAngle = AngleDegreesFromDot(SourceDot);
+				BestTargetAngle = AngleDegreesFromDot(TargetDot);
+			}
+
+			if (BestJ < 0)
+			{
+				continue;
+			}
+
+			FConn Conn;
+			Conn.Source = TEXT("relaxed_endpoint_to_endpoint");
+			Conn.P0 = EndpointsBefore[i];
+			Conn.P1 = EndpointsBefore[BestJ];
+			Conn.GapLength = FMath::Sqrt(BestD2);
+			Conn.SourceAngleDegrees = BestSourceAngle;
+			Conn.TargetAngleDegrees = BestTargetAngle;
+			Connections.Add(MoveTemp(Conn));
+			Used[i] = true;
+			Used[BestJ] = true;
 		}
 
 		// connected = work + drawn 1px connection lines.
 		TArray<uint8> Connected = Work;
 		for (FConn& C : Connections)
 		{
+			if (C.GapLength <= 0.0)
+			{
+				C.GapLength = FVector2D::Distance(
+					FVector2D(C.P0.X, C.P0.Y),
+					FVector2D(C.P1.X, C.P1.Y));
+			}
 			SkelGraph::LinePoints(C.P0, C.P1, C.LinePts);
 			for (const FIntPoint& P : C.LinePts)
 			{
@@ -813,6 +1043,10 @@ namespace FromLZImageOps
 		}
 		for (const FConn& C : Connections)
 		{
+			if (C.Source == TEXT("strict_endpoint_to_segment"))
+			{
+				continue;
+			}
 			for (const FIntPoint& P : C.AddedPts)
 			{
 				if (P.X >= 0 && P.X < Width && P.Y >= 0 && P.Y < Height)
@@ -1115,6 +1349,10 @@ namespace FromLZImageOps
 				Json += FString::Printf(TEXT("      \"source\": \"%s\",\n"), *C.Source);
 				Json += FString::Printf(TEXT("      \"p0\": [%d, %d],\n"), C.P0.X, C.P0.Y);
 				Json += FString::Printf(TEXT("      \"p1\": [%d, %d],\n"), C.P1.X, C.P1.Y);
+				Json += FString::Printf(TEXT("      \"gap_length\": %.3f,\n"), C.GapLength);
+				Json += FString::Printf(TEXT("      \"target_type\": \"%s\",\n"), *C.TargetType);
+				Json += FString::Printf(TEXT("      \"source_angle_degrees\": %.3f,\n"), C.SourceAngleDegrees);
+				Json += FString::Printf(TEXT("      \"target_angle_degrees\": %.3f,\n"), C.TargetAngleDegrees);
 				Json += FString::Printf(TEXT("      \"line_pixels\": %d,\n"), C.LinePts.Num());
 				Json += FString::Printf(TEXT("      \"added_pixels\": %d,\n"), C.AddedPts.Num());
 				Json += FString::Printf(TEXT("      \"rb_alt_path_found\": %s,\n"), C.bRbAltPath ? TEXT("true") : TEXT("false"));
@@ -3135,8 +3373,9 @@ namespace FromLZImageOps
 	static constexpr float CapLoopGraphNodeSnapTol = 5.0f;
 	static constexpr double CapGeometryEpsilon = 1e-6;
 	static constexpr double CapEndpointDirectionArc = 5.0;
-	static constexpr double CapRedOnlyLoopMinBboxArea = 1000.0;
-	static constexpr double CapBorrowedLoopMinBboxArea = 1500.0;
+	static constexpr double CapRedOnlyLoopMinBboxArea = 500.0;
+	static constexpr double CapBorrowedLoopMinBboxArea = 500.0;
+	static constexpr double CapInteriorRedMaxLineLengthPx = 20.0;
 
 	struct FCapStrokeSplit
 	{
@@ -4008,6 +4247,10 @@ namespace FromLZImageOps
 		double BlackTotalLength = 0.0;
 		bool bHasValidLocalGreenAction = false;
 		FString GreenPrefilterReason;
+		bool bHasValidFaceEvaluation = false;
+		FString FaceEvaluationReason;
+		bool bRejectedByInteriorRed = false;
+		FString InteriorRedRejectReason;
 		TArray<int32> LocalGreenStrokeIds;
 		double GreenBoundaryLength = 0.0;
 		TArray<int32> StrokeIds;
@@ -4373,10 +4616,6 @@ namespace FromLZImageOps
 			const bool bARedOnly = IsRedOnlyLoopCandidate(A);
 			const bool bBRedOnly = IsRedOnlyLoopCandidate(B);
 			if (A.Priority != B.Priority) { return A.Priority < B.Priority; }
-			if (!FMath::IsNearlyEqual(A.SyntheticMaxLength, B.SyntheticMaxLength, 1e-6))
-			{
-				return A.SyntheticMaxLength < B.SyntheticMaxLength;
-			}
 			if (!FMath::IsNearlyEqual(A.BlackTotalLength, B.BlackTotalLength, 1e-6))
 			{
 				return A.BlackTotalLength < B.BlackTotalLength;
@@ -4413,6 +4652,20 @@ namespace FromLZImageOps
 			if (IsBorrowedLoopCandidate(Candidate) && Candidate.LoopBboxArea < CapBorrowedLoopMinBboxArea)
 			{
 				Candidate.RejectReason = FString::Printf(TEXT("loop bbox area %.3f below %.3f"), Candidate.LoopBboxArea, CapBorrowedLoopMinBboxArea);
+				continue;
+			}
+			if (Candidate.bRejectedByInteriorRed)
+			{
+				Candidate.RejectReason = Candidate.InteriorRedRejectReason.IsEmpty()
+					? TEXT("candidate rejected: interior red line exceeds threshold")
+					: Candidate.InteriorRedRejectReason;
+				continue;
+			}
+			if (!Candidate.bHasValidFaceEvaluation)
+			{
+				Candidate.RejectReason = Candidate.FaceEvaluationReason.IsEmpty()
+					? TEXT("candidate has no valid base face")
+					: Candidate.FaceEvaluationReason;
 				continue;
 			}
 
@@ -4492,6 +4745,19 @@ namespace FromLZImageOps
 			Json += FString::Printf(TEXT("    \"black_total_length\": %.3f,\n"), C.BlackTotalLength);
 			Json += FString::Printf(TEXT("    \"has_valid_local_green_action\": %s,\n"), C.bHasValidLocalGreenAction ? TEXT("true") : TEXT("false"));
 			Json += FString::Printf(TEXT("    \"green_prefilter_reason\": \"%s\",\n"), *JsonEscaped(C.GreenPrefilterReason));
+			Json += FString::Printf(TEXT("    \"face_evaluation_valid\": %s,\n"), C.bHasValidFaceEvaluation ? TEXT("true") : TEXT("false"));
+			Json += FString::Printf(TEXT("    \"face_evaluation_reason\": \"%s\",\n"), *JsonEscaped(C.FaceEvaluationReason));
+			Json += FString::Printf(TEXT("    \"rejected_by_interior_red\": %s,\n"), C.bRejectedByInteriorRed ? TEXT("true") : TEXT("false"));
+			Json += FString::Printf(TEXT("    \"interior_red_reject_reason\": \"%s\",\n"), *JsonEscaped(C.InteriorRedRejectReason));
+			Json += FString::Printf(TEXT("    \"face_source_polygon\": \"%s\",\n"), *JsonEscaped(C.Result.FaceEvaluationSourcePolygon));
+			Json += FString::Printf(TEXT("    \"face_cap_mask_pixels\": %d,\n"), C.Result.FaceEvaluationCapMaskPixels);
+			Json += FString::Printf(TEXT("    \"preselected_face_id\": %d,\n"), C.Result.PreselectedFaceId);
+			Json += FString::Printf(TEXT("    \"preselected_face_overlap_pixels\": %d,\n"), C.Result.PreselectedFaceOverlapPixels);
+			Json += FString::Printf(TEXT("    \"preselected_face_overlap_ratio\": %.6f,\n"), C.Result.PreselectedFaceOverlapRatio);
+			Json += FString::Printf(TEXT("    \"candidate_face_overlap_threshold\": %.6f,\n"), FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio);
+			Json += FString::Printf(TEXT("    \"preselected_face_normal_side_angle_degrees\": %.6f,\n"), C.Result.PreselectedFaceNormalSideAngleDegrees);
+			Json += FString::Printf(TEXT("    \"candidate_face_max_normal_side_angle_degrees\": %.6f,\n"), FFromLZFaceReconstructor::CandidateFaceMaxNormalSideAngleDegrees);
+			Json += FString::Printf(TEXT("    \"preselected_face_distance_to_camera\": %.6f,\n"), C.Result.PreselectedFaceDistanceToCamera);
 			Json += FString::Printf(TEXT("    \"prefiltered_action\": \"%s\",\n"), *JsonEscaped(C.Result.Action));
 			Json += FString::Printf(TEXT("    \"prefiltered_action_reason\": \"%s\",\n"), *JsonEscaped(C.Result.ActionDecisionReason));
 			Json += FString::Printf(TEXT("    \"prefiltered_side_length\": %.3f,\n"), C.Result.SideLength);
@@ -4528,6 +4794,81 @@ namespace FromLZImageOps
 			}
 		}
 		return bIn;
+	}
+
+	// Reject a candidate when any contiguous run of a red stroke inside the cap
+	// polygon exceeds CapInteriorRedMaxLineLengthPx pixels.
+	static void CheckCapInteriorRedLines(
+		FLoopCandidate& Candidate,
+		const TArray<FColoredStroke>& Strokes,
+		const TArray<int32>& AllRed)
+	{
+		Candidate.bRejectedByInteriorRed = false;
+		Candidate.InteriorRedRejectReason.Reset();
+
+		const FStroke& CapPoly = Candidate.Result.CapPolygon;
+		if (CapPoly.Num() < 3)
+		{
+			return;
+		}
+
+		// Build a set of the candidate's own red stroke ids (cap boundary) to exclude.
+		TSet<int32> SelfRedIds;
+		for (int32 Sid : Candidate.RedStrokeIds)
+		{
+			SelfRedIds.Add(Sid);
+		}
+
+		for (int32 RedStrokeId : AllRed)
+		{
+			// Skip red strokes that form the candidate's own cap boundary —
+			// they naturally lie on/inside their own polygon and must not
+			// trigger a false-positive rejection.
+			if (SelfRedIds.Contains(RedStrokeId))
+			{
+				continue;
+			}
+			if (!Strokes.IsValidIndex(RedStrokeId))
+			{
+				continue;
+			}
+			const FStroke& Points = Strokes[RedStrokeId].Points;
+			if (Points.Num() < 2)
+			{
+				continue;
+			}
+
+			double ContiguousInsideLength = 0.0;
+			bool bPrevInside = PointInPolygon(CapPoly, Points[0]);
+
+			for (int32 k = 1; k < Points.Num(); ++k)
+			{
+				const bool bInside = PointInPolygon(CapPoly, Points[k]);
+				if (bPrevInside && bInside)
+				{
+					ContiguousInsideLength += (Points[k] - Points[k - 1]).Size();
+				}
+				else if (!bInside)
+				{
+					ContiguousInsideLength = 0.0;
+				}
+				else
+				{
+					// bInside && !bPrevInside: start a new inside run from this point.
+					ContiguousInsideLength = 0.0;
+				}
+
+				if (ContiguousInsideLength > CapInteriorRedMaxLineLengthPx)
+				{
+					Candidate.bRejectedByInteriorRed = true;
+					Candidate.InteriorRedRejectReason = FString::Printf(
+						TEXT("red stroke %d has %.1fpx contiguous inside cap polygon (threshold %.1f)"),
+						RedStrokeId, ContiguousInsideLength, CapInteriorRedMaxLineLengthPx);
+					return;
+				}
+				bPrevInside = bInside;
+			}
+		}
 	}
 
 	static constexpr double InteriorGreenMinInsideLengthPx = 10.0;
@@ -5345,6 +5686,70 @@ namespace FromLZImageOps
 				Height);
 		}
 
+		// Interior red line check: reject any candidate whose cap polygon
+		// interior contains a red stroke segment longer than 20px.
+		for (FLoopCandidate& Candidate : Candidates)
+		{
+			if (!Candidate.bHasValidLocalGreenAction)
+			{
+				continue; // already rejected by green prefilter
+			}
+			CheckCapInteriorRedLines(Candidate, TraceStrokes, RedIdx);
+		}
+
+		TArray<FFromLZCandidateFaceRequest> FaceRequests;
+		FaceRequests.Reserve(Candidates.Num());
+		for (const FLoopCandidate& Candidate : Candidates)
+		{
+			FFromLZCandidateFaceRequest Request;
+			Request.CandidateSource = Candidate.Source;
+			Request.Action = Candidate.Result.Action;
+			Request.CapPolygon = Candidate.Result.CapPolygon;
+			Request.CapPolygonTranslated = Candidate.Result.CapPolygonTranslated;
+			Request.SideVectors = Candidate.Result.SideCandidateVectors;
+			if (Request.SideVectors.Num() == 0 && Candidate.Result.SideVector.SizeSquared() > 1e-8)
+			{
+				Request.SideVectors.Add(Candidate.Result.SideVector);
+			}
+			FaceRequests.Add(MoveTemp(Request));
+		}
+
+		TArray<FFromLZCandidateFaceEvaluation> FaceEvaluations;
+		FString FaceEvaluationError;
+		const bool bFaceEvaluationBatchReady = FFromLZFaceReconstructor::EvaluateCandidateFaces(
+			PressDir, Width, Height, FaceRequests, FaceEvaluations, FaceEvaluationError);
+		for (int32 CandidateIndex = 0; CandidateIndex < Candidates.Num(); ++CandidateIndex)
+		{
+			FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			Candidate.bHasValidFaceEvaluation = false;
+			if (!bFaceEvaluationBatchReady)
+			{
+				Candidate.FaceEvaluationReason = FString::Printf(
+					TEXT("candidate face evaluation unavailable: %s"), *FaceEvaluationError);
+				Candidate.Result.FaceEvaluationRejectReason = Candidate.FaceEvaluationReason;
+				continue;
+			}
+			if (!FaceEvaluations.IsValidIndex(CandidateIndex))
+			{
+				Candidate.FaceEvaluationReason = TEXT("candidate face evaluation result is missing");
+				Candidate.Result.FaceEvaluationRejectReason = Candidate.FaceEvaluationReason;
+				continue;
+			}
+
+			const FFromLZCandidateFaceEvaluation& Evaluation = FaceEvaluations[CandidateIndex];
+			Candidate.bHasValidFaceEvaluation = Evaluation.bValid;
+			Candidate.FaceEvaluationReason = Evaluation.RejectReason;
+			Candidate.Result.bFaceEvaluationValid = Evaluation.bValid;
+			Candidate.Result.FaceEvaluationSourcePolygon = Evaluation.SourcePolygonKey;
+			Candidate.Result.FaceEvaluationRejectReason = Evaluation.RejectReason;
+			Candidate.Result.FaceEvaluationCapMaskPixels = Evaluation.CapMaskPixels;
+			Candidate.Result.PreselectedFaceId = Evaluation.SelectedFaceId;
+			Candidate.Result.PreselectedFaceOverlapPixels = Evaluation.SelectedFaceOverlapPixels;
+			Candidate.Result.PreselectedFaceOverlapRatio = Evaluation.SelectedFaceOverlapRatio;
+			Candidate.Result.PreselectedFaceNormalSideAngleDegrees = Evaluation.SelectedFaceNormalSideAngleDegrees;
+			Candidate.Result.PreselectedFaceDistanceToCamera = Evaluation.SelectedFaceDistanceToCamera;
+		}
+
 		TArray<int32> SelectedCandidateIndices;
 		SelectLoopCandidates(Candidates, SelectedCandidateIndices);
 		SaveLoopCandidatesJson(Candidates, PressDir / TEXT("09_loop_candidates.json"));
@@ -5528,6 +5933,15 @@ namespace FromLZImageOps
 		Json += FString::Printf(TEXT("  \"interior_green_min_inside_length\": %.3f,\n"), InteriorGreenMinInsideLengthPx);
 		Json += FString::Printf(TEXT("  \"candidate_source\": \"%s\",\n"), *Res.CandidateSource);
 		Json += FString::Printf(TEXT("  \"candidate_anchor_stroke_id\": %d,\n"), Res.CandidateAnchorStrokeId);
+		Json += FString::Printf(TEXT("  \"face_evaluation_valid\": %s,\n"), Res.bFaceEvaluationValid ? TEXT("true") : TEXT("false"));
+		Json += FString::Printf(TEXT("  \"face_evaluation_source_polygon\": \"%s\",\n"), *JsonEscaped(Res.FaceEvaluationSourcePolygon));
+		Json += FString::Printf(TEXT("  \"face_evaluation_reject_reason\": \"%s\",\n"), *JsonEscaped(Res.FaceEvaluationRejectReason));
+		Json += FString::Printf(TEXT("  \"face_evaluation_cap_mask_pixels\": %d,\n"), Res.FaceEvaluationCapMaskPixels);
+		Json += FString::Printf(TEXT("  \"preselected_face_id\": %d,\n"), Res.PreselectedFaceId);
+		Json += FString::Printf(TEXT("  \"preselected_face_overlap_pixels\": %d,\n"), Res.PreselectedFaceOverlapPixels);
+		Json += FString::Printf(TEXT("  \"preselected_face_overlap_ratio\": %.6f,\n"), Res.PreselectedFaceOverlapRatio);
+		Json += FString::Printf(TEXT("  \"preselected_face_normal_side_angle_degrees\": %.6f,\n"), Res.PreselectedFaceNormalSideAngleDegrees);
+		Json += FString::Printf(TEXT("  \"preselected_face_distance_to_camera\": %.6f,\n"), Res.PreselectedFaceDistanceToCamera);
 
 		// Selected green side stroke (chord vector + endpoint segment).
 		Json += TEXT("  \"side_vectors\": [");

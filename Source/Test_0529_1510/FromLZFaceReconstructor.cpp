@@ -37,9 +37,8 @@ namespace
 	const FName Step11HiddenSourceTag(TEXT("FromLZ_Step11HiddenSource"));
 	const FName Step11ActionAttachTag(TEXT("FromLZ_Action_Attach"));
 	const FName Step11ActionExcavateCutterTag(TEXT("FromLZ_Action_ExcavateCutter"));
-	constexpr double MinOverlapRatio = 0.05;
-	constexpr double NormalParallelThresholdDegrees = 30.0;
-	constexpr double PreferredNormalAngleThresholdDegrees = 10.0;
+	constexpr double NormalParallelThresholdDegrees = FFromLZFaceReconstructor::CandidateFaceMaxNormalSideAngleDegrees;
+	constexpr double PreferredNormalAngleThresholdDegrees = FFromLZFaceReconstructor::CandidateFacePreferredNormalSideAngleDegrees;
 	constexpr double MinProjectedNormalPixels = 1.0;
 	constexpr double SolidCollinearTolerancePixels = 0.75;
 	constexpr double SolidRdpTolerancePixels = 1.25;
@@ -1613,6 +1612,221 @@ namespace
 		return ProjectWorldDirectionToImageOrthographic(Camera, Width, Height, Face.Normal, OutDirection);
 	}
 
+	static void MapPolygonToFacesSpace(
+		const TArray<FVector2D>& InPoly, double ScaleX, double ScaleY, TArray<FVector2D>& OutPoly);
+	static void SaveCandidateFaceValidationDebug(
+		const FFromLZCandidateFaceRequest& Request,
+		const FFromLZCandidateFaceEvaluation& Evaluation,
+		const FCommonInputs& Inputs,
+		int32 SourceWidth,
+		int32 SourceHeight,
+		const TArray<uint8>& Mask,
+		const TArray<FFaceCandidate>& Candidates,
+		const FString& OutputDir);
+
+	static FFromLZCandidateFaceEvaluation EvaluateSourcePolygonForFaces(
+		const TArray<FVector2D>& SourcePolygon,
+		const TArray<FVector2D>& SideVectors,
+		int32 SourceWidth,
+		int32 SourceHeight,
+		const FString& SourcePolygonKey,
+		const FCommonInputs& Inputs,
+		TArray<uint8>* OutMask = nullptr,
+		TArray<FFaceCandidate>* OutCandidates = nullptr)
+	{
+		FFromLZCandidateFaceEvaluation Evaluation;
+		Evaluation.bEvaluated = true;
+		Evaluation.SourcePolygonKey = SourcePolygonKey;
+
+		if (SourceWidth <= 0 || SourceHeight <= 0 || Inputs.FacesWidth <= 0 || Inputs.FacesHeight <= 0)
+		{
+			Evaluation.RejectReason = TEXT("invalid source or faces image dimensions");
+			return Evaluation;
+		}
+		if (SourcePolygon.Num() < 3)
+		{
+			Evaluation.RejectReason = TEXT("source polygon has fewer than three points");
+			return Evaluation;
+		}
+
+		const double ScaleX = double(Inputs.FacesWidth) / double(SourceWidth);
+		const double ScaleY = double(Inputs.FacesHeight) / double(SourceHeight);
+		TArray<FVector2D> FaceSpacePoly;
+		MapPolygonToFacesSpace(SourcePolygon, ScaleX, ScaleY, FaceSpacePoly);
+
+		TArray<FVector2D> FaceSpaceSideVectors;
+		for (const FVector2D& SideVector : SideVectors)
+		{
+			const FVector2D Scaled(SideVector.X * ScaleX, SideVector.Y * ScaleY);
+			if (Scaled.SizeSquared() >= 1e-8)
+			{
+				FaceSpaceSideVectors.Add(Scaled.GetSafeNormal());
+			}
+		}
+		if (FaceSpaceSideVectors.Num() == 0)
+		{
+			Evaluation.RejectReason = TEXT("candidate has no non-zero side vector in faces image space");
+			return Evaluation;
+		}
+
+		TArray<uint8> Mask;
+		RasterizePolygonMask(FaceSpacePoly, Inputs.FacesWidth, Inputs.FacesHeight, Mask, Evaluation.CapMaskPixels);
+		if (OutMask)
+		{
+			*OutMask = Mask;
+		}
+		if (Evaluation.CapMaskPixels <= 0)
+		{
+			Evaluation.RejectReason = TEXT("source polygon mask is empty in faces image space");
+			return Evaluation;
+		}
+
+		TMap<int32, FOverlapAccum> AccumByFace;
+		for (int32 y = 0; y < Inputs.FacesHeight; ++y)
+		{
+			for (int32 x = 0; x < Inputs.FacesWidth; ++x)
+			{
+				const int32 PixIdx = y * Inputs.FacesWidth + x;
+				if (Mask[PixIdx] == 0)
+				{
+					continue;
+				}
+				const int32 Off = PixIdx * 4;
+				const uint32 Key = ColorKey(Inputs.FacesRGBA[Off + 0], Inputs.FacesRGBA[Off + 1], Inputs.FacesRGBA[Off + 2]);
+				if (const int32* FaceId = Inputs.FaceIdByColorKey.Find(Key))
+				{
+					FOverlapAccum& Acc = AccumByFace.FindOrAdd(*FaceId);
+					++Acc.Pixels;
+					Acc.SumX += double(x) + 0.5;
+					Acc.SumY += double(y) + 0.5;
+				}
+			}
+		}
+
+		TArray<FFaceCandidate> Candidates;
+		bool bAnyOverlapPass = false;
+		bool bAnyAnglePass = false;
+		bool bAnyPlaneHit = false;
+		for (const TPair<int32, FOverlapAccum>& Pair : AccumByFace)
+		{
+			const double OverlapRatio = double(Pair.Value.Pixels) / double(Evaluation.CapMaskPixels);
+			const int32* FaceIndex = Inputs.FaceIndexById.Find(Pair.Key);
+			if (!FaceIndex)
+			{
+				continue;
+			}
+			const bool bOverlapPass =
+				OverlapRatio >= FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio;
+			bAnyOverlapPass |= bOverlapPass;
+			const FFaceInfo& Face = Inputs.Faces[*FaceIndex];
+			FFaceCandidate Candidate;
+			Candidate.FaceId = Pair.Key;
+			Candidate.OverlapPixels = Pair.Value.Pixels;
+			Candidate.OverlapRatio = OverlapRatio;
+			Candidate.MaskCentroid = FVector2D(
+				Pair.Value.SumX / double(Pair.Value.Pixels),
+				Pair.Value.SumY / double(Pair.Value.Pixels));
+			Candidate.bHasPlaneHit = IntersectMaskCentroidWithFacePlane(
+				Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
+				Candidate.MaskCentroid, Face, Candidate.PlaneHit, Candidate.DistanceToCamera);
+			bAnyPlaneHit |= bOverlapPass && Candidate.bHasPlaneHit;
+			if (Candidate.bHasPlaneHit)
+			{
+				Candidate.bHasProjectedNormal = ProjectFaceNormalToImage(
+					Inputs.Camera, Inputs.FacesWidth, Inputs.FacesHeight,
+					Face, Candidate.ProjectedNormal2D);
+				if (Candidate.bHasProjectedNormal)
+				{
+					const FVector2D NormalDir = Candidate.ProjectedNormal2D.GetSafeNormal();
+					double BestAngle = 180.0;
+					FVector2D BestOrientedNormalDir = NormalDir;
+					for (const FVector2D& GreenDir : FaceSpaceSideVectors)
+					{
+						const double SignedDot = FVector2D::DotProduct(NormalDir, GreenDir);
+						const double Dot = FMath::Clamp(FMath::Abs(SignedDot), 0.0, 1.0);
+						const double Angle = FMath::RadiansToDegrees(FMath::Acos(Dot));
+						if (Angle < BestAngle)
+						{
+							BestAngle = Angle;
+							BestOrientedNormalDir = SignedDot >= 0.0 ? NormalDir : -NormalDir;
+						}
+					}
+					Candidate.ProjectedNormal2D = BestOrientedNormalDir;
+					Candidate.NormalGreenAngleDegrees = BestAngle;
+					Candidate.bNormalParallelPass = BestAngle <= NormalParallelThresholdDegrees;
+					bAnyAnglePass |= bOverlapPass && Candidate.bNormalParallelPass;
+				}
+			}
+			Candidates.Add(Candidate);
+		}
+
+		Candidates.Sort([](const FFaceCandidate& A, const FFaceCandidate& B)
+		{
+			return A.FaceId < B.FaceId;
+		});
+		if (OutCandidates)
+		{
+			*OutCandidates = Candidates;
+		}
+
+		const FFaceCandidate* Preferred = nullptr;
+		const FFaceCandidate* Fallback = nullptr;
+		for (const FFaceCandidate& Candidate : Candidates)
+		{
+			if (Candidate.OverlapRatio < FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio ||
+				!Candidate.bHasPlaneHit ||
+				!Candidate.bNormalParallelPass)
+			{
+				continue;
+			}
+			if (!Fallback || Candidate.DistanceToCamera < Fallback->DistanceToCamera)
+			{
+				Fallback = &Candidate;
+			}
+			if (Candidate.NormalGreenAngleDegrees < PreferredNormalAngleThresholdDegrees &&
+				(!Preferred || Candidate.DistanceToCamera < Preferred->DistanceToCamera))
+			{
+				Preferred = &Candidate;
+			}
+		}
+
+		const FFaceCandidate* Selected = Preferred ? Preferred : Fallback;
+		if (!Selected)
+		{
+			if (!bAnyOverlapPass)
+			{
+				Evaluation.RejectReason = FString::Printf(
+					TEXT("no face reaches candidate overlap threshold %.3f"),
+					FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio);
+			}
+			else if (!bAnyPlaneHit)
+			{
+				Evaluation.RejectReason = TEXT("overlap passed but no face had a valid camera-to-plane intersection");
+			}
+			else if (!bAnyAnglePass)
+			{
+				Evaluation.RejectReason = FString::Printf(
+					TEXT("overlap passed but no face normal is within %.1f degrees of the side vector"),
+					NormalParallelThresholdDegrees);
+			}
+			else
+			{
+				Evaluation.RejectReason = TEXT("no face passed all candidate face checks");
+			}
+			return Evaluation;
+		}
+
+		Evaluation.bValid = true;
+		Evaluation.RejectReason = TEXT("selected");
+		Evaluation.SelectedFaceId = Selected->FaceId;
+		Evaluation.SelectedFaceOverlapPixels = Selected->OverlapPixels;
+		Evaluation.SelectedFaceOverlapRatio = Selected->OverlapRatio;
+		Evaluation.SelectedFaceNormalSideAngleDegrees = Selected->NormalGreenAngleDegrees;
+		Evaluation.SelectedFaceDistanceToCamera = Selected->DistanceToCamera;
+		Evaluation.SelectedPlaneHit = Selected->PlaneHit;
+		return Evaluation;
+	}
+
 	static bool ProjectSignedWorldDirectionToImage(
 		const FCameraInfo& Camera, int32 Width, int32 Height,
 		const FVector& DirectionWorld, FVector2D& OutDirection)
@@ -2268,6 +2482,193 @@ namespace
 		const FVector2D Base = B - Dir * HeadLen;
 		DrawLineRGBA(RGBA, Width, Height, B, Base + Perp * HeadHalf, Color, Radius);
 		DrawLineRGBA(RGBA, Width, Height, B, Base - Perp * HeadHalf, Color, Radius);
+	}
+
+	static void SaveCandidateFaceValidationDebug(
+		const FFromLZCandidateFaceRequest& Request,
+		const FFromLZCandidateFaceEvaluation& Evaluation,
+		const FCommonInputs& Inputs,
+		int32 SourceWidth,
+		int32 SourceHeight,
+		const TArray<uint8>& Mask,
+		const TArray<FFaceCandidate>& Candidates,
+		const FString& OutputDir)
+	{
+		IFileManager::Get().MakeDirectory(*OutputDir, true);
+
+		const TArray<FVector2D>& SourcePolygon =
+			Evaluation.SourcePolygonKey == TEXT("cap_polygon_translated")
+				? Request.CapPolygonTranslated
+				: Request.CapPolygon;
+		const double ScaleX = SourceWidth > 0 ? double(Inputs.FacesWidth) / double(SourceWidth) : 1.0;
+		const double ScaleY = SourceHeight > 0 ? double(Inputs.FacesHeight) / double(SourceHeight) : 1.0;
+		TArray<FVector2D> FaceSpacePolygon;
+		MapPolygonToFacesSpace(SourcePolygon, ScaleX, ScaleY, FaceSpacePolygon);
+
+		if (Inputs.FacesRGBA.Num() >= Inputs.FacesWidth * Inputs.FacesHeight * 4)
+		{
+			TArray<uint8> RGBA = Inputs.FacesRGBA;
+			TMap<int32, const FFaceCandidate*> CandidateByFaceId;
+			for (const FFaceCandidate& Candidate : Candidates)
+			{
+				CandidateByFaceId.Add(Candidate.FaceId, &Candidate);
+			}
+
+			if (Mask.Num() >= Inputs.FacesWidth * Inputs.FacesHeight)
+			{
+				for (int32 Pixel = 0; Pixel < Inputs.FacesWidth * Inputs.FacesHeight; ++Pixel)
+				{
+					if (Mask[Pixel] == 0)
+					{
+						continue;
+					}
+
+					const int32 Offset = Pixel * 4;
+					const uint32 Key = ColorKey(RGBA[Offset + 0], RGBA[Offset + 1], RGBA[Offset + 2]);
+					const int32* FaceId = Inputs.FaceIdByColorKey.Find(Key);
+					FColor Overlay(230, 30, 50, 255);
+					if (FaceId)
+					{
+						if (const FFaceCandidate* const* Found = CandidateByFaceId.Find(*FaceId))
+						{
+							const FFaceCandidate& Candidate = **Found;
+							if (Candidate.FaceId == Evaluation.SelectedFaceId)
+							{
+								Overlay = FColor(40, 230, 80, 255);
+							}
+							else if (Candidate.OverlapRatio < FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio)
+							{
+								Overlay = FColor(230, 30, 50, 255);
+							}
+							else if (!Candidate.bHasPlaneHit || !Candidate.bNormalParallelPass)
+							{
+								Overlay = FColor(255, 205, 30, 255);
+							}
+							else
+							{
+								Overlay = FColor(0, 200, 255, 255);
+							}
+						}
+					}
+
+					RGBA[Offset + 0] = BlendChannel(RGBA[Offset + 0], Overlay.R, 0.70);
+					RGBA[Offset + 1] = BlendChannel(RGBA[Offset + 1], Overlay.G, 0.70);
+					RGBA[Offset + 2] = BlendChannel(RGBA[Offset + 2], Overlay.B, 0.70);
+					RGBA[Offset + 3] = 255;
+				}
+			}
+
+			DrawClosedPolylineRGBA(
+				RGBA, Inputs.FacesWidth, Inputs.FacesHeight,
+				FaceSpacePolygon, FColor::White, 2);
+
+			FVector2D PolygonCentroid = FVector2D::ZeroVector;
+			for (const FVector2D& Point : FaceSpacePolygon)
+			{
+				PolygonCentroid += Point;
+			}
+			if (FaceSpacePolygon.Num() > 0)
+			{
+				PolygonCentroid /= double(FaceSpacePolygon.Num());
+			}
+
+			for (const FVector2D& SideVector : Request.SideVectors)
+			{
+				const FVector2D ScaledSide(SideVector.X * ScaleX, SideVector.Y * ScaleY);
+				if (ScaledSide.SizeSquared() > 1e-8)
+				{
+					DrawArrowRGBA(
+						RGBA, Inputs.FacesWidth, Inputs.FacesHeight,
+						PolygonCentroid, PolygonCentroid + ScaledSide,
+						FColor(0, 255, 80, 255), 2);
+				}
+			}
+
+			const double NormalArrowLength = 110.0;
+			for (const FFaceCandidate& Candidate : Candidates)
+			{
+				if (!Candidate.bHasProjectedNormal)
+				{
+					DrawPointRGBA(
+						RGBA, Inputs.FacesWidth, Inputs.FacesHeight,
+						FMath::RoundToInt(Candidate.MaskCentroid.X),
+						FMath::RoundToInt(Candidate.MaskCentroid.Y),
+						FColor(255, 205, 30, 255), 4);
+					continue;
+				}
+
+				FColor ArrowColor(230, 30, 50, 255);
+				if (Candidate.FaceId == Evaluation.SelectedFaceId)
+				{
+					ArrowColor = FColor(40, 230, 80, 255);
+				}
+				else if (Candidate.OverlapRatio >= FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio &&
+					Candidate.bHasPlaneHit &&
+					Candidate.bNormalParallelPass)
+				{
+					ArrowColor = FColor(0, 200, 255, 255);
+				}
+				else if (Candidate.OverlapRatio >= FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio)
+				{
+					ArrowColor = FColor(255, 205, 30, 255);
+				}
+				const FVector2D Tip =
+					Candidate.MaskCentroid +
+					Candidate.ProjectedNormal2D.GetSafeNormal() * NormalArrowLength;
+				DrawArrowRGBA(
+					RGBA, Inputs.FacesWidth, Inputs.FacesHeight,
+					Candidate.MaskCentroid, Tip, ArrowColor, 2);
+			}
+
+			SaveRGBAToPng(
+				RGBA, Inputs.FacesWidth, Inputs.FacesHeight,
+				OutputDir / TEXT("face_validation.png"));
+		}
+
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("candidate_source"), Request.CandidateSource);
+		Root->SetStringField(TEXT("action"), Request.Action);
+		Root->SetStringField(TEXT("source_polygon"), Evaluation.SourcePolygonKey);
+		Root->SetBoolField(TEXT("valid"), Evaluation.bValid);
+		Root->SetStringField(TEXT("reason"), Evaluation.RejectReason);
+		Root->SetNumberField(TEXT("cap_mask_pixels"), Evaluation.CapMaskPixels);
+		Root->SetNumberField(TEXT("overlap_threshold"), FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio);
+		Root->SetNumberField(TEXT("max_normal_side_angle_degrees"), FFromLZFaceReconstructor::CandidateFaceMaxNormalSideAngleDegrees);
+		Root->SetNumberField(TEXT("preferred_normal_side_angle_degrees"), FFromLZFaceReconstructor::CandidateFacePreferredNormalSideAngleDegrees);
+		Root->SetNumberField(TEXT("selected_face_id"), Evaluation.SelectedFaceId);
+		Root->SetNumberField(TEXT("selected_face_overlap_pixels"), Evaluation.SelectedFaceOverlapPixels);
+		Root->SetNumberField(TEXT("selected_face_overlap_ratio"), Evaluation.SelectedFaceOverlapRatio);
+		Root->SetNumberField(TEXT("selected_face_normal_side_angle_degrees"), Evaluation.SelectedFaceNormalSideAngleDegrees);
+		Root->SetNumberField(TEXT("selected_face_distance_to_camera"), Evaluation.SelectedFaceDistanceToCamera);
+		TSharedRef<FJsonObject> Legend = MakeShared<FJsonObject>();
+		Legend->SetStringField(TEXT("white_outline"), TEXT("candidate source polygon"));
+		Legend->SetStringField(TEXT("green_arrow"), TEXT("local-green side vector"));
+		Legend->SetStringField(TEXT("red_mask"), TEXT("background or face overlap below threshold"));
+		Legend->SetStringField(TEXT("yellow_mask_or_arrow"), TEXT("overlap passed but plane intersection or normal-angle validation failed"));
+		Legend->SetStringField(TEXT("cyan_mask_or_arrow"), TEXT("face passed all hard conditions but was not selected"));
+		Legend->SetStringField(TEXT("green_mask_or_arrow"), TEXT("preselected base face"));
+		Root->SetObjectField(TEXT("legend"), Legend);
+
+		TArray<TSharedPtr<FJsonValue>> CandidateValues;
+		for (const FFaceCandidate& Candidate : Candidates)
+		{
+			TSharedRef<FJsonObject> CandidateObject = MakeShared<FJsonObject>();
+			CandidateObject->SetNumberField(TEXT("face_id"), Candidate.FaceId);
+			CandidateObject->SetNumberField(TEXT("overlap_pixels"), Candidate.OverlapPixels);
+			CandidateObject->SetNumberField(TEXT("overlap_ratio"), Candidate.OverlapRatio);
+			CandidateObject->SetBoolField(
+				TEXT("overlap_pass"),
+				Candidate.OverlapRatio >= FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio);
+			CandidateObject->SetBoolField(TEXT("plane_intersection_valid"), Candidate.bHasPlaneHit);
+			CandidateObject->SetBoolField(TEXT("projected_normal_valid"), Candidate.bHasProjectedNormal);
+			CandidateObject->SetNumberField(TEXT("normal_side_angle_degrees"), Candidate.NormalGreenAngleDegrees);
+			CandidateObject->SetBoolField(TEXT("normal_side_angle_pass"), Candidate.bNormalParallelPass);
+			CandidateObject->SetNumberField(TEXT("distance_to_camera"), Candidate.DistanceToCamera);
+			CandidateObject->SetBoolField(TEXT("selected"), Candidate.FaceId == Evaluation.SelectedFaceId);
+			CandidateValues.Add(MakeShared<FJsonValueObject>(CandidateObject));
+		}
+		Root->SetArrayField(TEXT("faces"), CandidateValues);
+		SaveJsonObject(Root, OutputDir / TEXT("face_validation.json"));
 	}
 
 	static bool IsFiniteVector2D(const FVector2D& Value)
@@ -3558,6 +3959,9 @@ namespace
 		TArray<FVector2D> RawTranslatedPolygon;
 		const bool bHasCapPolygon = ParseVector2DArray(CapJson, TEXT("cap_polygon"), RawCapPolygon);
 		const bool bHasTranslatedPolygon = ParseVector2DArray(CapJson, TEXT("cap_polygon_translated"), RawTranslatedPolygon);
+		double PreselectedFaceIdNumber = -1.0;
+		CapJson->TryGetNumberField(TEXT("preselected_face_id"), PreselectedFaceIdNumber);
+		const int32 PreselectedFaceId = FMath::RoundToInt(PreselectedFaceIdNumber);
 		const TArray<FVector2D>* SourcePolyForFace = Result.PolygonKey == TEXT("cap_polygon") ? &RawCapPolygon : &RawTranslatedPolygon;
 		if (!SourcePolyForFace || SourcePolyForFace->Num() < 3 ||
 			(Result.PolygonKey == TEXT("cap_polygon") && !bHasCapPolygon) ||
@@ -3638,7 +4042,11 @@ namespace
 
 		TArray<uint8> Mask;
 		RasterizePolygonMask(FaceSpacePoly, Inputs.FacesWidth, Inputs.FacesHeight, Mask, Result.CapMaskPixels);
-		Result.MinOverlapPixels = FMath::Max(1, FMath::CeilToInt(double(Result.CapMaskPixels) * MinOverlapRatio));
+		Result.MinOverlapPixels = FMath::Max(
+			1,
+			FMath::CeilToInt(
+				double(Result.CapMaskPixels) *
+				FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio));
 		SaveMaskPng(Mask, Inputs.FacesWidth, Inputs.FacesHeight, ComponentDir / TEXT("10_cap_mask.png"));
 		if (Result.CapMaskPixels <= 0)
 		{
@@ -3798,12 +4206,15 @@ namespace
 		{
 			if (Result.Candidates.Num() == 0)
 			{
-				Result.Error = TEXT("No face survived the 5% mask-overlap threshold");
+				Result.Error = FString::Printf(
+					TEXT("No face survived the %.1f%% candidate mask-overlap threshold"),
+					FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio * 100.0);
 			}
 			else if (ParallelFaceIds.Num() == 0)
 			{
 				Result.Error = FString::Printf(
-					TEXT("No 5%% mask-overlap candidate passed the %.1f degree normal-to-green-line parallel filter"),
+					TEXT("No %.1f%% mask-overlap candidate passed the %.1f degree normal-to-green-line parallel filter"),
+					FFromLZFaceReconstructor::CandidateFaceMinOverlapRatio * 100.0,
 					NormalParallelThresholdDegrees);
 			}
 			else
@@ -3811,6 +4222,21 @@ namespace
 				Result.Error = TEXT("No parallel face candidate had a valid camera-to-plane intersection");
 			}
 			SaveFaceAndSkippedSolid(FString::Printf(TEXT("Solid skipped because Step 10 did not select a source face: %s"), *Result.Error));
+			return Result;
+		}
+		if (PreselectedFaceId < 0)
+		{
+			Result.Error = TEXT("Step 9 did not provide a valid preselected_face_id");
+			SaveFaceAndSkippedSolid(FString::Printf(TEXT("Solid skipped because Step 9/10 face selection validation failed: %s"), *Result.Error));
+			return Result;
+		}
+		if (Result.SelectedFaceId != PreselectedFaceId)
+		{
+			Result.Error = FString::Printf(
+				TEXT("Step 10 selected face %d but Step 9 preselected face %d"),
+				Result.SelectedFaceId,
+				PreselectedFaceId);
+			SaveFaceAndSkippedSolid(FString::Printf(TEXT("Solid skipped because Step 9/10 face selection validation failed: %s"), *Result.Error));
 			return Result;
 		}
 
@@ -6892,6 +7318,97 @@ namespace
 				FString::Printf(TEXT("Solid skipped because Step 10 common inputs failed: %s"), *Error));
 		}
 	}
+}
+
+bool FFromLZFaceReconstructor::EvaluateCandidateFaces(
+	const FString& PressDir,
+	int32 SourceWidth,
+	int32 SourceHeight,
+	const TArray<FFromLZCandidateFaceRequest>& Requests,
+	TArray<FFromLZCandidateFaceEvaluation>& OutEvaluations,
+	FString& OutError)
+{
+	OutEvaluations.Reset();
+	OutError.Reset();
+
+	FCommonInputs Inputs;
+	if (!LoadCaptureRef(PressDir, Inputs))
+	{
+		OutError = TEXT("failed to read capture_ref.json or resolve capture/faces paths");
+		return false;
+	}
+	if (!DecodePngToRGBA(Inputs.FacesPngPath, Inputs.FacesRGBA, Inputs.FacesWidth, Inputs.FacesHeight))
+	{
+		OutError = FString::Printf(TEXT("failed to decode faces png: %s"), *Inputs.FacesPngPath);
+		return false;
+	}
+	if (!LoadFacesJson(Inputs.FacesJsonPath, Inputs.Faces, Inputs.FacesProjection))
+	{
+		OutError = FString::Printf(TEXT("failed to read faces json: %s"), *Inputs.FacesJsonPath);
+		return false;
+	}
+	FString CameraLoadError;
+	if (!LoadCameraJson(Inputs.CaptureJsonPath, Inputs.Camera, CameraLoadError))
+	{
+		OutError = CameraLoadError;
+		return false;
+	}
+	if (!ValidateProjectionMetadata(Inputs, OutError))
+	{
+		return false;
+	}
+	if (!BuildFaceLookups(Inputs, OutError))
+	{
+		return false;
+	}
+
+	OutEvaluations.Reserve(Requests.Num());
+	const FString ValidationRoot = PressDir / TEXT("CandidateFaceValidation");
+	IFileManager::Get().MakeDirectory(*ValidationRoot, true);
+	for (int32 RequestIndex = 0; RequestIndex < Requests.Num(); ++RequestIndex)
+	{
+		const FFromLZCandidateFaceRequest& Request = Requests[RequestIndex];
+		FString SourceLabel = Request.CandidateSource.IsEmpty() ? TEXT("unknown") : Request.CandidateSource;
+		SourceLabel.ReplaceInline(TEXT("/"), TEXT("_"));
+		SourceLabel.ReplaceInline(TEXT("\\"), TEXT("_"));
+		SourceLabel.ReplaceInline(TEXT(" "), TEXT("_"));
+		const FString CandidateOutputDir = ValidationRoot / FString::Printf(
+			TEXT("Candidate_%03d_%s"), RequestIndex, *SourceLabel);
+
+		const bool bExcavate = Request.Action.Equals(TEXT("excavate"), ESearchCase::IgnoreCase);
+		const bool bAttach = Request.Action.Equals(TEXT("attach"), ESearchCase::IgnoreCase);
+		if (!bExcavate && !bAttach)
+		{
+			FFromLZCandidateFaceEvaluation Evaluation;
+			Evaluation.bEvaluated = true;
+			Evaluation.SourcePolygonKey = TEXT("cap_polygon");
+			Evaluation.RejectReason = FString::Printf(TEXT("unsupported candidate action: %s"), *Request.Action);
+			SaveCandidateFaceValidationDebug(
+				Request, Evaluation, Inputs, SourceWidth, SourceHeight,
+				TArray<uint8>(), TArray<FFaceCandidate>(), CandidateOutputDir);
+			OutEvaluations.Add(Evaluation);
+			continue;
+		}
+
+		const TArray<FVector2D>& SourcePolygon = bExcavate ? Request.CapPolygon : Request.CapPolygonTranslated;
+		const FString SourcePolygonKey = bExcavate ? TEXT("cap_polygon") : TEXT("cap_polygon_translated");
+		TArray<uint8> Mask;
+		TArray<FFaceCandidate> Candidates;
+		FFromLZCandidateFaceEvaluation Evaluation = EvaluateSourcePolygonForFaces(
+			SourcePolygon,
+			Request.SideVectors,
+			SourceWidth,
+			SourceHeight,
+			SourcePolygonKey,
+			Inputs,
+			&Mask,
+			&Candidates);
+		SaveCandidateFaceValidationDebug(
+			Request, Evaluation, Inputs, SourceWidth, SourceHeight,
+			Mask, Candidates, CandidateOutputDir);
+		OutEvaluations.Add(MoveTemp(Evaluation));
+	}
+	return true;
 }
 
 void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FString& ActionPressDir, TWeakObjectPtr<UWorld> World, int32 SessionGeneration)
