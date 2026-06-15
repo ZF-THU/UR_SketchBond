@@ -3225,10 +3225,14 @@ namespace FromLZImageOps
 
 		// Walk an unordered cycle (edge indices) into an ordered node + point sequence.
 		void BuildPolygon(const FColoredStroke* StrokesData, const FGraph& G, const TArray<int32>& Cycle,
-			FStroke& OutPolygon, TArray<FVector2D>& OutNodes)
+			FStroke& OutPolygon, TArray<FVector2D>& OutNodes, TArray<FCapBoundaryRun>* OutRuns = nullptr)
 		{
 			OutPolygon.Reset();
 			OutNodes.Reset();
+			if (OutRuns)
+			{
+				OutRuns->Reset();
+			}
 			if (Cycle.Num() == 0)
 			{
 				return;
@@ -3258,6 +3262,13 @@ namespace FromLZImageOps
 
 				const FStroke& SP = StrokesData[G.StrokeId[e]].Points;
 				OutNodes.Add(G.NodePos[CurNode]);
+				FCapBoundaryRun Run;
+				Run.StrokeId = G.StrokeId[e];
+				Run.Color = G.bBlack[e] ? EStrokeColor::Black : EStrokeColor::Red;
+				Run.bSynthetic = G.bSynthetic.IsValidIndex(e) && G.bSynthetic[e] != 0;
+				Run.bReversed = !bForward;
+				Run.StartNodeId = CurNode;
+				Run.StartNodePosition = G.NodePos[CurNode];
 
 				if (bForward)
 				{
@@ -3266,6 +3277,10 @@ namespace FromLZImageOps
 						if (OutPolygon.Num() == 0 || (OutPolygon.Last() - SP[k]).SizeSquared() > 1e-6)
 						{
 							OutPolygon.Add(SP[k]);
+						}
+						if (Run.Points.Num() == 0 || (Run.Points.Last() - SP[k]).SizeSquared() > 1e-6)
+						{
+							Run.Points.Add(SP[k]);
 						}
 					}
 					CurNode = G.NodeV[e];
@@ -3278,8 +3293,21 @@ namespace FromLZImageOps
 						{
 							OutPolygon.Add(SP[k]);
 						}
+						if (Run.Points.Num() == 0 || (Run.Points.Last() - SP[k]).SizeSquared() > 1e-6)
+						{
+							Run.Points.Add(SP[k]);
+						}
 					}
 					CurNode = G.NodeU[e];
+				}
+				Run.EndNodeId = CurNode;
+				Run.EndNodePosition = G.NodePos[CurNode];
+				Run.ArcLengthPixels = StrokesData[Run.StrokeId].Arc;
+				Run.ChordLengthPixels = StrokesData[Run.StrokeId].Chord;
+				Run.Straightness = StrokesData[Run.StrokeId].Straightness;
+				if (OutRuns)
+				{
+					OutRuns->Add(MoveTemp(Run));
 				}
 			}
 
@@ -4418,7 +4446,13 @@ namespace FromLZImageOps
 				Out.BlackTotalLength += StrokeArcLength(Strokes[StrokeId]);
 			}
 		}
-		BuildPolygon(Strokes.GetData(), G, Cycle, Out.Result.CapPolygon, Out.Result.CapNodes);
+		BuildPolygon(
+			Strokes.GetData(),
+			G,
+			Cycle,
+			Out.Result.CapPolygon,
+			Out.Result.CapNodes,
+			&Out.Result.OrderedBoundaryRuns);
 		if (!IsValidLoopPolygon(Out.Result.CapPolygon))
 		{
 			return false;
@@ -5967,6 +6001,49 @@ namespace FromLZImageOps
 			Json += FString::Printf(TEXT("%s%d"), (i == 0 ? TEXT("") : TEXT(", ")), Res.CapStrokeIds[i]);
 		}
 		Json += TEXT("],\n");
+
+		Json += TEXT("  \"ordered_boundary_runs\": [\n");
+		for (int32 RunIndex = 0; RunIndex < Res.OrderedBoundaryRuns.Num(); ++RunIndex)
+		{
+			const FCapBoundaryRun& Run = Res.OrderedBoundaryRuns[RunIndex];
+			const TCHAR* Type = Run.bSynthetic
+				? TEXT("connector")
+				: (Run.Color == EStrokeColor::Black ? TEXT("black") : TEXT("red"));
+			Json += TEXT("    {\n");
+			Json += FString::Printf(TEXT("      \"stroke_id\": %d,\n"), Run.StrokeId);
+			Json += FString::Printf(TEXT("      \"type\": \"%s\",\n"), Type);
+			Json += FString::Printf(TEXT("      \"color\": \"%s\",\n"), StrokeColorToString(Run.Color));
+			Json += FString::Printf(TEXT("      \"synthetic\": %s,\n"), Run.bSynthetic ? TEXT("true") : TEXT("false"));
+			Json += FString::Printf(TEXT("      \"reversed\": %s,\n"), Run.bReversed ? TEXT("true") : TEXT("false"));
+			Json += FString::Printf(TEXT("      \"start_node_id\": %d,\n"), Run.StartNodeId);
+			Json += FString::Printf(TEXT("      \"end_node_id\": %d,\n"), Run.EndNodeId);
+			Json += FString::Printf(
+				TEXT("      \"start_node_position\": [%.6f, %.6f],\n"),
+				Run.StartNodePosition.X,
+				Run.StartNodePosition.Y);
+			Json += FString::Printf(
+				TEXT("      \"end_node_position\": [%.6f, %.6f],\n"),
+				Run.EndNodePosition.X,
+				Run.EndNodePosition.Y);
+			Json += FString::Printf(TEXT("      \"arc_length_pixels\": %.9g,\n"), Run.ArcLengthPixels);
+			Json += FString::Printf(TEXT("      \"chord_length_pixels\": %.9g,\n"), Run.ChordLengthPixels);
+			Json += FString::Printf(TEXT("      \"straightness\": %.9g,\n"), Run.Straightness);
+			Json += TEXT("      \"points\": [");
+			for (int32 PointIndex = 0; PointIndex < Run.Points.Num(); ++PointIndex)
+			{
+				const FVector2D& Point = Run.Points[PointIndex];
+				Json += FString::Printf(
+					TEXT("%s[%.6f, %.6f]"),
+					PointIndex == 0 ? TEXT("") : TEXT(", "),
+					Point.X,
+					Point.Y);
+			}
+			Json += TEXT("]\n");
+			Json += FString::Printf(
+				TEXT("    }%s\n"),
+				RunIndex + 1 < Res.OrderedBoundaryRuns.Num() ? TEXT(",") : TEXT(""));
+		}
+		Json += TEXT("  ],\n");
 
 		auto WritePoly = [&](const TCHAR* Key, const FStroke& Poly, bool bTrailingComma)
 		{

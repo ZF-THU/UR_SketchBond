@@ -16,6 +16,7 @@
 #include "EngineUtils.h"
 #include "GameFramework/Actor.h"
 #include "HAL/FileManager.h"
+#include "HAL/IConsoleManager.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Materials/Material.h"
@@ -48,6 +49,45 @@ namespace
 	constexpr double CapBBoxDegenerateAreaTolerance = 1e-6;
 	constexpr double FaceBBoxSquareRelativeTolerance = 0.01;
 	constexpr int32 CapBBoxDebugImageSize = 1024;
+
+	// Per-face capture pipeline (Source A removal): when enabled, the face boundary
+	// is reconstructed from the shared-camera contour by detecting image-clip corners
+	// (those whose 2D pixel position lies on the captured image rectangle) and
+	// snapping them onto the axis-aligned bbox in face UV. This eliminates the tilt
+	// caused by the shared camera's image rectangle intersecting the face plane at
+	// an oblique angle. Source B (cap polygon tilt from sketch via shared camera)
+	// is intentionally NOT addressed here; it remains handled by pure_red_root_alignment.
+	static int32 GFromLZUsePerFaceCapture = 1;
+	static FAutoConsoleVariableRef CVarFromLZUsePerFaceCapture(
+		TEXT("r.FromLZ.UsePerFaceCapture"),
+		GFromLZUsePerFaceCapture,
+		TEXT("If non-zero (default 1), derive face boundary by detecting image-clip corners in the shared-camera contour and snapping them to the axis-aligned bbox in face UV (eliminates Source A tilt). Set to 0 to use the legacy raw contour."),
+		ECVF_Default);
+	static constexpr double GFromLZPerFaceClipMarginPixels = 1.5;
+
+	// Pure-red root selection: when 0 (default), the pure_red_root_alignment stage
+	// only accepts root candidates targeting the U/V axes (0deg / 90deg) and skips
+	// diagonal targets (Octi_DiagPlus = 45deg, Octi_DiagMinus = 135deg). Set to
+	// non-zero to allow diagonal red roots (legacy behavior) so that a dominant
+	// near-45deg / near-135deg red stroke can rotate the entire cap onto a
+	// diagonal frame.
+	static int32 GFromLZPureRedAllowDiagonalRoot = 0;
+	static FAutoConsoleVariableRef CVarFromLZPureRedAllowDiagonalRoot(
+		TEXT("r.FromLZ.PureRedAllowDiagonalRoot"),
+		GFromLZPureRedAllowDiagonalRoot,
+		TEXT("If 0 (default), pure-red root candidates targeting Octi_DiagPlus (45deg) or Octi_DiagMinus (135deg) are skipped, restricting pure-red root alignment to U/V (0deg/90deg). Set to non-zero to restore legacy behavior allowing diagonal roots."),
+		ECVF_Default);
+
+	constexpr double WorldOrthoBlackAxisToleranceDegrees = 5.0;
+	constexpr double WorldOrthoDiagThresholdDegrees = 40.0;
+	constexpr double WorldOrthoAngleComparisonEpsilonDegrees = 1e-6;
+	constexpr double WorldOrthoBlackNodeSnapTolerancePixels = 10.0;
+	constexpr double WorldOrthoRedMacroCorridorPixels = 5.0;
+	constexpr double WorldOrthoRedMacroGroupMinLengthPixels = 20.0;
+	constexpr double WorldOrthoRedPrimitiveRdpTolerancePixels = 1.0;
+	constexpr double WorldOrthoShortRedEdgeLengthPixels = 20.0;
+	constexpr double WorldOrthoMinAreaRatio = 0.4;
+	constexpr int32 WorldOrthoPureRedMaxRootCandidates = 5;
 	constexpr double ExcavationCutterNormalScale = 1.2;
 	constexpr double ExcavationCutterCapScale = 1.1;
 	constexpr double Step11BooleanMinRenderableEdgeCm = 0.05;
@@ -171,6 +211,92 @@ namespace
 		double ReprojectionErrorPixels = 0.0;
 	};
 
+	struct FWorldOrthogonalStageDebug
+	{
+		FString Name;
+		FString Status = TEXT("not_reached");
+		FString Message;
+	};
+
+	struct FWorldOrthogonalRunDebug
+	{
+		int32 RunIndex = INDEX_NONE;
+		int32 StrokeId = INDEX_NONE;
+		FString Type;
+		bool bIgnoredConnector = false;
+		bool bUnprojected = false;
+		int32 StartNodeId = INDEX_NONE;
+		int32 EndNodeId = INDEX_NONE;
+		FVector2D StartNodeCapSpace = FVector2D::ZeroVector;
+		FVector2D EndNodeCapSpace = FVector2D::ZeroVector;
+		FVector2D StartNodeUV = FVector2D::ZeroVector;
+		FVector2D EndNodeUV = FVector2D::ZeroVector;
+		TArray<FVector2D> SourcePointsCapSpace;
+		TArray<FVector2D> FacePixels;
+		TArray<FVector2D> SamplesUV;
+		TArray<int32> ProtectedPointIndices;
+		TArray<FVector2D> ProtectedPointsUV;
+		FString RedProtectionMode;
+		double RedMaxChordDeviationPixels = 0.0;
+		TArray<FString> RedDirectionalGroupAxisTypes;
+		TArray<double> RedDirectionalGroupLengthsPixels;
+		TArray<int32> RedDirectionalGroupStartIndices;
+		TArray<int32> RedDirectionalGroupEndIndices;
+	};
+
+	struct FWorldOrthogonalEdgeDebug
+	{
+		int32 EdgeIndex = INDEX_NONE;
+		FString Type;
+		FString AxisTypeName;
+		TArray<int32> SourceRunIndices;
+		TArray<int32> SourceStrokeIds;
+		TArray<int32> PrimitiveEdgeIndices;
+		TArray<int32> GraphNodeIds;
+		TArray<FVector2D> GraphNodeCapSpace;
+		TArray<FVector2D> GraphNodeUV;
+		TArray<FVector2D> SnappedGraphNodeUV;
+		TArray<double> GraphNodeSnapDistancesPixels;
+		TArray<FVector2D> SamplesUV;
+		FVector2D StartUV = FVector2D::ZeroVector;
+		FVector2D EndUV = FVector2D::ZeroVector;
+		FVector2D DirectionUV = FVector2D::ZeroVector;
+		FVector2D SolvedStartUV = FVector2D::ZeroVector;
+		FVector2D SolvedEndUV = FVector2D::ZeroVector;
+		int32 AxisType = 0; // EOctilinearAxis value for debug JSON
+		double AngleToU = 180.0;
+		double AngleToV = 180.0;
+		double AngleToDiagPlus = 180.0;
+		double AngleToDiagMinus = 180.0;
+		double AngleToAssignedAxis = 0.0;
+		double SupportCoordinate = 0.0;
+		double PathLength = 0.0;
+	};
+
+	struct FWorldOrthogonalRootHypothesisDebug
+	{
+		int32 HypothesisIndex = INDEX_NONE;
+		int32 RootPrimitiveEdgeIndex = INDEX_NONE;
+		TArray<int32> RootStrokeIds;
+		FString TargetAxisTypeName;
+		FVector2D RootStartUV = FVector2D::ZeroVector;
+		FVector2D RootEndUV = FVector2D::ZeroVector;
+		FVector2D AlignedRootStartUV = FVector2D::ZeroVector;
+		FVector2D AlignedRootEndUV = FVector2D::ZeroVector;
+		double RootLengthPixels = 0.0;
+		double RootMaxChordDeviationPixels = 0.0;
+		double Reliability = 0.0;
+		double RotationDegrees = 0.0;
+		bool bValid = false;
+		bool bSelected = false;
+		FString RejectionReason;
+		int32 GeometryEdgeCount = 0;
+		double AngleCost = 0.0;
+		double AreaRatio = 0.0;
+		double MeanBoundaryDistance = 0.0;
+		double MaxBoundaryDistance = 0.0;
+	};
+
 	struct FCapBBoxRegularizationResult
 	{
 		bool bAttempted = false;
@@ -191,12 +317,43 @@ namespace
 		double CapMinimumBBoxArea = 0.0;
 		double CapMinimumBBoxRatio = 0.0;
 		bool bCapMinimumBBoxPassed = false;
+		bool bWorldOrthogonal = false;
+		bool bContainsBlack = false;
+		int32 BoundaryRunCount = 0;
+		int32 PrimitiveGeometryEdgeCount = 0;
+		int32 GeometryEdgeCount = 0;
+		int32 IgnoredConnectorCount = 0;
+		double WorldOrthogonalAngleCost = 0.0;
+		double WorldOrthogonalAreaRatio = 0.0;
+		double WorldOrthogonalMeanBoundaryDistance = 0.0;
+		double WorldOrthogonalMaxBoundaryDistance = 0.0;
+		double WorldOrthogonalCapDiagonal = 0.0;
+		bool bPureRedRootAlignmentAttempted = false;
+		int32 SelectedRootHypothesisIndex = INDEX_NONE;
+		int32 SelectedRootPrimitiveEdgeIndex = INDEX_NONE;
+		TArray<int32> SelectedRootStrokeIds;
+		FString SelectedRootTargetAxisTypeName;
+		double SelectedRootRotationDegrees = 0.0;
+		FVector2D RootRotationCenterUV = FVector2D::ZeroVector;
+		FVector2D SelectedRootStartUV = FVector2D::ZeroVector;
+		FVector2D SelectedRootEndUV = FVector2D::ZeroVector;
+		FVector2D SelectedAlignedRootStartUV = FVector2D::ZeroVector;
+		FVector2D SelectedAlignedRootEndUV = FVector2D::ZeroVector;
 		FVector FaceOriginWorld = FVector::ZeroVector;
 		FVector FaceNormalWorld = FVector::UpVector;
 		FVector FaceAxisUWorld = FVector::RightVector;
 		FVector FaceAxisVWorld = FVector::ForwardVector;
 		FVector2D OriginalSourceToCopiedDeltaPixels = FVector2D::ZeroVector;
+		FString WorldOrthogonalActiveStage;
+		TArray<FWorldOrthogonalStageDebug> WorldOrthogonalStages;
+		TArray<FWorldOrthogonalRunDebug> WorldOrthogonalRuns;
+		TArray<FWorldOrthogonalEdgeDebug> WorldOrthogonalPrimitiveEdges;
+		TArray<FWorldOrthogonalEdgeDebug> WorldOrthogonalMergedEdges;
+		TArray<FWorldOrthogonalRootHypothesisDebug> WorldOrthogonalRootHypotheses;
+		TArray<FVector2D> WorldOrthogonalSolvedVerticesUV;
+		TArray<FVector2D> WorldOrthogonalPhaseAlignedCapUV;
 		TArray<FVector2D> FaceBoundaryUV;
+		FString FaceBoundarySource = TEXT("shared_camera_legacy");
 		TArray<FVector2D> FaceHullUV;
 		TArray<FVector2D> FaceBBoxUV;
 		TArray<FVector2D> OriginalCapUV;
@@ -208,6 +365,26 @@ namespace
 		TArray<FVector> CapBaseBBoxWorld;
 		TArray<FVector> CapMinimumBBoxWorld;
 		TArray<FVector> FinalCapWorld;
+	};
+
+	enum class ECapBoundaryRunType : uint8
+	{
+		Red,
+		Black,
+		Connector
+	};
+
+	struct FCapBoundaryRunInput
+	{
+		int32 StrokeId = INDEX_NONE;
+		ECapBoundaryRunType Type = ECapBoundaryRunType::Red;
+		bool bSynthetic = false;
+		bool bReversed = false;
+		int32 StartNodeId = INDEX_NONE;
+		int32 EndNodeId = INDEX_NONE;
+		FVector2D StartNodePosition = FVector2D::ZeroVector;
+		FVector2D EndNodePosition = FVector2D::ZeroVector;
+		TArray<FVector2D> Points;
 	};
 
 	struct FSolidReconstructionResult
@@ -534,6 +711,8 @@ namespace
 			*Path);
 	}
 
+	static bool ParseVector2DField(const TSharedPtr<FJsonObject>& Object, const TCHAR* Key, FVector2D& Out);
+
 	static bool ParseVector2DArray(const TSharedPtr<FJsonObject>& Object, const TCHAR* Key, TArray<FVector2D>& Out)
 	{
 		Out.Reset();
@@ -557,6 +736,65 @@ namespace
 			Out.Emplace(Pair[0]->AsNumber(), Pair[1]->AsNumber());
 		}
 		return Out.Num() > 0;
+	}
+
+	static bool ParseOrderedBoundaryRuns(
+		const TSharedPtr<FJsonObject>& Object,
+		TArray<FCapBoundaryRunInput>& OutRuns)
+	{
+		OutRuns.Reset();
+		const TArray<TSharedPtr<FJsonValue>>* Values = nullptr;
+		if (!Object.IsValid() || !Object->TryGetArrayField(TEXT("ordered_boundary_runs"), Values))
+		{
+			return false;
+		}
+
+		for (const TSharedPtr<FJsonValue>& Value : *Values)
+		{
+			const TSharedPtr<FJsonObject> RunObject =
+				Value.IsValid() && Value->Type == EJson::Object ? Value->AsObject() : nullptr;
+			if (!RunObject.IsValid())
+			{
+				continue;
+			}
+
+			FCapBoundaryRunInput Run;
+			double Number = -1.0;
+			RunObject->TryGetNumberField(TEXT("stroke_id"), Number);
+			Run.StrokeId = FMath::RoundToInt(Number);
+			RunObject->TryGetBoolField(TEXT("synthetic"), Run.bSynthetic);
+			RunObject->TryGetBoolField(TEXT("reversed"), Run.bReversed);
+			Number = -1.0;
+			RunObject->TryGetNumberField(TEXT("start_node_id"), Number);
+			Run.StartNodeId = FMath::RoundToInt(Number);
+			Number = -1.0;
+			RunObject->TryGetNumberField(TEXT("end_node_id"), Number);
+			Run.EndNodeId = FMath::RoundToInt(Number);
+			ParseVector2DField(RunObject, TEXT("start_node_position"), Run.StartNodePosition);
+			ParseVector2DField(RunObject, TEXT("end_node_position"), Run.EndNodePosition);
+
+			FString Type;
+			RunObject->TryGetStringField(TEXT("type"), Type);
+			if (Run.bSynthetic || Type.Equals(TEXT("connector"), ESearchCase::IgnoreCase))
+			{
+				Run.Type = ECapBoundaryRunType::Connector;
+			}
+			else if (Type.Equals(TEXT("black"), ESearchCase::IgnoreCase))
+			{
+				Run.Type = ECapBoundaryRunType::Black;
+			}
+			else
+			{
+				Run.Type = ECapBoundaryRunType::Red;
+			}
+
+			if (!ParseVector2DArray(RunObject, TEXT("points"), Run.Points) || Run.Points.Num() < 2)
+			{
+				continue;
+			}
+			OutRuns.Add(MoveTemp(Run));
+		}
+		return OutRuns.Num() > 0;
 	}
 
 	// Parse an array of 2-point segments: [[[x0,y0],[x1,y1]], ...].
@@ -2296,6 +2534,14 @@ namespace
 		}
 	}
 
+	static void DrawOpenPolylineRGBA(TArray<uint8>& RGBA, int32 Width, int32 Height, const TArray<FVector2D>& Points, const FColor& Color, int32 Radius)
+	{
+		for (int32 Index = 1; Index < Points.Num(); ++Index)
+		{
+			DrawLineRGBA(RGBA, Width, Height, Points[Index - 1], Points[Index], Color, Radius);
+		}
+	}
+
 	static TSharedPtr<FJsonValue> JsonVector2D(const FVector2D& V)
 	{
 		TArray<TSharedPtr<FJsonValue>> Arr;
@@ -2340,6 +2586,31 @@ namespace
 		for (const FVector2D& V : Values)
 		{
 			JsonValues.Add(JsonVector2D(V));
+		}
+		Object->SetArrayField(Key, JsonValues);
+	}
+
+	static void SetIntArrayField(TSharedRef<FJsonObject> Object, const TCHAR* Key, const TArray<int32>& Values)
+	{
+		TArray<TSharedPtr<FJsonValue>> JsonValues;
+		JsonValues.Reserve(Values.Num());
+		for (int32 Value : Values)
+		{
+			JsonValues.Add(MakeShared<FJsonValueNumber>(Value));
+		}
+		Object->SetArrayField(Key, JsonValues);
+	}
+
+	static void SetDoubleArrayField(
+		TSharedRef<FJsonObject> Object,
+		const TCHAR* Key,
+		const TArray<double>& Values)
+	{
+		TArray<TSharedPtr<FJsonValue>> JsonValues;
+		JsonValues.Reserve(Values.Num());
+		for (double Value : Values)
+		{
+			JsonValues.Add(MakeShared<FJsonValueNumber>(Value));
 		}
 		Object->SetArrayField(Key, JsonValues);
 	}
@@ -2446,6 +2717,41 @@ namespace
 		Root->SetNumberField(TEXT("cap_bbox_fill_ratio_threshold"), Result.CapBBoxRegularization.FillRatioThreshold);
 		Root->SetNumberField(TEXT("cap_base_bbox_ratio"), Result.CapBBoxRegularization.CapBaseBBoxRatio);
 		Root->SetNumberField(TEXT("cap_minimum_bbox_ratio"), Result.CapBBoxRegularization.CapMinimumBBoxRatio);
+		Root->SetBoolField(TEXT("cap_world_orthogonal_attempted"), Result.CapBBoxRegularization.bAttempted);
+		Root->SetBoolField(TEXT("cap_world_orthogonal_applied"), Result.CapBBoxRegularization.bApplied);
+		Root->SetBoolField(TEXT("cap_world_orthogonal_fallback_to_original"), Result.CapBBoxRegularization.bFallbackToOriginal);
+		Root->SetBoolField(TEXT("cap_world_orthogonal_contains_black"), Result.CapBBoxRegularization.bContainsBlack);
+		Root->SetStringField(TEXT("cap_world_orthogonal_reason"), Result.CapBBoxRegularization.RejectionReason);
+		Root->SetStringField(TEXT("cap_world_orthogonal_selected_geometry"), Result.CapBBoxRegularization.SelectedGeometry);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_boundary_run_count"), Result.CapBBoxRegularization.BoundaryRunCount);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_primitive_geometry_edge_count"), Result.CapBBoxRegularization.PrimitiveGeometryEdgeCount);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_geometry_edge_count"), Result.CapBBoxRegularization.GeometryEdgeCount);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_ignored_connector_count"), Result.CapBBoxRegularization.IgnoredConnectorCount);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_area_ratio"), Result.CapBBoxRegularization.WorldOrthogonalAreaRatio);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_mean_boundary_distance"), Result.CapBBoxRegularization.WorldOrthogonalMeanBoundaryDistance);
+		Root->SetNumberField(TEXT("cap_world_orthogonal_max_boundary_distance"), Result.CapBBoxRegularization.WorldOrthogonalMaxBoundaryDistance);
+		Root->SetBoolField(
+			TEXT("cap_world_orthogonal_pure_red_root_alignment_attempted"),
+			Result.CapBBoxRegularization.bPureRedRootAlignmentAttempted);
+		Root->SetNumberField(
+			TEXT("cap_world_orthogonal_root_hypothesis_count"),
+			Result.CapBBoxRegularization.WorldOrthogonalRootHypotheses.Num());
+		Root->SetNumberField(
+			TEXT("cap_world_orthogonal_selected_root_hypothesis_index"),
+			Result.CapBBoxRegularization.SelectedRootHypothesisIndex);
+		Root->SetNumberField(
+			TEXT("cap_world_orthogonal_selected_root_primitive_edge_index"),
+			Result.CapBBoxRegularization.SelectedRootPrimitiveEdgeIndex);
+		SetIntArrayField(
+			Root,
+			TEXT("cap_world_orthogonal_selected_root_stroke_ids"),
+			Result.CapBBoxRegularization.SelectedRootStrokeIds);
+		Root->SetStringField(
+			TEXT("cap_world_orthogonal_selected_root_target_axis"),
+			Result.CapBBoxRegularization.SelectedRootTargetAxisTypeName);
+		Root->SetNumberField(
+			TEXT("cap_world_orthogonal_selected_root_rotation_degrees"),
+			Result.CapBBoxRegularization.SelectedRootRotationDegrees);
 
 		SaveJsonObject(Root, Path);
 	}
@@ -2944,6 +3250,2806 @@ namespace
 		Debug.RejectionReason = Reason;
 		Debug.FinalCapUV = Debug.OriginalCapUV;
 		Debug.FinalCapWorld = Debug.OriginalCapWorld;
+		for (FWorldOrthogonalStageDebug& Stage : Debug.WorldOrthogonalStages)
+		{
+			if (Stage.Name == Debug.WorldOrthogonalActiveStage)
+			{
+				Stage.Status = TEXT("failed");
+				Stage.Message = Reason;
+				break;
+			}
+		}
+	}
+
+	static const TCHAR* WorldOrthogonalStageNames[] =
+	{
+		TEXT("input_validation"),
+		TEXT("world_aligned_face_uv"),
+		TEXT("boundary_run_unprojection"),
+		TEXT("red_corner_protection"),
+		TEXT("primitive_edge_classification"),
+		TEXT("pure_red_root_alignment"),
+		TEXT("same_axis_merge"),
+		TEXT("adjacency_validation"),
+		TEXT("support_line_solve"),
+		TEXT("vertex_intersections"),
+		TEXT("topology_validation"),
+		TEXT("metric_validation"),
+		TEXT("world_conversion"),
+		TEXT("orthographic_reprojection")
+	};
+
+	static void InitializeWorldOrthogonalStages(FCapBBoxRegularizationResult& Debug)
+	{
+		Debug.WorldOrthogonalStages.Reset();
+		for (const TCHAR* Name : WorldOrthogonalStageNames)
+		{
+			FWorldOrthogonalStageDebug Stage;
+			Stage.Name = Name;
+			Debug.WorldOrthogonalStages.Add(MoveTemp(Stage));
+		}
+	}
+
+	static void SetWorldOrthogonalStage(
+		FCapBBoxRegularizationResult& Debug,
+		const TCHAR* Name,
+		const TCHAR* Status,
+		const FString& Message = FString())
+	{
+		for (FWorldOrthogonalStageDebug& Stage : Debug.WorldOrthogonalStages)
+		{
+			if (Stage.Name == Name)
+			{
+				Stage.Status = Status;
+				Stage.Message = Message;
+				return;
+			}
+		}
+		FWorldOrthogonalStageDebug Stage;
+		Stage.Name = Name;
+		Stage.Status = Status;
+		Stage.Message = Message;
+		Debug.WorldOrthogonalStages.Add(MoveTemp(Stage));
+	}
+
+	static void BeginWorldOrthogonalStage(
+		FCapBBoxRegularizationResult& Debug,
+		const TCHAR* Name)
+	{
+		Debug.WorldOrthogonalActiveStage = Name;
+		SetWorldOrthogonalStage(Debug, Name, TEXT("in_progress"));
+	}
+
+	static void PassWorldOrthogonalStage(
+		FCapBBoxRegularizationResult& Debug,
+		const TCHAR* Name,
+		const FString& Message = FString())
+	{
+		SetWorldOrthogonalStage(Debug, Name, TEXT("passed"), Message);
+		if (Debug.WorldOrthogonalActiveStage == Name)
+		{
+			Debug.WorldOrthogonalActiveStage.Reset();
+		}
+	}
+
+	// Octilinear axis types: 0=U(horizontal), 1=V(vertical), 2=Diag+(45deg), 3=Diag-(135deg)
+	enum EOctilinearAxis : int32
+	{
+		Octi_U = 0,
+		Octi_V = 1,
+		Octi_DiagPlus = 2,
+		Octi_DiagMinus = 3
+	};
+
+	static EOctilinearAxis ClassifyOctilinearAxisByThreshold(
+		double AngleToU,
+		double AngleToV,
+		double AngleToDiagPlus,
+		double AngleToDiagMinus)
+	{
+		const double MinAxisAngle = FMath::Min(AngleToU, AngleToV);
+		if (MinAxisAngle <=
+			WorldOrthoDiagThresholdDegrees +
+				WorldOrthoAngleComparisonEpsilonDegrees)
+		{
+			return AngleToU <= AngleToV ? Octi_U : Octi_V;
+		}
+		return AngleToDiagPlus <= AngleToDiagMinus
+			? Octi_DiagPlus
+			: Octi_DiagMinus;
+	}
+
+	struct FWorldOrthogonalEdge
+	{
+		ECapBoundaryRunType Type = ECapBoundaryRunType::Red;
+		TArray<int32> SourceRunIndices;
+		TArray<int32> SourceStrokeIds;
+		TArray<int32> PrimitiveEdgeIndices;
+		TArray<int32> GraphNodeIds;
+		TArray<FVector2D> GraphNodeCapSpace;
+		TArray<FVector2D> GraphNodeUV;
+		TArray<FVector2D> SnappedGraphNodeUV;
+		TArray<double> GraphNodeSnapDistancesPixels;
+		TArray<FVector2D> SamplesUV;
+		TArray<FVector2D> SamplesCapSpace;
+		FVector2D DirectionUV = FVector2D::ZeroVector;
+		FVector2D StartUV = FVector2D::ZeroVector;
+		FVector2D EndUV = FVector2D::ZeroVector;
+		FVector2D StartCapSpace = FVector2D::ZeroVector;
+		FVector2D EndCapSpace = FVector2D::ZeroVector;
+		EOctilinearAxis AxisType = Octi_U;
+		bool bUseMajorChordDirection = false;
+		double AngleToU = 180.0;
+		double AngleToV = 180.0;
+		double AngleToDiagPlus = 180.0; // angle to (1,1) normalized = 45deg direction
+		double AngleToDiagMinus = 180.0; // angle to (1,-1) normalized = 135deg direction
+		double AngleToAssignedAxis = 0.0; // angle to whichever axis the edge was assigned
+		double SupportCoordinate = 0.0;
+		double PathLength = 0.0;
+		double CapPathLengthPixels = 0.0;
+	};
+
+	// Per-face capture: detect contour corners whose 2D pixel position lies on the
+	// shared-camera image rectangle, then snap their face-UV onto the axis-aligned
+	// bbox so image-clip edges become axis-aligned in face UV. Real geometry corners
+	// (interior to the image) are kept as-is. Returns false on degenerate input.
+	static bool BuildPerFaceCleanBoundaryUV(
+		const TArray<FVector2D>& KeyPoints2D,
+		const TArray<FVector>& KeyPoints3D,
+		const FVector& PlanePoint,
+		const FVector& AxisU,
+		const FVector& AxisV,
+		int32 ImageWidth,
+		int32 ImageHeight,
+		double ClipMarginPixels,
+		TArray<FVector2D>& OutCleanBoundaryUV)
+	{
+		OutCleanBoundaryUV.Reset();
+		const int32 N = KeyPoints3D.Num();
+		if (N < 3 || N != KeyPoints2D.Num() || ImageWidth <= 1 || ImageHeight <= 1)
+		{
+			return false;
+		}
+
+		TArray<FVector2D> RawUV;
+		RawUV.SetNum(N);
+		for (int32 i = 0; i < N; ++i)
+		{
+			RawUV[i] = WorldPointToFaceUV(KeyPoints3D[i], PlanePoint, AxisU, AxisV);
+		}
+
+		const double MaxX = double(ImageWidth - 1);
+		const double MaxY = double(ImageHeight - 1);
+		TArray<bool> IsClipped;
+		IsClipped.SetNum(N);
+		int32 ClippedCount = 0;
+		for (int32 i = 0; i < N; ++i)
+		{
+			const FVector2D& P = KeyPoints2D[i];
+			const bool bClipped =
+				P.X <= ClipMarginPixels ||
+				P.X >= MaxX - ClipMarginPixels ||
+				P.Y <= ClipMarginPixels ||
+				P.Y >= MaxY - ClipMarginPixels;
+			IsClipped[i] = bClipped;
+			if (bClipped) { ++ClippedCount; }
+		}
+
+		if (ClippedCount == 0)
+		{
+			OutCleanBoundaryUV = MoveTemp(RawUV);
+			return OutCleanBoundaryUV.Num() >= 3;
+		}
+
+		double MinU = TNumericLimits<double>::Max();
+		double MaxU = -TNumericLimits<double>::Max();
+		double MinV = TNumericLimits<double>::Max();
+		double MaxV = -TNumericLimits<double>::Max();
+		for (int32 i = 0; i < N; ++i)
+		{
+			MinU = FMath::Min(MinU, RawUV[i].X);
+			MaxU = FMath::Max(MaxU, RawUV[i].X);
+			MinV = FMath::Min(MinV, RawUV[i].Y);
+			MaxV = FMath::Max(MaxV, RawUV[i].Y);
+		}
+		if (!FMath::IsFinite(MinU) || !FMath::IsFinite(MaxU) ||
+			!FMath::IsFinite(MinV) || !FMath::IsFinite(MaxV) ||
+			MaxU - MinU <= 1e-9 || MaxV - MinV <= 1e-9)
+		{
+			return false;
+		}
+
+		if (ClippedCount == N)
+		{
+			OutCleanBoundaryUV.Add(FVector2D(MinU, MinV));
+			OutCleanBoundaryUV.Add(FVector2D(MaxU, MinV));
+			OutCleanBoundaryUV.Add(FVector2D(MaxU, MaxV));
+			OutCleanBoundaryUV.Add(FVector2D(MinU, MaxV));
+			return true;
+		}
+
+		auto SnapToBBoxEdge = [&](int32 Index) -> FVector2D
+		{
+			const FVector2D& UV = RawUV[Index];
+			const double DistMinU = FMath::Abs(UV.X - MinU);
+			const double DistMaxU = FMath::Abs(UV.X - MaxU);
+			const double DistMinV = FMath::Abs(UV.Y - MinV);
+			const double DistMaxV = FMath::Abs(UV.Y - MaxV);
+			double Best = DistMinU;
+			int32 Side = 0;
+			if (DistMaxU < Best) { Best = DistMaxU; Side = 1; }
+			if (DistMinV < Best) { Best = DistMinV; Side = 2; }
+			if (DistMaxV < Best) { Best = DistMaxV; Side = 3; }
+
+			FVector2D Snapped(
+				FMath::Clamp(UV.X, MinU, MaxU),
+				FMath::Clamp(UV.Y, MinV, MaxV));
+			switch (Side)
+			{
+				case 0: Snapped.X = MinU; break;
+				case 1: Snapped.X = MaxU; break;
+				case 2: Snapped.Y = MinV; break;
+				case 3: Snapped.Y = MaxV; break;
+				default: break;
+			}
+			return Snapped;
+		};
+
+		TArray<FVector2D> Built;
+		Built.Reserve(N);
+		for (int32 i = 0; i < N; ++i)
+		{
+			Built.Add(IsClipped[i] ? SnapToBBoxEdge(i) : RawUV[i]);
+		}
+
+		constexpr double DupTolUV = 1e-3;
+		TArray<FVector2D> Deduped;
+		Deduped.Reserve(Built.Num());
+		for (int32 i = 0; i < Built.Num(); ++i)
+		{
+			const FVector2D& Curr = Built[i];
+			if (Deduped.Num() == 0 ||
+				FVector2D::Distance(Curr, Deduped.Last()) > DupTolUV)
+			{
+				Deduped.Add(Curr);
+			}
+		}
+		while (Deduped.Num() >= 2 &&
+			FVector2D::Distance(Deduped[0], Deduped.Last()) <= DupTolUV)
+		{
+			Deduped.Pop(EAllowShrinking::No);
+		}
+
+		OutCleanBoundaryUV = MoveTemp(Deduped);
+		return OutCleanBoundaryUV.Num() >= 3;
+	}
+
+	static bool BuildWorldAlignedFaceBasis(
+		const FVector& PlaneNormal,
+		FVector& OutAxisU,
+		FVector& OutAxisV,
+		int32& OutExcludedWorldAxis)
+	{
+		const FVector Normal = PlaneNormal.GetSafeNormal();
+		if (Normal.IsNearlyZero())
+		{
+			return false;
+		}
+
+		const FVector WorldAxes[3] =
+		{
+			FVector::XAxisVector,
+			FVector::YAxisVector,
+			FVector::ZAxisVector
+		};
+		const double Alignment[3] =
+		{
+			FMath::Abs(FVector::DotProduct(Normal, WorldAxes[0])),
+			FMath::Abs(FVector::DotProduct(Normal, WorldAxes[1])),
+			FMath::Abs(FVector::DotProduct(Normal, WorldAxes[2]))
+		};
+
+		OutExcludedWorldAxis = 0;
+		if (Alignment[1] > Alignment[OutExcludedWorldAxis])
+		{
+			OutExcludedWorldAxis = 1;
+		}
+		if (Alignment[2] > Alignment[OutExcludedWorldAxis])
+		{
+			OutExcludedWorldAxis = 2;
+		}
+
+		int32 PrimaryAxis = 0;
+		int32 SecondaryAxis = 1;
+		if (OutExcludedWorldAxis == 0)
+		{
+			PrimaryAxis = 1;
+			SecondaryAxis = 2;
+		}
+		else if (OutExcludedWorldAxis == 1)
+		{
+			PrimaryAxis = 0;
+			SecondaryAxis = 2;
+		}
+
+		OutAxisU =
+			WorldAxes[PrimaryAxis] -
+			Normal * FVector::DotProduct(WorldAxes[PrimaryAxis], Normal);
+		if (!OutAxisU.Normalize())
+		{
+			return false;
+		}
+
+		OutAxisV = FVector::CrossProduct(Normal, OutAxisU).GetSafeNormal();
+		if (OutAxisV.IsNearlyZero())
+		{
+			return false;
+		}
+
+		FVector ProjectedSecondary =
+			WorldAxes[SecondaryAxis] -
+			Normal * FVector::DotProduct(WorldAxes[SecondaryAxis], Normal);
+		if (ProjectedSecondary.Normalize() &&
+			FVector::DotProduct(OutAxisV, ProjectedSecondary) < 0.0)
+		{
+			OutAxisV *= -1.0;
+		}
+		if (FVector::DotProduct(FVector::CrossProduct(OutAxisU, OutAxisV), Normal) < 0.0)
+		{
+			OutAxisV *= -1.0;
+		}
+		return true;
+	}
+
+	static bool ComputePrincipalDirection2D(
+		const TArray<FVector2D>& Points,
+		FVector2D& OutDirection,
+		double& OutPathLength)
+	{
+		OutDirection = FVector2D::ZeroVector;
+		OutPathLength = 0.0;
+		if (Points.Num() < 2)
+		{
+			return false;
+		}
+
+		FVector2D Mean = FVector2D::ZeroVector;
+		for (const FVector2D& Point : Points)
+		{
+			Mean += Point;
+		}
+		Mean /= double(Points.Num());
+
+		double XX = 0.0;
+		double XY = 0.0;
+		double YY = 0.0;
+		for (int32 Index = 0; Index < Points.Num(); ++Index)
+		{
+			const FVector2D Delta = Points[Index] - Mean;
+			XX += Delta.X * Delta.X;
+			XY += Delta.X * Delta.Y;
+			YY += Delta.Y * Delta.Y;
+			if (Index > 0)
+			{
+				OutPathLength += FVector2D::Distance(Points[Index - 1], Points[Index]);
+			}
+		}
+
+		const double Angle = 0.5 * FMath::Atan2(2.0 * XY, XX - YY);
+		OutDirection = FVector2D(FMath::Cos(Angle), FMath::Sin(Angle)).GetSafeNormal();
+		const FVector2D Chord = Points.Last() - Points[0];
+		if (Chord.SizeSquared() > 1e-12 &&
+			FVector2D::DotProduct(OutDirection, Chord) < 0.0)
+		{
+			OutDirection *= -1.0;
+		}
+		return !OutDirection.IsNearlyZero() && OutPathLength > 1e-8;
+	}
+
+	struct FRedDirectionalGroup
+	{
+		int32 StartIndex = INDEX_NONE;
+		int32 EndIndex = INDEX_NONE;
+		EOctilinearAxis AxisType = Octi_U;
+		double LengthPixels = 0.0;
+	};
+
+	static FString OctilinearAxisName(EOctilinearAxis Axis);
+
+	static EOctilinearAxis ClassifyRedMacroOctilinearAxis(
+		const FVector2D& Direction)
+	{
+		const FVector2D Unit = Direction.GetSafeNormal();
+		if (Unit.IsNearlyZero())
+		{
+			return Octi_U;
+		}
+		const FVector2D DiagPlus =
+			FVector2D(1.0, 1.0).GetSafeNormal();
+		const FVector2D DiagMinus =
+			FVector2D(1.0, -1.0).GetSafeNormal();
+		const double AngleU = FMath::RadiansToDegrees(FMath::Acos(
+			FMath::Clamp(FMath::Abs(Unit.X), 0.0, 1.0)));
+		const double AngleV = FMath::RadiansToDegrees(FMath::Acos(
+			FMath::Clamp(FMath::Abs(Unit.Y), 0.0, 1.0)));
+		const double AngleDiagPlus = FMath::RadiansToDegrees(FMath::Acos(
+			FMath::Clamp(
+				FMath::Abs(FVector2D::DotProduct(Unit, DiagPlus)),
+				0.0,
+				1.0)));
+		const double AngleDiagMinus = FMath::RadiansToDegrees(FMath::Acos(
+			FMath::Clamp(
+				FMath::Abs(FVector2D::DotProduct(Unit, DiagMinus)),
+				0.0,
+				1.0)));
+		return ClassifyOctilinearAxisByThreshold(
+			AngleU,
+			AngleV,
+			AngleDiagPlus,
+			AngleDiagMinus);
+	}
+
+	static void FindProtectedRedRunIndices(
+		const TArray<FVector2D>& PointsUV,
+		const TArray<FVector2D>& PointsCapSpace,
+		TArray<int32>& OutIndices,
+		FWorldOrthogonalRunDebug& OutDebug)
+	{
+		OutIndices.Reset();
+		OutDebug.RedProtectionMode.Reset();
+		OutDebug.RedMaxChordDeviationPixels = 0.0;
+		OutDebug.RedDirectionalGroupAxisTypes.Reset();
+		OutDebug.RedDirectionalGroupLengthsPixels.Reset();
+		OutDebug.RedDirectionalGroupStartIndices.Reset();
+		OutDebug.RedDirectionalGroupEndIndices.Reset();
+		if (PointsUV.Num() < 2 ||
+			PointsCapSpace.Num() != PointsUV.Num())
+		{
+			return;
+		}
+
+		const int32 LastIndex = PointsCapSpace.Num() - 1;
+		const FVector2D ChordStart = PointsCapSpace[0];
+		const FVector2D ChordEnd = PointsCapSpace[LastIndex];
+		for (const FVector2D& Point : PointsCapSpace)
+		{
+			OutDebug.RedMaxChordDeviationPixels = FMath::Max(
+				OutDebug.RedMaxChordDeviationPixels,
+				FMath::Sqrt(DistancePointToSegmentSquared2D(
+					Point,
+					ChordStart,
+					ChordEnd)));
+		}
+		if (FVector2D::Distance(ChordStart, ChordEnd) > 1e-6 &&
+			OutDebug.RedMaxChordDeviationPixels <=
+				WorldOrthoRedMacroCorridorPixels)
+		{
+			OutIndices = { 0, LastIndex };
+			OutDebug.RedProtectionMode = TEXT("straight_corridor_macro_edge");
+			FVector2D DirectionUV;
+			double PathLengthUV = 0.0;
+			const EOctilinearAxis AxisType =
+				ComputePrincipalDirection2D(PointsUV, DirectionUV, PathLengthUV)
+					? ClassifyRedMacroOctilinearAxis(DirectionUV)
+					: Octi_U;
+			double LengthPixels = 0.0;
+			for (int32 Index = 1; Index < PointsCapSpace.Num(); ++Index)
+			{
+				LengthPixels += FVector2D::Distance(
+					PointsCapSpace[Index - 1],
+					PointsCapSpace[Index]);
+			}
+			OutDebug.RedDirectionalGroupAxisTypes.Add(
+				OctilinearAxisName(AxisType));
+			OutDebug.RedDirectionalGroupLengthsPixels.Add(LengthPixels);
+			OutDebug.RedDirectionalGroupStartIndices.Add(0);
+			OutDebug.RedDirectionalGroupEndIndices.Add(LastIndex);
+			return;
+		}
+
+		TArray<bool> Keep;
+		Keep.Init(false, PointsCapSpace.Num());
+		MarkRdpSegment(
+			PointsCapSpace,
+			0,
+			LastIndex,
+			WorldOrthoRedPrimitiveRdpTolerancePixels *
+				WorldOrthoRedPrimitiveRdpTolerancePixels,
+			Keep);
+		TArray<int32> SimplifiedIndices;
+		for (int32 Index = 0; Index < PointsCapSpace.Num(); ++Index)
+		{
+			if (Keep[Index])
+			{
+				SimplifiedIndices.Add(Index);
+			}
+		}
+		if (SimplifiedIndices.Num() < 2)
+		{
+			OutIndices = { 0, LastIndex };
+			OutDebug.RedProtectionMode = TEXT("rdp_macro_edge");
+			return;
+		}
+
+		TArray<double> PrefixLengthPixels;
+		PrefixLengthPixels.SetNum(PointsCapSpace.Num());
+		PrefixLengthPixels[0] = 0.0;
+		for (int32 Index = 1; Index < PointsCapSpace.Num(); ++Index)
+		{
+			PrefixLengthPixels[Index] =
+				PrefixLengthPixels[Index - 1] +
+				FVector2D::Distance(
+					PointsCapSpace[Index - 1],
+					PointsCapSpace[Index]);
+		}
+
+		TArray<FRedDirectionalGroup> Groups;
+		for (int32 SegmentIndex = 0;
+			SegmentIndex + 1 < SimplifiedIndices.Num();
+			++SegmentIndex)
+		{
+			const int32 StartIndex = SimplifiedIndices[SegmentIndex];
+			const int32 EndIndex = SimplifiedIndices[SegmentIndex + 1];
+			if (EndIndex <= StartIndex)
+			{
+				continue;
+			}
+			TArray<FVector2D> SegmentUV;
+			SegmentUV.Reserve(EndIndex - StartIndex + 1);
+			for (int32 PointIndex = StartIndex;
+				PointIndex <= EndIndex;
+				++PointIndex)
+			{
+				SegmentUV.Add(PointsUV[PointIndex]);
+			}
+			FVector2D DirectionUV;
+			double PathLengthUV = 0.0;
+			if (!ComputePrincipalDirection2D(
+				SegmentUV,
+				DirectionUV,
+				PathLengthUV))
+			{
+				continue;
+			}
+
+			FRedDirectionalGroup Group;
+			Group.StartIndex = StartIndex;
+			Group.EndIndex = EndIndex;
+			Group.AxisType = ClassifyRedMacroOctilinearAxis(DirectionUV);
+			Group.LengthPixels =
+				PrefixLengthPixels[EndIndex] -
+				PrefixLengthPixels[StartIndex];
+			if (Groups.Num() > 0 &&
+				Groups.Last().AxisType == Group.AxisType)
+			{
+				Groups.Last().EndIndex = Group.EndIndex;
+				Groups.Last().LengthPixels += Group.LengthPixels;
+			}
+			else
+			{
+				Groups.Add(Group);
+			}
+		}
+
+		if (Groups.Num() == 0)
+		{
+			OutIndices = { 0, LastIndex };
+			OutDebug.RedProtectionMode = TEXT("degenerate_groups_macro_edge");
+			return;
+		}
+
+		for (const FRedDirectionalGroup& Group : Groups)
+		{
+			OutDebug.RedDirectionalGroupAxisTypes.Add(
+				OctilinearAxisName(Group.AxisType));
+			OutDebug.RedDirectionalGroupLengthsPixels.Add(Group.LengthPixels);
+			OutDebug.RedDirectionalGroupStartIndices.Add(Group.StartIndex);
+			OutDebug.RedDirectionalGroupEndIndices.Add(Group.EndIndex);
+		}
+
+		OutIndices.Add(0);
+		for (int32 GroupIndex = 0; GroupIndex + 1 < Groups.Num(); ++GroupIndex)
+		{
+			const FRedDirectionalGroup& Incoming = Groups[GroupIndex];
+			const FRedDirectionalGroup& Outgoing = Groups[GroupIndex + 1];
+			if (Incoming.LengthPixels >=
+					WorldOrthoRedMacroGroupMinLengthPixels &&
+				Outgoing.LengthPixels >=
+					WorldOrthoRedMacroGroupMinLengthPixels)
+			{
+				OutIndices.Add(Incoming.EndIndex);
+			}
+		}
+		OutIndices.Add(LastIndex);
+		OutDebug.RedProtectionMode =
+			OutIndices.Num() > 2
+				? TEXT("macro_directional_corners")
+				: TEXT("short_groups_absorbed_macro_edge");
+	}
+
+	static double DirectionAngleToWorldUVAxis(const FVector2D& Direction, int32 Axis);
+
+	static double DirectionAngleToOctilinearAxis(const FVector2D& Direction, EOctilinearAxis Axis)
+	{
+		const FVector2D Unit = Direction.GetSafeNormal();
+		FVector2D TargetAxis;
+		switch (Axis)
+		{
+		case Octi_U:        TargetAxis = FVector2D(1.0, 0.0); break;
+		case Octi_V:        TargetAxis = FVector2D(0.0, 1.0); break;
+		case Octi_DiagPlus: TargetAxis = FVector2D(1.0, 1.0).GetSafeNormal(); break;
+		case Octi_DiagMinus:TargetAxis = FVector2D(1.0,-1.0).GetSafeNormal(); break;
+		default:            TargetAxis = FVector2D(1.0, 0.0); break;
+		}
+		const double Dot = FMath::Abs(FVector2D::DotProduct(Unit, TargetAxis));
+		return FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, 0.0, 1.0)));
+	}
+
+	static EOctilinearAxis ClassifyEdgeAxisType(
+		const FWorldOrthogonalEdge& Edge)
+	{
+		return ClassifyOctilinearAxisByThreshold(
+			Edge.AngleToU,
+			Edge.AngleToV,
+			Edge.AngleToDiagPlus,
+			Edge.AngleToDiagMinus);
+	}
+
+	static FString OctilinearAxisName(EOctilinearAxis Axis)
+	{
+		switch (Axis)
+		{
+		case Octi_U:         return TEXT("U");
+		case Octi_V:         return TEXT("V");
+		case Octi_DiagPlus:  return TEXT("Diag+");
+		case Octi_DiagMinus: return TEXT("Diag-");
+		default:             return TEXT("Unknown");
+		}
+	}
+
+	static double OctilinearAxisAngleDegrees(EOctilinearAxis Axis)
+	{
+		switch (Axis)
+		{
+		case Octi_U:         return 0.0;
+		case Octi_DiagPlus:  return 45.0;
+		case Octi_V:         return 90.0;
+		case Octi_DiagMinus: return 135.0;
+		default:             return 0.0;
+		}
+	}
+
+	static double DirectionAngleDegrees180(const FVector2D& Direction)
+	{
+		double Angle = FMath::RadiansToDegrees(
+			FMath::Atan2(Direction.Y, Direction.X));
+		while (Angle < 0.0)
+		{
+			Angle += 180.0;
+		}
+		while (Angle >= 180.0)
+		{
+			Angle -= 180.0;
+		}
+		return Angle;
+	}
+
+	static double RotationToOctilinearAxisDegrees(
+		const FVector2D& Direction,
+		EOctilinearAxis Axis)
+	{
+		const double SourceAngle = DirectionAngleDegrees180(Direction);
+		const double BaseTarget = OctilinearAxisAngleDegrees(Axis);
+		double BestRotation = BaseTarget - SourceAngle;
+		for (int32 Offset = -2; Offset <= 2; ++Offset)
+		{
+			const double Candidate =
+				BaseTarget + 180.0 * double(Offset) - SourceAngle;
+			if (FMath::Abs(Candidate) < FMath::Abs(BestRotation))
+			{
+				BestRotation = Candidate;
+			}
+		}
+		return BestRotation;
+	}
+
+	static FVector2D RotatePointAround2D(
+		const FVector2D& Point,
+		const FVector2D& Center,
+		double RotationDegrees)
+	{
+		const double Angle = FMath::DegreesToRadians(RotationDegrees);
+		const double CosAngle = FMath::Cos(Angle);
+		const double SinAngle = FMath::Sin(Angle);
+		const FVector2D Delta = Point - Center;
+		return Center + FVector2D(
+			CosAngle * Delta.X - SinAngle * Delta.Y,
+			SinAngle * Delta.X + CosAngle * Delta.Y);
+	}
+
+	static void RotatePointsAround2D(
+		TArray<FVector2D>& Points,
+		const FVector2D& Center,
+		double RotationDegrees)
+	{
+		for (FVector2D& Point : Points)
+		{
+			Point = RotatePointAround2D(Point, Center, RotationDegrees);
+		}
+	}
+
+	static bool InitializeWorldOrthogonalEdge(FWorldOrthogonalEdge& Edge);
+
+	static bool RotateAndReclassifyPureRedEdge(
+		FWorldOrthogonalEdge& Edge,
+		const FVector2D& Center,
+		double RotationDegrees)
+	{
+		RotatePointsAround2D(Edge.SamplesUV, Center, RotationDegrees);
+		Edge.StartUV = RotatePointAround2D(
+			Edge.StartUV,
+			Center,
+			RotationDegrees);
+		Edge.EndUV = RotatePointAround2D(
+			Edge.EndUV,
+			Center,
+			RotationDegrees);
+		RotatePointsAround2D(Edge.GraphNodeUV, Center, RotationDegrees);
+		if (!InitializeWorldOrthogonalEdge(Edge))
+		{
+			return false;
+		}
+		return true;
+	}
+
+	static double OctilinearSupportValue(
+		const FVector2D& Point,
+		EOctilinearAxis Axis)
+	{
+		switch (Axis)
+		{
+		case Octi_U:         return Point.Y;
+		case Octi_V:         return Point.X;
+		case Octi_DiagPlus:  return Point.X - Point.Y;
+		case Octi_DiagMinus: return Point.X + Point.Y;
+		default:             return Point.Y;
+		}
+	}
+
+	static FVector2D ProjectPointToOctilinearSupport(
+		const FVector2D& Point,
+		EOctilinearAxis Axis,
+		double SupportCoordinate)
+	{
+		switch (Axis)
+		{
+		case Octi_U:
+			return FVector2D(Point.X, SupportCoordinate);
+		case Octi_V:
+			return FVector2D(SupportCoordinate, Point.Y);
+		case Octi_DiagPlus:
+		{
+			const double Offset =
+				0.5 * (OctilinearSupportValue(Point, Axis) - SupportCoordinate);
+			return FVector2D(Point.X - Offset, Point.Y + Offset);
+		}
+		case Octi_DiagMinus:
+		{
+			const double Offset =
+				0.5 * (OctilinearSupportValue(Point, Axis) - SupportCoordinate);
+			return FVector2D(Point.X - Offset, Point.Y - Offset);
+		}
+		default:
+			return Point;
+		}
+	}
+
+	static bool InitializeWorldOrthogonalEdge(FWorldOrthogonalEdge& Edge)
+	{
+		if (Edge.SamplesUV.Num() < 2)
+		{
+			return false;
+		}
+		FVector2D PrincipalDirection;
+		if (!ComputePrincipalDirection2D(
+				Edge.SamplesUV,
+				PrincipalDirection,
+				Edge.PathLength))
+		{
+			return false;
+		}
+		const FVector2D MajorChord = Edge.EndUV - Edge.StartUV;
+		Edge.DirectionUV =
+			Edge.bUseMajorChordDirection && !MajorChord.IsNearlyZero()
+				? MajorChord.GetSafeNormal()
+				: PrincipalDirection;
+		Edge.CapPathLengthPixels = 0.0;
+		for (int32 Index = 1; Index < Edge.SamplesCapSpace.Num(); ++Index)
+		{
+			Edge.CapPathLengthPixels += FVector2D::Distance(
+				Edge.SamplesCapSpace[Index - 1],
+				Edge.SamplesCapSpace[Index]);
+		}
+		Edge.AngleToU = DirectionAngleToWorldUVAxis(Edge.DirectionUV, 0);
+		Edge.AngleToV = DirectionAngleToWorldUVAxis(Edge.DirectionUV, 1);
+		Edge.AngleToDiagPlus = DirectionAngleToOctilinearAxis(Edge.DirectionUV, Octi_DiagPlus);
+		Edge.AngleToDiagMinus = DirectionAngleToOctilinearAxis(Edge.DirectionUV, Octi_DiagMinus);
+		Edge.AxisType = ClassifyEdgeAxisType(Edge);
+		Edge.AngleToAssignedAxis = DirectionAngleToOctilinearAxis(Edge.DirectionUV, Edge.AxisType);
+		return true;
+	}
+
+	static double UnorientedDirectionAngleDegrees(
+		const FVector2D& A,
+		const FVector2D& B)
+	{
+		const FVector2D UnitA = A.GetSafeNormal();
+		const FVector2D UnitB = B.GetSafeNormal();
+		if (UnitA.IsNearlyZero() || UnitB.IsNearlyZero())
+		{
+			return 90.0;
+		}
+		const double Dot = FMath::Abs(FVector2D::DotProduct(UnitA, UnitB));
+		return FMath::RadiansToDegrees(
+			FMath::Acos(FMath::Clamp(Dot, 0.0, 1.0)));
+	}
+
+	static bool MergeOrderedWorldOrthogonalEdges(
+		const FWorldOrthogonalEdge& A,
+		const FWorldOrthogonalEdge& B,
+		FWorldOrthogonalEdge& Out)
+	{
+		if (A.Type != B.Type)
+		{
+			return false;
+		}
+		Out = A;
+		auto AppendDistinctPoints = [](
+			const TArray<FVector2D>& Source,
+			TArray<FVector2D>& Target)
+		{
+			for (const FVector2D& Point : Source)
+			{
+				if (Target.Num() == 0 ||
+					FVector2D::Distance(Target.Last(), Point) > 1e-7)
+				{
+					Target.Add(Point);
+				}
+			}
+		};
+		AppendDistinctPoints(B.SamplesUV, Out.SamplesUV);
+		AppendDistinctPoints(B.SamplesCapSpace, Out.SamplesCapSpace);
+		Out.EndUV = B.EndUV;
+		Out.EndCapSpace = B.EndCapSpace;
+		Out.SourceRunIndices.Append(B.SourceRunIndices);
+		Out.SourceStrokeIds.Append(B.SourceStrokeIds);
+		Out.PrimitiveEdgeIndices.Append(B.PrimitiveEdgeIndices);
+		Out.GraphNodeIds.Append(B.GraphNodeIds);
+		Out.GraphNodeCapSpace.Append(B.GraphNodeCapSpace);
+		Out.GraphNodeUV.Append(B.GraphNodeUV);
+		Out.SnappedGraphNodeUV.Reset();
+		Out.GraphNodeSnapDistancesPixels.Reset();
+		Out.bUseMajorChordDirection = true;
+		return InitializeWorldOrthogonalEdge(Out);
+	}
+
+	static int32 CollapseShortRedPrimitiveEdges(
+		TArray<FWorldOrthogonalEdge>& Edges)
+	{
+		int32 CollapseCount = 0;
+		bool bChanged = true;
+		while (bChanged && Edges.Num() > 3)
+		{
+			bChanged = false;
+			int32 ShortIndex = INDEX_NONE;
+			double ShortestLength = TNumericLimits<double>::Max();
+			for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+			{
+				const FWorldOrthogonalEdge& Edge = Edges[EdgeIndex];
+				if (Edge.Type == ECapBoundaryRunType::Red &&
+					Edge.CapPathLengthPixels <
+						WorldOrthoShortRedEdgeLengthPixels &&
+					Edge.CapPathLengthPixels < ShortestLength)
+				{
+					const FWorldOrthogonalEdge& Previous =
+						Edges[(EdgeIndex + Edges.Num() - 1) % Edges.Num()];
+					const FWorldOrthogonalEdge& Next =
+						Edges[(EdgeIndex + 1) % Edges.Num()];
+					if (Previous.Type == ECapBoundaryRunType::Red &&
+						Next.Type == ECapBoundaryRunType::Red &&
+						FVector2D::Distance(
+							Previous.EndCapSpace,
+							Edge.StartCapSpace) <= 1e-6 &&
+						FVector2D::Distance(
+							Edge.EndCapSpace,
+							Next.StartCapSpace) <= 1e-6)
+					{
+						ShortIndex = EdgeIndex;
+						ShortestLength = Edge.CapPathLengthPixels;
+					}
+				}
+			}
+			if (ShortIndex == INDEX_NONE)
+			{
+				break;
+			}
+
+			const int32 PreviousIndex =
+				(ShortIndex + Edges.Num() - 1) % Edges.Num();
+			const int32 NextIndex = (ShortIndex + 1) % Edges.Num();
+			const FWorldOrthogonalEdge& Short = Edges[ShortIndex];
+			const FWorldOrthogonalEdge& Previous = Edges[PreviousIndex];
+			const FWorldOrthogonalEdge& Next = Edges[NextIndex];
+			const FVector2D ShortChord =
+				Short.EndCapSpace - Short.StartCapSpace;
+			const double PreviousAngle = UnorientedDirectionAngleDegrees(
+				ShortChord,
+				Previous.EndCapSpace - Previous.StartCapSpace);
+			const double NextAngle = UnorientedDirectionAngleDegrees(
+				ShortChord,
+				Next.EndCapSpace - Next.StartCapSpace);
+			const bool bMergeIntoPrevious =
+				PreviousAngle < NextAngle ||
+				(FMath::IsNearlyEqual(PreviousAngle, NextAngle, 1e-6) &&
+				 Previous.CapPathLengthPixels >= Next.CapPathLengthPixels);
+
+			FWorldOrthogonalEdge Merged;
+			if (bMergeIntoPrevious)
+			{
+				if (!MergeOrderedWorldOrthogonalEdges(
+					Previous,
+					Short,
+					Merged))
+				{
+					break;
+				}
+				if (ShortIndex > 0)
+				{
+					Edges[PreviousIndex] = MoveTemp(Merged);
+					Edges.RemoveAt(ShortIndex);
+				}
+				else
+				{
+					Edges[PreviousIndex] = MoveTemp(Merged);
+					Edges.RemoveAt(0);
+				}
+			}
+			else
+			{
+				if (!MergeOrderedWorldOrthogonalEdges(
+					Short,
+					Next,
+					Merged))
+				{
+					break;
+				}
+				if (NextIndex > ShortIndex)
+				{
+					Edges[ShortIndex] = MoveTemp(Merged);
+					Edges.RemoveAt(NextIndex);
+				}
+				else
+				{
+					Edges[ShortIndex] = MoveTemp(Merged);
+					Edges.RemoveAt(0);
+				}
+			}
+			++CollapseCount;
+			bChanged = true;
+		}
+		return CollapseCount;
+	}
+
+	static FWorldOrthogonalEdgeDebug MakeWorldOrthogonalEdgeDebug(
+		const FWorldOrthogonalEdge& Edge,
+		int32 EdgeIndex)
+	{
+		FWorldOrthogonalEdgeDebug Debug;
+		Debug.EdgeIndex = EdgeIndex;
+		Debug.Type = Edge.Type == ECapBoundaryRunType::Black ? TEXT("black") : TEXT("red");
+		Debug.AxisTypeName = OctilinearAxisName(Edge.AxisType);
+		Debug.SourceRunIndices = Edge.SourceRunIndices;
+		Debug.SourceStrokeIds = Edge.SourceStrokeIds;
+		Debug.PrimitiveEdgeIndices = Edge.PrimitiveEdgeIndices;
+		Debug.GraphNodeIds = Edge.GraphNodeIds;
+		Debug.GraphNodeCapSpace = Edge.GraphNodeCapSpace;
+		Debug.GraphNodeUV = Edge.GraphNodeUV;
+		Debug.SnappedGraphNodeUV = Edge.SnappedGraphNodeUV;
+		Debug.GraphNodeSnapDistancesPixels = Edge.GraphNodeSnapDistancesPixels;
+		Debug.SamplesUV = Edge.SamplesUV;
+		Debug.StartUV = Edge.StartUV;
+		Debug.EndUV = Edge.EndUV;
+		Debug.DirectionUV = Edge.DirectionUV;
+		Debug.AxisType = static_cast<int32>(Edge.AxisType);
+		Debug.AngleToU = Edge.AngleToU;
+		Debug.AngleToV = Edge.AngleToV;
+		Debug.AngleToDiagPlus = Edge.AngleToDiagPlus;
+		Debug.AngleToDiagMinus = Edge.AngleToDiagMinus;
+		Debug.AngleToAssignedAxis = Edge.AngleToAssignedAxis;
+		Debug.SupportCoordinate = Edge.SupportCoordinate;
+		Debug.PathLength = Edge.PathLength;
+		return Debug;
+	}
+
+	static void CaptureWorldOrthogonalEdgeDebug(
+		const TArray<FWorldOrthogonalEdge>& Edges,
+		TArray<FWorldOrthogonalEdgeDebug>& OutDebug)
+	{
+		OutDebug.Reset();
+		OutDebug.Reserve(Edges.Num());
+		for (int32 Index = 0; Index < Edges.Num(); ++Index)
+		{
+			OutDebug.Add(MakeWorldOrthogonalEdgeDebug(Edges[Index], Index));
+		}
+	}
+
+	static double WeightedMedianForEdgeOctilinear(
+		const TArray<FVector2D>& Points,
+		EOctilinearAxis Axis);
+
+	static bool MergeAdjacentWorldOrthogonalEdges(
+		TArray<FWorldOrthogonalEdge>& Edges,
+		TFunctionRef<double(const FVector2D&, const FVector2D&)> DistancePixels)
+	{
+		auto AppendGraphNodes = [](
+			const FWorldOrthogonalEdge& Source,
+			FWorldOrthogonalEdge& Target)
+		{
+			for (int32 NodeIndex = 0; NodeIndex < Source.GraphNodeIds.Num(); ++NodeIndex)
+			{
+				const int32 NodeId = Source.GraphNodeIds[NodeIndex];
+				const bool bDuplicateSharedNode =
+					Target.GraphNodeIds.Num() > 0 &&
+					Target.GraphNodeIds.Last() == NodeId &&
+					NodeId != INDEX_NONE;
+				if (bDuplicateSharedNode)
+				{
+					continue;
+				}
+				Target.GraphNodeIds.Add(NodeId);
+				Target.GraphNodeCapSpace.Add(
+					Source.GraphNodeCapSpace.IsValidIndex(NodeIndex)
+						? Source.GraphNodeCapSpace[NodeIndex]
+						: FVector2D::ZeroVector);
+				Target.GraphNodeUV.Add(
+					Source.GraphNodeUV.IsValidIndex(NodeIndex)
+						? Source.GraphNodeUV[NodeIndex]
+						: FVector2D::ZeroVector);
+			}
+		};
+
+		auto CanMerge = [&](const FWorldOrthogonalEdge& A, const FWorldOrthogonalEdge& B)
+		{
+			if (A.Type != B.Type || A.AxisType != B.AxisType)
+			{
+				return false;
+			}
+			if (A.Type == ECapBoundaryRunType::Red)
+			{
+				return true;
+			}
+			if (A.Type != ECapBoundaryRunType::Black ||
+				A.GraphNodeIds.Num() < 2 ||
+				B.GraphNodeIds.Num() < 2 ||
+				A.GraphNodeIds.Last() == INDEX_NONE ||
+				A.GraphNodeIds.Last() != B.GraphNodeIds[0])
+			{
+				return false;
+			}
+
+			TArray<FVector2D> CombinedSamples = A.SamplesUV;
+			for (const FVector2D& Sample : B.SamplesUV)
+			{
+				if (CombinedSamples.Num() == 0 ||
+					FVector2D::Distance(CombinedSamples.Last(), Sample) > 1e-7)
+				{
+					CombinedSamples.Add(Sample);
+				}
+			}
+			const double CombinedSupport =
+				WeightedMedianForEdgeOctilinear(CombinedSamples, A.AxisType);
+			auto NodesFitSupport = [&](const FWorldOrthogonalEdge& Edge)
+			{
+				for (const FVector2D& NodeUV : Edge.GraphNodeUV)
+				{
+					const FVector2D Snapped = ProjectPointToOctilinearSupport(
+						NodeUV,
+						A.AxisType,
+						CombinedSupport);
+					if (DistancePixels(NodeUV, Snapped) >
+						WorldOrthoBlackNodeSnapTolerancePixels)
+					{
+						return false;
+					}
+				}
+				return true;
+			};
+			return NodesFitSupport(A) && NodesFitSupport(B);
+		};
+
+		auto MergePair = [&](const FWorldOrthogonalEdge& A, const FWorldOrthogonalEdge& B, FWorldOrthogonalEdge& Out)
+		{
+			Out = A;
+			for (const FVector2D& Sample : B.SamplesUV)
+			{
+				if (Out.SamplesUV.Num() == 0 ||
+					FVector2D::Distance(Out.SamplesUV.Last(), Sample) > 1e-7)
+				{
+					Out.SamplesUV.Add(Sample);
+				}
+			}
+			for (const FVector2D& Sample : B.SamplesCapSpace)
+			{
+				if (Out.SamplesCapSpace.Num() == 0 ||
+					FVector2D::Distance(
+						Out.SamplesCapSpace.Last(),
+						Sample) > 1e-7)
+				{
+					Out.SamplesCapSpace.Add(Sample);
+				}
+			}
+			Out.EndUV = B.EndUV;
+			Out.EndCapSpace = B.EndCapSpace;
+			Out.SourceRunIndices.Append(B.SourceRunIndices);
+			Out.SourceStrokeIds.Append(B.SourceStrokeIds);
+			Out.PrimitiveEdgeIndices.Append(B.PrimitiveEdgeIndices);
+			AppendGraphNodes(B, Out);
+			Out.SnappedGraphNodeUV.Reset();
+			Out.GraphNodeSnapDistancesPixels.Reset();
+			Out.bUseMajorChordDirection =
+				A.bUseMajorChordDirection ||
+				B.bUseMajorChordDirection;
+			const EOctilinearAxis MergedAxisType = A.AxisType;
+			if (!InitializeWorldOrthogonalEdge(Out))
+			{
+				return false;
+			}
+			Out.AxisType = MergedAxisType;
+			Out.AngleToAssignedAxis = DirectionAngleToOctilinearAxis(Out.DirectionUV, MergedAxisType);
+			return true;
+		};
+
+		for (int32 Index = 0; Index + 1 < Edges.Num();)
+		{
+			if (!CanMerge(Edges[Index], Edges[Index + 1]))
+			{
+				++Index;
+				continue;
+			}
+
+			FWorldOrthogonalEdge Merged;
+			if (!MergePair(Edges[Index], Edges[Index + 1], Merged))
+			{
+				return false;
+			}
+			Edges[Index] = MoveTemp(Merged);
+			Edges.RemoveAt(Index + 1);
+			if (Index > 0)
+			{
+				--Index;
+			}
+		}
+
+		if (Edges.Num() > 1 && CanMerge(Edges.Last(), Edges[0]))
+		{
+			FWorldOrthogonalEdge Merged;
+			if (!MergePair(Edges.Last(), Edges[0], Merged))
+			{
+				return false;
+			}
+			Edges.RemoveAt(Edges.Num() - 1);
+			Edges[0] = MoveTemp(Merged);
+		}
+		return true;
+	}
+
+	static double DirectionAngleToWorldUVAxis(const FVector2D& Direction, int32 Axis)
+	{
+		const FVector2D Unit = Direction.GetSafeNormal();
+		const double Dot = Axis == 0 ? FMath::Abs(Unit.X) : FMath::Abs(Unit.Y);
+		return FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, 0.0, 1.0)));
+	}
+
+	static double WeightedMedianForEdge(
+		const TArray<FVector2D>& Points,
+		int32 EdgeAxis)
+	{
+		struct FWeightedCoordinate
+		{
+			double Value = 0.0;
+			double Weight = 0.0;
+		};
+
+		TArray<FWeightedCoordinate> Values;
+		Values.Reserve(Points.Num());
+		double TotalWeight = 0.0;
+		for (int32 Index = 0; Index < Points.Num(); ++Index)
+		{
+			double Weight = 0.0;
+			if (Index > 0)
+			{
+				Weight += 0.5 * FVector2D::Distance(Points[Index - 1], Points[Index]);
+			}
+			if (Index + 1 < Points.Num())
+			{
+				Weight += 0.5 * FVector2D::Distance(Points[Index], Points[Index + 1]);
+			}
+			Weight = FMath::Max(Weight, 1e-6);
+			FWeightedCoordinate Item;
+			Item.Value = EdgeAxis == 0 ? Points[Index].Y : Points[Index].X;
+			Item.Weight = Weight;
+			Values.Add(Item);
+			TotalWeight += Weight;
+		}
+		Values.Sort([](const FWeightedCoordinate& A, const FWeightedCoordinate& B)
+		{
+			return A.Value < B.Value;
+		});
+
+		double Accumulated = 0.0;
+		for (const FWeightedCoordinate& Item : Values)
+		{
+			Accumulated += Item.Weight;
+			if (Accumulated * 2.0 >= TotalWeight)
+			{
+				return Item.Value;
+			}
+		}
+		return Values.Num() > 0 ? Values.Last().Value : 0.0;
+	}
+
+	static double WeightedMedianForEdgeOctilinear(
+		const TArray<FVector2D>& Points,
+		EOctilinearAxis Axis)
+	{
+		struct FWeightedCoordinate
+		{
+			double Value = 0.0;
+			double Weight = 0.0;
+		};
+
+		TArray<FWeightedCoordinate> Values;
+		Values.Reserve(Points.Num());
+		double TotalWeight = 0.0;
+		for (int32 Index = 0; Index < Points.Num(); ++Index)
+		{
+			double Weight = 0.0;
+			if (Index > 0)
+			{
+				Weight += 0.5 * FVector2D::Distance(Points[Index - 1], Points[Index]);
+			}
+			if (Index + 1 < Points.Num())
+			{
+				Weight += 0.5 * FVector2D::Distance(Points[Index], Points[Index + 1]);
+			}
+			Weight = FMath::Max(Weight, 1e-6);
+			double Val = 0.0;
+			switch (Axis)
+			{
+			case Octi_U:         Val = Points[Index].Y; break;
+			case Octi_V:         Val = Points[Index].X; break;
+			case Octi_DiagPlus:  Val = Points[Index].X - Points[Index].Y; break;
+			case Octi_DiagMinus: Val = Points[Index].X + Points[Index].Y; break;
+			default:             Val = Points[Index].Y; break;
+			}
+			FWeightedCoordinate Item;
+			Item.Value = Val;
+			Item.Weight = Weight;
+			Values.Add(Item);
+			TotalWeight += Weight;
+		}
+		Values.Sort([](const FWeightedCoordinate& A, const FWeightedCoordinate& B)
+		{
+			return A.Value < B.Value;
+		});
+
+		double Accumulated = 0.0;
+		for (const FWeightedCoordinate& Item : Values)
+		{
+			Accumulated += Item.Weight;
+			if (Accumulated * 2.0 >= TotalWeight)
+			{
+				return Item.Value;
+			}
+		}
+		return Values.Num() > 0 ? Values.Last().Value : 0.0;
+	}
+
+	// Solve the intersection point of two octilinear support lines.
+	// InAxis/OutAxis: the axis type of the previous (incoming) and current (outgoing) edge
+	// InSupport/OutSupport: the support coordinate for each edge
+	//
+	// U-line:      V = InSupport  (horizontal, fixed V)
+	// V-line:      U = InSupport  (vertical, fixed U)
+	// Diag+ line:  U - V = InSupport  (45deg diagonal)
+	// Diag- line:  U + V = InSupport  (135deg diagonal)
+	//
+	// Returns the (U, V) intersection point.
+	static FVector2D SolveOctilinearVertexIntersection(
+		EOctilinearAxis InAxis, double InSupport,
+		EOctilinearAxis OutAxis, double OutSupport)
+	{
+		double U = 0.0, V = 0.0;
+
+		// 12 valid intersection types (same-type pairs are rejected by adjacency_validation)
+		if (InAxis == Octi_U && OutAxis == Octi_V)
+		{
+			U = OutSupport; V = InSupport;
+		}
+		else if (InAxis == Octi_V && OutAxis == Octi_U)
+		{
+			U = InSupport; V = OutSupport;
+		}
+		else if (InAxis == Octi_U && OutAxis == Octi_DiagPlus)
+		{
+			V = InSupport; U = V + OutSupport;
+		}
+		else if (InAxis == Octi_U && OutAxis == Octi_DiagMinus)
+		{
+			V = InSupport; U = OutSupport - V;
+		}
+		else if (InAxis == Octi_V && OutAxis == Octi_DiagPlus)
+		{
+			U = InSupport; V = U - OutSupport;
+		}
+		else if (InAxis == Octi_V && OutAxis == Octi_DiagMinus)
+		{
+			U = InSupport; V = OutSupport - U;
+		}
+		else if (InAxis == Octi_DiagPlus && OutAxis == Octi_U)
+		{
+			V = OutSupport; U = V + InSupport;
+		}
+		else if (InAxis == Octi_DiagMinus && OutAxis == Octi_U)
+		{
+			V = OutSupport; U = InSupport - V;
+		}
+		else if (InAxis == Octi_DiagPlus && OutAxis == Octi_V)
+		{
+			U = OutSupport; V = U - InSupport;
+		}
+		else if (InAxis == Octi_DiagMinus && OutAxis == Octi_V)
+		{
+			U = OutSupport; V = InSupport - U;
+		}
+		else if (InAxis == Octi_DiagPlus && OutAxis == Octi_DiagMinus)
+		{
+			U = (InSupport + OutSupport) / 2.0;
+			V = (OutSupport - InSupport) / 2.0;
+		}
+		else if (InAxis == Octi_DiagMinus && OutAxis == Octi_DiagPlus)
+		{
+			U = (InSupport + OutSupport) / 2.0;
+			V = (InSupport - OutSupport) / 2.0;
+		}
+		else
+		{
+			return FVector2D(0.0, 0.0);
+		}
+
+		return FVector2D(U, V);
+	}
+
+	static FVector2D PolygonAreaCentroid2D(const TArray<FVector2D>& Polygon)
+	{
+		double TwiceArea = 0.0;
+		FVector2D Weighted = FVector2D::ZeroVector;
+		for (int32 Index = 0; Index < Polygon.Num(); ++Index)
+		{
+			const FVector2D& A = Polygon[Index];
+			const FVector2D& B = Polygon[(Index + 1) % Polygon.Num()];
+			const double Cross = A.X * B.Y - B.X * A.Y;
+			TwiceArea += Cross;
+			Weighted += (A + B) * Cross;
+		}
+		if (FMath::Abs(TwiceArea) <= 1e-12)
+		{
+			FVector2D Average = FVector2D::ZeroVector;
+			for (const FVector2D& Point : Polygon)
+			{
+				Average += Point;
+			}
+			return Polygon.Num() > 0 ? Average / double(Polygon.Num()) : FVector2D::ZeroVector;
+		}
+		return Weighted / (3.0 * TwiceArea);
+	}
+
+	static double Orientation2D(const FVector2D& A, const FVector2D& B, const FVector2D& C)
+	{
+		return FVector2D::CrossProduct(B - A, C - A);
+	}
+
+	static bool SegmentsIntersectStrict2D(
+		const FVector2D& A,
+		const FVector2D& B,
+		const FVector2D& C,
+		const FVector2D& D)
+	{
+		const double O1 = Orientation2D(A, B, C);
+		const double O2 = Orientation2D(A, B, D);
+		const double O3 = Orientation2D(C, D, A);
+		const double O4 = Orientation2D(C, D, B);
+		return ((O1 > 1e-8 && O2 < -1e-8) || (O1 < -1e-8 && O2 > 1e-8)) &&
+			((O3 > 1e-8 && O4 < -1e-8) || (O3 < -1e-8 && O4 > 1e-8));
+	}
+
+	static bool PolygonHasSelfIntersection(const TArray<FVector2D>& Polygon)
+	{
+		const int32 Count = Polygon.Num();
+		for (int32 AIndex = 0; AIndex < Count; ++AIndex)
+		{
+			const int32 ANext = (AIndex + 1) % Count;
+			for (int32 BIndex = AIndex + 1; BIndex < Count; ++BIndex)
+			{
+				const int32 BNext = (BIndex + 1) % Count;
+				if (AIndex == BIndex || ANext == BIndex || BNext == AIndex)
+				{
+					continue;
+				}
+				if (SegmentsIntersectStrict2D(
+					Polygon[AIndex],
+					Polygon[ANext],
+					Polygon[BIndex],
+					Polygon[BNext]))
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	static void ComputeBoundaryDistanceStats(
+		const TArray<FVector2D>& Samples,
+		const TArray<FVector2D>& Polygon,
+		double& OutMean,
+		double& OutMax)
+	{
+		OutMean = 0.0;
+		OutMax = 0.0;
+		if (Samples.Num() == 0 || Polygon.Num() < 2)
+		{
+			return;
+		}
+
+		for (const FVector2D& Sample : Samples)
+		{
+			double BestSquared = TNumericLimits<double>::Max();
+			for (int32 EdgeIndex = 0; EdgeIndex < Polygon.Num(); ++EdgeIndex)
+			{
+				BestSquared = FMath::Min(
+					BestSquared,
+					DistancePointToSegmentSquared2D(
+						Sample,
+						Polygon[EdgeIndex],
+						Polygon[(EdgeIndex + 1) % Polygon.Num()]));
+			}
+			const double Distance = FMath::Sqrt(BestSquared);
+			OutMean += Distance;
+			OutMax = FMath::Max(OutMax, Distance);
+		}
+		OutMean /= double(Samples.Num());
+	}
+
+	struct FPureRedRootHypothesisSolve
+	{
+		bool bValid = false;
+		FString RejectionReason;
+		TArray<FWorldOrthogonalEdge> Edges;
+		TArray<FVector2D> CorrectedUV;
+		double AngleCost = 0.0;
+		double AreaRatio = 0.0;
+		double MeanBoundaryDistance = 0.0;
+		double MaxBoundaryDistance = 0.0;
+	};
+
+	static FPureRedRootHypothesisSolve EvaluatePureRedRootHypothesis(
+		const TArray<FWorldOrthogonalEdge>& PrimitiveEdges,
+		const TArray<FVector2D>& OriginalCapUV,
+		const TArray<FVector2D>& BoundarySamplesUV,
+		const FVector2D& RotationCenterUV,
+		double RotationDegrees)
+	{
+		FPureRedRootHypothesisSolve Result;
+		Result.Edges = PrimitiveEdges;
+		for (FWorldOrthogonalEdge& Edge : Result.Edges)
+		{
+			if (Edge.Type != ECapBoundaryRunType::Red ||
+				!RotateAndReclassifyPureRedEdge(
+					Edge,
+					RotationCenterUV,
+					RotationDegrees))
+			{
+				Result.RejectionReason =
+					TEXT("failed to rotate and classify a pure-red primitive edge");
+				return Result;
+			}
+		}
+
+		auto UnusedDistancePixels = [](
+			const FVector2D& A,
+			const FVector2D& B)
+		{
+			return FVector2D::Distance(A, B);
+		};
+		if (!MergeAdjacentWorldOrthogonalEdges(
+			Result.Edges,
+			UnusedDistancePixels))
+		{
+			Result.RejectionReason =
+				TEXT("failed to merge same-axis pure-red support edges");
+			return Result;
+		}
+		if (Result.Edges.Num() < 3)
+		{
+			Result.RejectionReason =
+				TEXT("pure-red hypothesis has fewer than three support edges");
+			return Result;
+		}
+		for (int32 EdgeIndex = 0; EdgeIndex < Result.Edges.Num(); ++EdgeIndex)
+		{
+			if (Result.Edges[EdgeIndex].AxisType ==
+				Result.Edges[(EdgeIndex + 1) % Result.Edges.Num()].AxisType)
+			{
+				Result.RejectionReason =
+					TEXT("pure-red hypothesis retains adjacent same-axis support edges");
+				return Result;
+			}
+		}
+
+		for (FWorldOrthogonalEdge& Edge : Result.Edges)
+		{
+			Edge.SupportCoordinate = WeightedMedianForEdgeOctilinear(
+				Edge.SamplesUV,
+				Edge.AxisType);
+			Result.AngleCost +=
+				FMath::Max(Edge.PathLength, 1e-6) *
+				Edge.AngleToAssignedAxis *
+				Edge.AngleToAssignedAxis;
+		}
+
+		Result.CorrectedUV.SetNum(Result.Edges.Num());
+		for (int32 EdgeIndex = 0; EdgeIndex < Result.Edges.Num(); ++EdgeIndex)
+		{
+			const int32 PreviousIndex =
+				(EdgeIndex + Result.Edges.Num() - 1) % Result.Edges.Num();
+			Result.CorrectedUV[EdgeIndex] =
+				SolveOctilinearVertexIntersection(
+					Result.Edges[PreviousIndex].AxisType,
+					Result.Edges[PreviousIndex].SupportCoordinate,
+					Result.Edges[EdgeIndex].AxisType,
+					Result.Edges[EdgeIndex].SupportCoordinate);
+			if (!IsFiniteVector2D(Result.CorrectedUV[EdgeIndex]))
+			{
+				Result.RejectionReason =
+					TEXT("pure-red support-line intersection is not finite");
+				return Result;
+			}
+		}
+
+		const FVector2D CenterOffset =
+			RotationCenterUV - PolygonAreaCentroid2D(Result.CorrectedUV);
+		for (FVector2D& Point : Result.CorrectedUV)
+		{
+			Point += CenterOffset;
+		}
+		for (FWorldOrthogonalEdge& Edge : Result.Edges)
+		{
+			switch (Edge.AxisType)
+			{
+			case Octi_U:
+				Edge.SupportCoordinate += CenterOffset.Y;
+				break;
+			case Octi_V:
+				Edge.SupportCoordinate += CenterOffset.X;
+				break;
+			case Octi_DiagPlus:
+				Edge.SupportCoordinate +=
+					CenterOffset.X - CenterOffset.Y;
+				break;
+			case Octi_DiagMinus:
+				Edge.SupportCoordinate +=
+					CenterOffset.X + CenterOffset.Y;
+				break;
+			default:
+				break;
+			}
+		}
+
+		for (int32 VertexIndex = 0;
+			VertexIndex < Result.CorrectedUV.Num();
+			++VertexIndex)
+		{
+			if (FVector2D::Distance(
+				Result.CorrectedUV[VertexIndex],
+				Result.CorrectedUV[
+					(VertexIndex + 1) % Result.CorrectedUV.Num()]) <= 1e-6)
+			{
+				Result.RejectionReason =
+					TEXT("pure-red hypothesis creates a degenerate edge");
+				return Result;
+			}
+		}
+		if (PolygonHasSelfIntersection(Result.CorrectedUV))
+		{
+			Result.RejectionReason =
+				TEXT("pure-red hypothesis self-intersects");
+			return Result;
+		}
+
+		TArray<FVector2D> RotatedOriginalCapUV = OriginalCapUV;
+		TArray<FVector2D> RotatedBoundarySamplesUV = BoundarySamplesUV;
+		RotatePointsAround2D(
+			RotatedOriginalCapUV,
+			RotationCenterUV,
+			RotationDegrees);
+		RotatePointsAround2D(
+			RotatedBoundarySamplesUV,
+			RotationCenterUV,
+			RotationDegrees);
+		const double OriginalSignedArea =
+			SignedPolygonAreaForRegularization(RotatedOriginalCapUV);
+		const double CorrectedSignedArea =
+			SignedPolygonAreaForRegularization(Result.CorrectedUV);
+		if (FMath::Abs(OriginalSignedArea) <= 1e-8 ||
+			FMath::Abs(CorrectedSignedArea) <= 1e-8 ||
+			OriginalSignedArea * CorrectedSignedArea <= 0.0)
+		{
+			Result.RejectionReason =
+				TEXT("pure-red hypothesis reverses or degenerates polygon area");
+			return Result;
+		}
+		Result.AreaRatio =
+			FMath::Abs(CorrectedSignedArea) /
+			FMath::Abs(OriginalSignedArea);
+
+		for (int32 VertexIndex = 0;
+			VertexIndex < Result.Edges.Num();
+			++VertexIndex)
+		{
+			const int32 PreviousIndex =
+				(VertexIndex + Result.Edges.Num() - 1) %
+				Result.Edges.Num();
+			const double OriginalTurn = FVector2D::CrossProduct(
+				Result.Edges[PreviousIndex].DirectionUV.GetSafeNormal(),
+				Result.Edges[VertexIndex].DirectionUV.GetSafeNormal());
+			const FVector2D CorrectedIncoming =
+				Result.CorrectedUV[VertexIndex] -
+				Result.CorrectedUV[PreviousIndex];
+			const FVector2D CorrectedOutgoing =
+				Result.CorrectedUV[
+					(VertexIndex + 1) % Result.CorrectedUV.Num()] -
+				Result.CorrectedUV[VertexIndex];
+			const double CorrectedTurn = FVector2D::CrossProduct(
+				CorrectedIncoming.GetSafeNormal(),
+				CorrectedOutgoing.GetSafeNormal());
+			if (FMath::Abs(OriginalTurn) >= 0.25 &&
+				OriginalTurn * CorrectedTurn < 0.0)
+			{
+				Result.RejectionReason =
+					TEXT("pure-red hypothesis changes a protected convex/concave turn");
+				return Result;
+			}
+		}
+
+		ComputeBoundaryDistanceStats(
+			RotatedBoundarySamplesUV,
+			Result.CorrectedUV,
+			Result.MeanBoundaryDistance,
+			Result.MaxBoundaryDistance);
+		Result.bValid = true;
+		return Result;
+	}
+
+	static bool PixelToFaceUV(
+		const FVector2D& Pixel,
+		const FFaceInfo& Face,
+		const FCommonInputs& Inputs,
+		const FVector& AxisU,
+		const FVector& AxisV,
+		FVector2D& OutUV)
+	{
+		FVector World;
+		if (!IntersectPixelWithPlaneOrthographic(
+			Inputs.Camera,
+			Inputs.FacesWidth,
+			Inputs.FacesHeight,
+			Pixel,
+			Face.PlanePoint,
+			Face.Normal,
+			World))
+		{
+			return false;
+		}
+		OutUV = WorldPointToFaceUV(World, Face.PlanePoint, AxisU, AxisV);
+		return IsFiniteVector2D(OutUV);
+	}
+
+	static bool RegularizeCapToWorldOrthogonalPolygon(
+		const FFaceInfo& Face,
+		const FCommonInputs& Inputs,
+		const FVector2D& OriginalDeltaPixels,
+		const TArray<FVector>& OriginalCapWorld,
+		const TArray<FCapBoundaryRunInput>& BoundaryRuns,
+		const FVector2D& SourceTranslationCapSpace,
+		double ScaleX,
+		double ScaleY,
+		TArray<FVector>& OutFinalCapWorld,
+		FCapBBoxRegularizationResult& OutDebug)
+	{
+		OutDebug = FCapBBoxRegularizationResult();
+		OutDebug.bAttempted = true;
+		OutDebug.bWorldOrthogonal = true;
+		InitializeWorldOrthogonalStages(OutDebug);
+		BeginWorldOrthogonalStage(OutDebug, TEXT("input_validation"));
+		OutDebug.FaceOriginWorld = Face.PlanePoint;
+		OutDebug.FaceNormalWorld = Face.Normal.GetSafeNormal();
+		OutDebug.OriginalSourceToCopiedDeltaPixels = OriginalDeltaPixels;
+		OutDebug.OriginalCapWorld = OriginalCapWorld;
+		OutDebug.BoundaryRunCount = BoundaryRuns.Num();
+		OutFinalCapWorld = OriginalCapWorld;
+
+		if (OriginalCapWorld.Num() < 3 || BoundaryRuns.Num() < 3)
+		{
+			SetRegularizationFallback(OutDebug, TEXT("ordered boundary runs are missing or insufficient"));
+			return false;
+		}
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("input_validation"),
+			FString::Printf(
+				TEXT("%d ordered runs and %d original cap vertices"),
+				BoundaryRuns.Num(),
+				OriginalCapWorld.Num()));
+
+		BeginWorldOrthogonalStage(OutDebug, TEXT("world_aligned_face_uv"));
+		int32 ExcludedWorldAxis = INDEX_NONE;
+		if (!BuildWorldAlignedFaceBasis(
+			Face.Normal,
+			OutDebug.FaceAxisUWorld,
+			OutDebug.FaceAxisVWorld,
+			ExcludedWorldAxis))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("failed to build world-aligned face UV basis"));
+			return false;
+		}
+
+		for (const FVector& Point : Face.KeyPoints3D)
+		{
+			OutDebug.FaceBoundaryUV.Add(WorldPointToFaceUV(
+				Point,
+				Face.PlanePoint,
+				OutDebug.FaceAxisUWorld,
+				OutDebug.FaceAxisVWorld));
+		}
+		OutDebug.FaceBoundarySource = TEXT("shared_camera_legacy");
+		if (GFromLZUsePerFaceCapture != 0)
+		{
+			TArray<FVector2D> CleanBoundaryUV;
+			if (BuildPerFaceCleanBoundaryUV(
+				Face.KeyPoints2D,
+				Face.KeyPoints3D,
+				Face.PlanePoint,
+				OutDebug.FaceAxisUWorld,
+				OutDebug.FaceAxisVWorld,
+				Inputs.FacesWidth,
+				Inputs.FacesHeight,
+				GFromLZPerFaceClipMarginPixels,
+				CleanBoundaryUV))
+			{
+				OutDebug.FaceBoundaryUV = MoveTemp(CleanBoundaryUV);
+				OutDebug.FaceBoundarySource = TEXT("per_face_clip_clean");
+			}
+		}
+		for (const FVector& Point : OriginalCapWorld)
+		{
+			OutDebug.OriginalCapUV.Add(WorldPointToFaceUV(
+				Point,
+				Face.PlanePoint,
+				OutDebug.FaceAxisUWorld,
+				OutDebug.FaceAxisVWorld));
+		}
+
+		double MinU, MaxU, MinV, MaxV;
+		ComputeAxisAlignedBounds(OutDebug.OriginalCapUV, MinU, MaxU, MinV, MaxV);
+		OutDebug.WorldOrthogonalCapDiagonal =
+			FVector2D(MaxU - MinU, MaxV - MinV).Size();
+		if (!FMath::IsFinite(OutDebug.WorldOrthogonalCapDiagonal) ||
+			OutDebug.WorldOrthogonalCapDiagonal <= 1e-6)
+		{
+			SetRegularizationFallback(OutDebug, TEXT("original cap has a degenerate world-UV extent"));
+			return false;
+		}
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("world_aligned_face_uv"),
+			FString::Printf(
+				TEXT("excluded world axis %d; cap diagonal %.6f world units"),
+				ExcludedWorldAxis,
+				OutDebug.WorldOrthogonalCapDiagonal));
+
+		auto FaceUVToCapSpace = [&](const FVector2D& UV, FVector2D& OutCapSpace)
+		{
+			if (FMath::Abs(ScaleX) <= 1e-12 || FMath::Abs(ScaleY) <= 1e-12)
+			{
+				return false;
+			}
+			FVector2D FacePixel;
+			if (!ProjectWorldToImage(
+				Inputs.Camera,
+				Inputs.FacesWidth,
+				Inputs.FacesHeight,
+				FaceUVToWorld(
+					UV,
+					Face.PlanePoint,
+					OutDebug.FaceAxisUWorld,
+					OutDebug.FaceAxisVWorld),
+				FacePixel))
+			{
+				return false;
+			}
+			OutCapSpace = FVector2D(
+				FacePixel.X / ScaleX - SourceTranslationCapSpace.X,
+				FacePixel.Y / ScaleY - SourceTranslationCapSpace.Y);
+			return IsFiniteVector2D(OutCapSpace);
+		};
+		auto FaceUVDistancePixels = [&](const FVector2D& A, const FVector2D& B)
+		{
+			FVector2D CapA;
+			FVector2D CapB;
+			if (!FaceUVToCapSpace(A, CapA) || !FaceUVToCapSpace(B, CapB))
+			{
+				return TNumericLimits<double>::Max();
+			}
+			return FVector2D::Distance(CapA, CapB);
+		};
+
+		TArray<FWorldOrthogonalEdge> Edges;
+		TArray<FVector2D> BoundarySamplesUV;
+		BeginWorldOrthogonalStage(OutDebug, TEXT("boundary_run_unprojection"));
+		for (int32 RunIndex = 0; RunIndex < BoundaryRuns.Num(); ++RunIndex)
+		{
+			const FCapBoundaryRunInput& Run = BoundaryRuns[RunIndex];
+			FWorldOrthogonalRunDebug RunDebug;
+			RunDebug.RunIndex = RunIndex;
+			RunDebug.StrokeId = Run.StrokeId;
+			RunDebug.Type =
+				Run.Type == ECapBoundaryRunType::Connector
+				? TEXT("connector")
+				: (Run.Type == ECapBoundaryRunType::Black ? TEXT("black") : TEXT("red"));
+			RunDebug.bIgnoredConnector = Run.Type == ECapBoundaryRunType::Connector;
+			RunDebug.StartNodeId = Run.StartNodeId;
+			RunDebug.EndNodeId = Run.EndNodeId;
+			RunDebug.StartNodeCapSpace = Run.StartNodePosition;
+			RunDebug.EndNodeCapSpace = Run.EndNodePosition;
+			RunDebug.SourcePointsCapSpace = Run.Points;
+			for (const FVector2D& Point : Run.Points)
+			{
+				RunDebug.FacePixels.Emplace(
+					(Point.X + SourceTranslationCapSpace.X) * ScaleX,
+					(Point.Y + SourceTranslationCapSpace.Y) * ScaleY);
+			}
+			OutDebug.WorldOrthogonalRuns.Add(MoveTemp(RunDebug));
+			FWorldOrthogonalRunDebug& StoredRunDebug = OutDebug.WorldOrthogonalRuns.Last();
+
+			if (Run.Type == ECapBoundaryRunType::Connector)
+			{
+				++OutDebug.IgnoredConnectorCount;
+				continue;
+			}
+
+			TArray<FVector2D> RunSamplesUV;
+			TArray<FVector2D> RunSamplesCapSpace;
+			OutDebug.bContainsBlack |= Run.Type == ECapBoundaryRunType::Black;
+			for (const FVector2D& Point : Run.Points)
+			{
+				const FVector2D FacePixel(
+					(Point.X + SourceTranslationCapSpace.X) * ScaleX,
+					(Point.Y + SourceTranslationCapSpace.Y) * ScaleY);
+				FVector2D UV;
+				if (!PixelToFaceUV(
+					FacePixel,
+					Face,
+					Inputs,
+					OutDebug.FaceAxisUWorld,
+					OutDebug.FaceAxisVWorld,
+					UV))
+				{
+					SetRegularizationFallback(OutDebug, TEXT("failed to unproject an ordered boundary run point"));
+					return false;
+				}
+				if (RunSamplesUV.Num() == 0 ||
+					FVector2D::Distance(RunSamplesUV.Last(), UV) > 1e-7)
+				{
+					RunSamplesUV.Add(UV);
+					RunSamplesCapSpace.Add(Point);
+					BoundarySamplesUV.Add(UV);
+					StoredRunDebug.SamplesUV.Add(UV);
+				}
+			}
+			if (RunSamplesUV.Num() < 2)
+			{
+				SetRegularizationFallback(OutDebug, TEXT("a non-connector boundary run has degenerate geometry"));
+				return false;
+			}
+
+			const FVector2D StartPixel(
+				(Run.StartNodePosition.X + SourceTranslationCapSpace.X) * ScaleX,
+				(Run.StartNodePosition.Y + SourceTranslationCapSpace.Y) * ScaleY);
+			const FVector2D EndPixel(
+				(Run.EndNodePosition.X + SourceTranslationCapSpace.X) * ScaleX,
+				(Run.EndNodePosition.Y + SourceTranslationCapSpace.Y) * ScaleY);
+			FVector2D RunStartUV;
+			FVector2D RunEndUV;
+			if (!PixelToFaceUV(
+					StartPixel,
+					Face,
+					Inputs,
+					OutDebug.FaceAxisUWorld,
+					OutDebug.FaceAxisVWorld,
+					RunStartUV) ||
+				!PixelToFaceUV(
+					EndPixel,
+					Face,
+					Inputs,
+					OutDebug.FaceAxisUWorld,
+					OutDebug.FaceAxisVWorld,
+					RunEndUV))
+			{
+				SetRegularizationFallback(OutDebug, TEXT("failed to unproject a boundary graph endpoint"));
+				return false;
+			}
+			StoredRunDebug.StartNodeUV = RunStartUV;
+			StoredRunDebug.EndNodeUV = RunEndUV;
+			StoredRunDebug.bUnprojected = true;
+
+			if (Run.Type == ECapBoundaryRunType::Black)
+			{
+				FWorldOrthogonalEdge Edge;
+				Edge.Type = Run.Type;
+				Edge.SourceRunIndices.Add(RunIndex);
+				Edge.SourceStrokeIds.Add(Run.StrokeId);
+				Edge.PrimitiveEdgeIndices.Add(Edges.Num());
+				Edge.GraphNodeIds = { Run.StartNodeId, Run.EndNodeId };
+				Edge.GraphNodeCapSpace = {
+					Run.StartNodePosition,
+					Run.EndNodePosition
+				};
+				Edge.GraphNodeUV = { RunStartUV, RunEndUV };
+				Edge.SamplesUV = MoveTemp(RunSamplesUV);
+				Edge.SamplesCapSpace = MoveTemp(RunSamplesCapSpace);
+				Edge.StartUV = RunStartUV;
+				Edge.EndUV = RunEndUV;
+				Edge.StartCapSpace = Run.StartNodePosition;
+				Edge.EndCapSpace = Run.EndNodePosition;
+				if (!InitializeWorldOrthogonalEdge(Edge))
+				{
+					SetRegularizationFallback(OutDebug, TEXT("a black boundary run has degenerate geometry"));
+					return false;
+				}
+				Edges.Add(MoveTemp(Edge));
+				continue;
+			}
+
+			BeginWorldOrthogonalStage(OutDebug, TEXT("red_corner_protection"));
+			TArray<int32> ProtectedIndices;
+			FindProtectedRedRunIndices(
+				RunSamplesUV,
+				RunSamplesCapSpace,
+				ProtectedIndices,
+				StoredRunDebug);
+			if (ProtectedIndices.Num() < 2)
+			{
+				SetRegularizationFallback(OutDebug, TEXT("a red boundary run has no usable protected path"));
+				return false;
+			}
+			StoredRunDebug.ProtectedPointIndices = ProtectedIndices;
+			for (int32 ProtectedIndex : ProtectedIndices)
+			{
+				if (RunSamplesUV.IsValidIndex(ProtectedIndex))
+				{
+					StoredRunDebug.ProtectedPointsUV.Add(RunSamplesUV[ProtectedIndex]);
+				}
+			}
+			for (int32 SegmentIndex = 0; SegmentIndex + 1 < ProtectedIndices.Num(); ++SegmentIndex)
+			{
+				const int32 StartIndex = ProtectedIndices[SegmentIndex];
+				const int32 EndIndex = ProtectedIndices[SegmentIndex + 1];
+				if (EndIndex <= StartIndex)
+				{
+					continue;
+				}
+
+				FWorldOrthogonalEdge Edge;
+				Edge.Type = Run.Type;
+				Edge.SourceRunIndices.Add(RunIndex);
+				Edge.SourceStrokeIds.Add(Run.StrokeId);
+				Edge.PrimitiveEdgeIndices.Add(Edges.Num());
+				for (int32 PointIndex = StartIndex; PointIndex <= EndIndex; ++PointIndex)
+				{
+					Edge.SamplesUV.Add(RunSamplesUV[PointIndex]);
+					Edge.SamplesCapSpace.Add(
+						RunSamplesCapSpace[PointIndex]);
+				}
+				Edge.StartUV = SegmentIndex == 0
+					? RunStartUV
+					: RunSamplesUV[StartIndex];
+				Edge.EndUV = SegmentIndex + 2 == ProtectedIndices.Num()
+					? RunEndUV
+					: RunSamplesUV[EndIndex];
+				Edge.StartCapSpace = SegmentIndex == 0
+					? Run.StartNodePosition
+					: RunSamplesCapSpace[StartIndex];
+				Edge.EndCapSpace =
+					SegmentIndex + 2 == ProtectedIndices.Num()
+						? Run.EndNodePosition
+						: RunSamplesCapSpace[EndIndex];
+				if (!InitializeWorldOrthogonalEdge(Edge))
+				{
+					SetRegularizationFallback(OutDebug, TEXT("a protected red boundary segment has degenerate geometry"));
+					return false;
+				}
+				Edges.Add(MoveTemp(Edge));
+			}
+			BeginWorldOrthogonalStage(OutDebug, TEXT("boundary_run_unprojection"));
+		}
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("boundary_run_unprojection"),
+			FString::Printf(
+				TEXT("%d runs unprojected; %d connector runs ignored for geometry"),
+				BoundaryRuns.Num() - OutDebug.IgnoredConnectorCount,
+				OutDebug.IgnoredConnectorCount));
+		PassWorldOrthogonalStage(OutDebug, TEXT("red_corner_protection"));
+		const int32 CollapsedShortEdgeCount =
+			CollapseShortRedPrimitiveEdges(Edges);
+		OutDebug.PrimitiveGeometryEdgeCount = Edges.Num();
+		BeginWorldOrthogonalStage(
+			OutDebug,
+			TEXT("pure_red_root_alignment"));
+		if (!OutDebug.bContainsBlack)
+		{
+			OutDebug.bPureRedRootAlignmentAttempted = true;
+			OutDebug.RootRotationCenterUV =
+				PolygonAreaCentroid2D(OutDebug.OriginalCapUV);
+
+			struct FRootCandidate
+			{
+				int32 PrimitiveEdgeIndex = INDEX_NONE;
+				double LengthPixels = 0.0;
+				double MaxChordDeviationPixels = 0.0;
+				double Reliability = 0.0;
+				EOctilinearAxis TargetAxis = Octi_U;
+				double RotationDegrees = 0.0;
+			};
+			TArray<FRootCandidate> RootCandidates;
+			for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+			{
+				const FWorldOrthogonalEdge& Edge = Edges[EdgeIndex];
+				TArray<FVector2D> SamplesCapSpace;
+				SamplesCapSpace.Reserve(Edge.SamplesUV.Num());
+				bool bMapped = true;
+				for (const FVector2D& SampleUV : Edge.SamplesUV)
+				{
+					FVector2D SampleCapSpace;
+					if (!FaceUVToCapSpace(SampleUV, SampleCapSpace))
+					{
+						bMapped = false;
+						break;
+					}
+					SamplesCapSpace.Add(SampleCapSpace);
+				}
+				if (!bMapped || SamplesCapSpace.Num() < 2)
+				{
+					continue;
+				}
+
+				double LengthPixels = 0.0;
+				for (int32 SampleIndex = 1;
+					SampleIndex < SamplesCapSpace.Num();
+					++SampleIndex)
+				{
+					LengthPixels += FVector2D::Distance(
+						SamplesCapSpace[SampleIndex - 1],
+						SamplesCapSpace[SampleIndex]);
+				}
+				const FVector2D ChordStart = SamplesCapSpace[0];
+				const FVector2D ChordEnd = SamplesCapSpace.Last();
+				const double ChordLengthPixels =
+					FVector2D::Distance(ChordStart, ChordEnd);
+				double MaxChordDeviationPixels = 0.0;
+				for (const FVector2D& Sample : SamplesCapSpace)
+				{
+					MaxChordDeviationPixels = FMath::Max(
+						MaxChordDeviationPixels,
+						FMath::Sqrt(DistancePointToSegmentSquared2D(
+							Sample,
+							ChordStart,
+							ChordEnd)));
+				}
+				if (LengthPixels <
+						WorldOrthoRedMacroGroupMinLengthPixels ||
+					MaxChordDeviationPixels >
+						WorldOrthoRedMacroCorridorPixels)
+				{
+					continue;
+				}
+
+				// Skip diagonal targets (45deg / 135deg) for pure-red roots unless
+				// explicitly re-enabled via CVar. Without this gate a dominant
+				// near-diagonal red stroke would snap the entire cap onto a 45deg /
+				// 135deg frame, which is rarely the user's intent.
+				if (GFromLZPureRedAllowDiagonalRoot == 0 &&
+					(Edge.AxisType == Octi_DiagPlus ||
+					 Edge.AxisType == Octi_DiagMinus))
+				{
+					continue;
+				}
+
+				FRootCandidate Candidate;
+				Candidate.PrimitiveEdgeIndex = EdgeIndex;
+				Candidate.LengthPixels = LengthPixels;
+				Candidate.MaxChordDeviationPixels =
+					MaxChordDeviationPixels;
+				Candidate.Reliability = ChordLengthPixels;
+				Candidate.TargetAxis = Edge.AxisType;
+				Candidate.RotationDegrees =
+					RotationToOctilinearAxisDegrees(
+						Edge.DirectionUV,
+						Candidate.TargetAxis);
+				RootCandidates.Add(Candidate);
+			}
+			RootCandidates.Sort([](
+				const FRootCandidate& A,
+				const FRootCandidate& B)
+			{
+				return A.Reliability > B.Reliability;
+			});
+			if (RootCandidates.Num() >
+				WorldOrthoPureRedMaxRootCandidates)
+			{
+				RootCandidates.SetNum(
+					WorldOrthoPureRedMaxRootCandidates);
+			}
+
+			TArray<FRootCandidate> Hypotheses;
+			FRootCandidate Baseline;
+			Baseline.PrimitiveEdgeIndex = INDEX_NONE;
+			Baseline.RotationDegrees = 0.0;
+			Hypotheses.Add(Baseline);
+			for (const FRootCandidate& Candidate : RootCandidates)
+			{
+				bool bDuplicateRotation = false;
+				for (const FRootCandidate& Existing : Hypotheses)
+				{
+					if (FMath::Abs(
+						Existing.RotationDegrees -
+						Candidate.RotationDegrees) < 0.25)
+					{
+						bDuplicateRotation = true;
+						break;
+					}
+				}
+				if (!bDuplicateRotation)
+				{
+					Hypotheses.Add(Candidate);
+				}
+			}
+
+			int32 BestHypothesisIndex = INDEX_NONE;
+			FPureRedRootHypothesisSolve BestSolve;
+			auto IsBetterHypothesis = [](
+				const FPureRedRootHypothesisSolve& CandidateSolve,
+				const FRootCandidate& Candidate,
+				const FPureRedRootHypothesisSolve& Best,
+				const FRootCandidate& BestCandidate)
+			{
+				const double Epsilon = 1e-6;
+				if (CandidateSolve.MeanBoundaryDistance + Epsilon <
+					Best.MeanBoundaryDistance)
+				{
+					return true;
+				}
+				if (FMath::Abs(
+					CandidateSolve.MeanBoundaryDistance -
+					Best.MeanBoundaryDistance) > Epsilon)
+				{
+					return false;
+				}
+				const double CandidateAreaError =
+					FMath::Abs(CandidateSolve.AreaRatio - 1.0);
+				const double BestAreaError =
+					FMath::Abs(Best.AreaRatio - 1.0);
+				if (CandidateAreaError + Epsilon < BestAreaError)
+				{
+					return true;
+				}
+				if (FMath::Abs(CandidateAreaError - BestAreaError) >
+					Epsilon)
+				{
+					return false;
+				}
+				if (CandidateSolve.AngleCost + Epsilon <
+					Best.AngleCost)
+				{
+					return true;
+				}
+				if (FMath::Abs(
+					CandidateSolve.AngleCost -
+					Best.AngleCost) > Epsilon)
+				{
+					return false;
+				}
+				if (FMath::Abs(Candidate.RotationDegrees) + Epsilon <
+					FMath::Abs(BestCandidate.RotationDegrees))
+				{
+					return true;
+				}
+				return Candidate.Reliability >
+					BestCandidate.Reliability;
+			};
+
+			OutDebug.WorldOrthogonalRootHypotheses.Reset();
+			for (int32 HypothesisIndex = 0;
+				HypothesisIndex < Hypotheses.Num();
+				++HypothesisIndex)
+			{
+				const FRootCandidate& Hypothesis =
+					Hypotheses[HypothesisIndex];
+				const FPureRedRootHypothesisSolve Solve =
+					EvaluatePureRedRootHypothesis(
+						Edges,
+						OutDebug.OriginalCapUV,
+						BoundarySamplesUV,
+						OutDebug.RootRotationCenterUV,
+						Hypothesis.RotationDegrees);
+
+				FWorldOrthogonalRootHypothesisDebug HypothesisDebug;
+				HypothesisDebug.HypothesisIndex = HypothesisIndex;
+				HypothesisDebug.RootPrimitiveEdgeIndex =
+					Hypothesis.PrimitiveEdgeIndex;
+				HypothesisDebug.RootLengthPixels =
+					Hypothesis.LengthPixels;
+				HypothesisDebug.RootMaxChordDeviationPixels =
+					Hypothesis.MaxChordDeviationPixels;
+				HypothesisDebug.Reliability =
+					Hypothesis.Reliability;
+				HypothesisDebug.RotationDegrees =
+					Hypothesis.RotationDegrees;
+				HypothesisDebug.bValid = Solve.bValid;
+				HypothesisDebug.RejectionReason =
+					Solve.RejectionReason;
+				HypothesisDebug.GeometryEdgeCount =
+					Solve.Edges.Num();
+				HypothesisDebug.AngleCost = Solve.AngleCost;
+				HypothesisDebug.AreaRatio = Solve.AreaRatio;
+				HypothesisDebug.MeanBoundaryDistance =
+					Solve.MeanBoundaryDistance;
+				HypothesisDebug.MaxBoundaryDistance =
+					Solve.MaxBoundaryDistance;
+				if (Edges.IsValidIndex(
+					Hypothesis.PrimitiveEdgeIndex))
+				{
+					const FWorldOrthogonalEdge& RootEdge =
+						Edges[Hypothesis.PrimitiveEdgeIndex];
+					HypothesisDebug.RootStrokeIds =
+						RootEdge.SourceStrokeIds;
+					HypothesisDebug.TargetAxisTypeName =
+						OctilinearAxisName(
+							Hypothesis.TargetAxis);
+					HypothesisDebug.RootStartUV =
+						RootEdge.StartUV;
+					HypothesisDebug.RootEndUV =
+						RootEdge.EndUV;
+					HypothesisDebug.AlignedRootStartUV =
+						RotatePointAround2D(
+							RootEdge.StartUV,
+							OutDebug.RootRotationCenterUV,
+							Hypothesis.RotationDegrees);
+					HypothesisDebug.AlignedRootEndUV =
+						RotatePointAround2D(
+							RootEdge.EndUV,
+							OutDebug.RootRotationCenterUV,
+							Hypothesis.RotationDegrees);
+				}
+				else
+				{
+					HypothesisDebug.TargetAxisTypeName =
+						TEXT("none");
+				}
+				OutDebug.WorldOrthogonalRootHypotheses.Add(
+					MoveTemp(HypothesisDebug));
+
+				if (Solve.bValid &&
+					(BestHypothesisIndex == INDEX_NONE ||
+						IsBetterHypothesis(
+							Solve,
+							Hypothesis,
+							BestSolve,
+							Hypotheses[BestHypothesisIndex])))
+				{
+					BestHypothesisIndex = HypothesisIndex;
+					BestSolve = Solve;
+				}
+			}
+
+			if (BestHypothesisIndex == INDEX_NONE)
+			{
+				SetRegularizationFallback(
+					OutDebug,
+					TEXT("all pure-red root alignment hypotheses failed"));
+				return false;
+			}
+
+			const FRootCandidate& Selected =
+				Hypotheses[BestHypothesisIndex];
+			OutDebug.WorldOrthogonalRootHypotheses[
+				BestHypothesisIndex].bSelected = true;
+			OutDebug.SelectedRootHypothesisIndex =
+				BestHypothesisIndex;
+			OutDebug.SelectedRootPrimitiveEdgeIndex =
+				Selected.PrimitiveEdgeIndex;
+			OutDebug.SelectedRootRotationDegrees =
+				Selected.RotationDegrees;
+			if (Edges.IsValidIndex(Selected.PrimitiveEdgeIndex))
+			{
+				const FWorldOrthogonalEdge& RootEdge =
+					Edges[Selected.PrimitiveEdgeIndex];
+				OutDebug.SelectedRootStrokeIds =
+					RootEdge.SourceStrokeIds;
+				OutDebug.SelectedRootTargetAxisTypeName =
+					OctilinearAxisName(Selected.TargetAxis);
+				OutDebug.SelectedRootStartUV = RootEdge.StartUV;
+				OutDebug.SelectedRootEndUV = RootEdge.EndUV;
+				OutDebug.SelectedAlignedRootStartUV =
+					RotatePointAround2D(
+						RootEdge.StartUV,
+						OutDebug.RootRotationCenterUV,
+						Selected.RotationDegrees);
+				OutDebug.SelectedAlignedRootEndUV =
+					RotatePointAround2D(
+						RootEdge.EndUV,
+						OutDebug.RootRotationCenterUV,
+						Selected.RotationDegrees);
+			}
+			else
+			{
+				OutDebug.SelectedRootTargetAxisTypeName =
+					TEXT("none");
+			}
+
+			for (FWorldOrthogonalEdge& Edge : Edges)
+			{
+				if (!RotateAndReclassifyPureRedEdge(
+					Edge,
+					OutDebug.RootRotationCenterUV,
+					Selected.RotationDegrees))
+				{
+					SetRegularizationFallback(
+						OutDebug,
+						TEXT("selected pure-red root rotation failed to transform a primitive edge"));
+					return false;
+				}
+			}
+			RotatePointsAround2D(
+				BoundarySamplesUV,
+				OutDebug.RootRotationCenterUV,
+				Selected.RotationDegrees);
+			OutDebug.WorldOrthogonalPhaseAlignedCapUV =
+				OutDebug.OriginalCapUV;
+			RotatePointsAround2D(
+				OutDebug.WorldOrthogonalPhaseAlignedCapUV,
+				OutDebug.RootRotationCenterUV,
+				Selected.RotationDegrees);
+			PassWorldOrthogonalStage(
+				OutDebug,
+				TEXT("pure_red_root_alignment"),
+				FString::Printf(
+					TEXT("selected hypothesis %d root edge %d rotation %.6f degrees from %d hypotheses"),
+					BestHypothesisIndex,
+					Selected.PrimitiveEdgeIndex,
+					Selected.RotationDegrees,
+					Hypotheses.Num()));
+		}
+		else
+		{
+			OutDebug.WorldOrthogonalPhaseAlignedCapUV =
+				OutDebug.OriginalCapUV;
+			PassWorldOrthogonalStage(
+				OutDebug,
+				TEXT("pure_red_root_alignment"),
+				TEXT("contains black; world phase locked and rotation fixed at 0 degrees"));
+		}
+
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("primitive_edge_classification"),
+			FString::Printf(
+				TEXT("%d primitive geometric edges after collapsing %d short red edges"),
+				Edges.Num(),
+				CollapsedShortEdgeCount));
+		CaptureWorldOrthogonalEdgeDebug(
+			Edges,
+			OutDebug.WorldOrthogonalPrimitiveEdges);
+
+		// Black edges use the same U/V-vs-diagonal threshold classification as
+		// red edges, then apply their stricter snap tolerance to that assigned axis.
+		for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+		{
+			const FWorldOrthogonalEdge& Edge = Edges[EdgeIndex];
+			if (Edge.Type == ECapBoundaryRunType::Black)
+			{
+				if (Edge.AngleToAssignedAxis >
+					WorldOrthoBlackAxisToleranceDegrees)
+				{
+					SetRegularizationFallback(
+						OutDebug,
+						FString::Printf(
+							TEXT("black edge %d assigned to %s by the %.3f-degree diagonal threshold requires %.3f degrees of snap, exceeding %.3f"),
+							EdgeIndex,
+							*OctilinearAxisName(Edge.AxisType),
+							WorldOrthoDiagThresholdDegrees,
+							Edge.AngleToAssignedAxis,
+							WorldOrthoBlackAxisToleranceDegrees));
+					return false;
+				}
+			}
+		}
+
+		BeginWorldOrthogonalStage(OutDebug, TEXT("same_axis_merge"));
+		if (!MergeAdjacentWorldOrthogonalEdges(Edges, FaceUVDistancePixels))
+		{
+			SetRegularizationFallback(
+				OutDebug,
+				TEXT("failed to merge adjacent geometric support fragments with the same octilinear axis assignment"));
+			return false;
+		}
+		OutDebug.GeometryEdgeCount = Edges.Num();
+		CaptureWorldOrthogonalEdgeDebug(
+			Edges,
+			OutDebug.WorldOrthogonalMergedEdges);
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("same_axis_merge"),
+			FString::Printf(
+				TEXT("%d graph primitives merged to %d geometric support edges; black graph nodes retained"),
+				OutDebug.PrimitiveGeometryEdgeCount,
+				OutDebug.GeometryEdgeCount));
+
+		// Stage 6: adjacency_validation — validate edge sequence can form an octilinear polygon
+		BeginWorldOrthogonalStage(OutDebug, TEXT("adjacency_validation"));
+		if (Edges.Num() < 3)
+		{
+			SetRegularizationFallback(
+				OutDebug,
+				FString::Printf(
+					TEXT("merged edge count %d is below the minimum of 3 for an octilinear polygon"),
+					Edges.Num()));
+			return false;
+		}
+		// Check no adjacent edges share the same axis type
+		for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+		{
+			const int32 NextIndex = (EdgeIndex + 1) % Edges.Num();
+			if (Edges[EdgeIndex].AxisType == Edges[NextIndex].AxisType)
+			{
+				SetRegularizationFallback(
+					OutDebug,
+					FString::Printf(
+						TEXT("adjacent support edges %d and %d share axis type %s; they do not define an octilinear corner"),
+						EdgeIndex, NextIndex, *OctilinearAxisName(Edges[EdgeIndex].AxisType)));
+				return false;
+			}
+		}
+		// Compute weighted angle cost for diagnostics
+		double AngleCost = 0.0;
+		for (const FWorldOrthogonalEdge& Edge : Edges)
+		{
+			AngleCost += FMath::Max(Edge.PathLength, 1e-6) * Edge.AngleToAssignedAxis * Edge.AngleToAssignedAxis;
+		}
+		OutDebug.WorldOrthogonalAngleCost = AngleCost;
+
+		CaptureWorldOrthogonalEdgeDebug(
+			Edges,
+			OutDebug.WorldOrthogonalMergedEdges);
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("adjacency_validation"),
+			FString::Printf(
+				TEXT("%d support edges with distinct adjacent octilinear directions; weighted angle cost %.6f"),
+				Edges.Num(),
+				AngleCost));
+
+		// Stage 7: support_line_solve — compute support coordinate for each edge
+		BeginWorldOrthogonalStage(OutDebug, TEXT("support_line_solve"));
+
+		for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+		{
+			FWorldOrthogonalEdge& Edge = Edges[EdgeIndex];
+			if (Edge.Type == ECapBoundaryRunType::Black)
+			{
+				Edge.SupportCoordinate = WeightedMedianForEdgeOctilinear(
+					Edge.SamplesUV,
+					Edge.AxisType);
+				Edge.SnappedGraphNodeUV.Reset();
+				Edge.GraphNodeSnapDistancesPixels.Reset();
+				for (int32 NodeIndex = 0; NodeIndex < Edge.GraphNodeUV.Num(); ++NodeIndex)
+				{
+					const FVector2D& OriginalNodeUV = Edge.GraphNodeUV[NodeIndex];
+					const FVector2D SnappedNodeUV = ProjectPointToOctilinearSupport(
+						OriginalNodeUV,
+						Edge.AxisType,
+						Edge.SupportCoordinate);
+					const double SnapDistancePixels =
+						FaceUVDistancePixels(OriginalNodeUV, SnappedNodeUV);
+					Edge.SnappedGraphNodeUV.Add(SnappedNodeUV);
+					Edge.GraphNodeSnapDistancesPixels.Add(SnapDistancePixels);
+					if (!FMath::IsFinite(SnapDistancePixels) ||
+						SnapDistancePixels > WorldOrthoBlackNodeSnapTolerancePixels)
+					{
+						const int32 NodeId = Edge.GraphNodeIds.IsValidIndex(NodeIndex)
+							? Edge.GraphNodeIds[NodeIndex]
+							: INDEX_NONE;
+						SetRegularizationFallback(
+							OutDebug,
+							FString::Printf(
+								TEXT("black support edge %d node %d requires %.3f px normal snap, exceeding %.3f px"),
+								EdgeIndex,
+								NodeId,
+								SnapDistancePixels,
+								WorldOrthoBlackNodeSnapTolerancePixels));
+						return false;
+					}
+				}
+				continue;
+			}
+
+			const int32 PreviousIndex = (EdgeIndex + Edges.Num() - 1) % Edges.Num();
+			const int32 NextIndex = (EdgeIndex + 1) % Edges.Num();
+			const FWorldOrthogonalEdge& Previous = Edges[PreviousIndex];
+			const FWorldOrthogonalEdge& Next = Edges[NextIndex];
+			const bool bPreviousBlack = Previous.Type == ECapBoundaryRunType::Black;
+			const bool bNextBlack = Next.Type == ECapBoundaryRunType::Black;
+			const double PreviousFixed =
+				OctilinearSupportValue(Previous.EndUV, Edge.AxisType);
+			const double NextFixed =
+				OctilinearSupportValue(Next.StartUV, Edge.AxisType);
+			if (bPreviousBlack && bNextBlack)
+			{
+				Edge.SupportCoordinate = 0.5 * (PreviousFixed + NextFixed);
+			}
+			else if (bPreviousBlack)
+			{
+				Edge.SupportCoordinate = PreviousFixed;
+			}
+			else if (bNextBlack)
+			{
+				Edge.SupportCoordinate = NextFixed;
+			}
+			else
+			{
+				Edge.SupportCoordinate = WeightedMedianForEdgeOctilinear(
+					Edge.SamplesUV, Edge.AxisType);
+			}
+		}
+		CaptureWorldOrthogonalEdgeDebug(
+			Edges,
+			OutDebug.WorldOrthogonalMergedEdges);
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("support_line_solve"),
+			OutDebug.bContainsBlack
+				? FString::Printf(
+					TEXT("black support lines fitted with graph-node snap tolerance %.3f px; remaining red supports solved"),
+					WorldOrthoBlackNodeSnapTolerancePixels)
+				: TEXT("pure-red supports solved by weighted median"));
+
+		// Stage 8: vertex_intersections — solve vertex positions from support intersections
+		BeginWorldOrthogonalStage(OutDebug, TEXT("vertex_intersections"));
+		TArray<FVector2D> CorrectedUV;
+		CorrectedUV.SetNum(Edges.Num());
+		for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+		{
+			const int32 PreviousIndex = (EdgeIndex + Edges.Num() - 1) % Edges.Num();
+			const FWorldOrthogonalEdge& Previous = Edges[PreviousIndex];
+			const FWorldOrthogonalEdge& Current = Edges[EdgeIndex];
+			FVector2D Vertex = SolveOctilinearVertexIntersection(
+				Previous.AxisType, Previous.SupportCoordinate,
+				Current.AxisType, Current.SupportCoordinate);
+			if (!IsFiniteVector2D(Vertex))
+			{
+				SetRegularizationFallback(
+					OutDebug,
+					FString::Printf(
+						TEXT("vertex intersection between edge %d (%s) and edge %d (%s) is not finite"),
+						PreviousIndex, *OctilinearAxisName(Previous.AxisType),
+						EdgeIndex, *OctilinearAxisName(Current.AxisType)));
+				return false;
+			}
+			CorrectedUV[EdgeIndex] = Vertex;
+		}
+		OutDebug.WorldOrthogonalSolvedVerticesUV = CorrectedUV;
+
+		if (!OutDebug.bContainsBlack)
+		{
+			const FVector2D CenterOffset =
+				PolygonAreaCentroid2D(OutDebug.OriginalCapUV) -
+				PolygonAreaCentroid2D(CorrectedUV);
+			for (FVector2D& Point : CorrectedUV)
+			{
+				Point += CenterOffset;
+			}
+			for (FWorldOrthogonalEdge& Edge : Edges)
+			{
+				switch (Edge.AxisType)
+				{
+				case Octi_U:         Edge.SupportCoordinate += CenterOffset.Y; break;
+				case Octi_V:         Edge.SupportCoordinate += CenterOffset.X; break;
+				case Octi_DiagPlus:  Edge.SupportCoordinate += (CenterOffset.X - CenterOffset.Y); break;
+				case Octi_DiagMinus: Edge.SupportCoordinate += (CenterOffset.X + CenterOffset.Y); break;
+				default:             Edge.SupportCoordinate += CenterOffset.Y; break;
+				}
+			}
+			OutDebug.WorldOrthogonalSolvedVerticesUV = CorrectedUV;
+		}
+
+		// Black graph nodes keep their identity and order while their geometric
+		// positions may snap to the fitted support chain within the pixel budget.
+		for (int32 EdgeIndex = 0; EdgeIndex < Edges.Num(); ++EdgeIndex)
+		{
+			FWorldOrthogonalEdge& Edge = Edges[EdgeIndex];
+			const FVector2D& Start = CorrectedUV[EdgeIndex];
+			const FVector2D& End = CorrectedUV[(EdgeIndex + 1) % Edges.Num()];
+			if (Edge.Type == ECapBoundaryRunType::Black)
+			{
+				Edge.SnappedGraphNodeUV.Reset();
+				Edge.GraphNodeSnapDistancesPixels.Reset();
+				for (int32 NodeIndex = 0; NodeIndex < Edge.GraphNodeUV.Num(); ++NodeIndex)
+				{
+					FVector2D SnappedNodeUV = ProjectPointToOctilinearSupport(
+						Edge.GraphNodeUV[NodeIndex],
+						Edge.AxisType,
+						Edge.SupportCoordinate);
+					if (NodeIndex == 0)
+					{
+						SnappedNodeUV = Start;
+					}
+					else if (NodeIndex + 1 == Edge.GraphNodeUV.Num())
+					{
+						SnappedNodeUV = End;
+					}
+					const double SnapDistancePixels =
+						FaceUVDistancePixels(Edge.GraphNodeUV[NodeIndex], SnappedNodeUV);
+					Edge.SnappedGraphNodeUV.Add(SnappedNodeUV);
+					Edge.GraphNodeSnapDistancesPixels.Add(SnapDistancePixels);
+					if (!FMath::IsFinite(SnapDistancePixels) ||
+						SnapDistancePixels > WorldOrthoBlackNodeSnapTolerancePixels)
+					{
+						const int32 NodeId = Edge.GraphNodeIds.IsValidIndex(NodeIndex)
+							? Edge.GraphNodeIds[NodeIndex]
+							: INDEX_NONE;
+						SetRegularizationFallback(
+							OutDebug,
+							FString::Printf(
+								TEXT("octilinear solve moves black graph node %d by %.3f px, exceeding %.3f px"),
+								NodeId,
+								SnapDistancePixels,
+								WorldOrthoBlackNodeSnapTolerancePixels));
+						return false;
+					}
+				}
+			}
+			if (OutDebug.WorldOrthogonalMergedEdges.IsValidIndex(EdgeIndex))
+			{
+				FWorldOrthogonalEdgeDebug& EdgeDebug =
+					OutDebug.WorldOrthogonalMergedEdges[EdgeIndex];
+				EdgeDebug.AxisType = static_cast<int32>(Edge.AxisType);
+				EdgeDebug.SupportCoordinate = Edge.SupportCoordinate;
+				EdgeDebug.SolvedStartUV = Start;
+				EdgeDebug.SolvedEndUV = End;
+				EdgeDebug.SnappedGraphNodeUV = Edge.SnappedGraphNodeUV;
+				EdgeDebug.GraphNodeSnapDistancesPixels =
+					Edge.GraphNodeSnapDistancesPixels;
+			}
+		}
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("vertex_intersections"),
+			FString::Printf(TEXT("%d support-line intersections"), CorrectedUV.Num()));
+
+		// Stage 9: topology_validation — self-intersection and protected turns only
+		BeginWorldOrthogonalStage(OutDebug, TEXT("topology_validation"));
+		const double OriginalSignedArea = SignedPolygonAreaForRegularization(OutDebug.OriginalCapUV);
+		const double CorrectedSignedArea = SignedPolygonAreaForRegularization(CorrectedUV);
+		OutDebug.WorldOrthogonalAreaRatio =
+			FMath::Abs(CorrectedSignedArea) / FMath::Abs(OriginalSignedArea);
+		if (!FMath::IsFinite(OutDebug.WorldOrthogonalAreaRatio) ||
+			OutDebug.WorldOrthogonalAreaRatio < WorldOrthoMinAreaRatio)
+		{
+			SetRegularizationFallback(
+				OutDebug,
+				FString::Printf(
+					TEXT("orthogonal area ratio %.6f is below the minimum %.6f"),
+					OutDebug.WorldOrthogonalAreaRatio,
+					WorldOrthoMinAreaRatio));
+			return false;
+		}
+
+		if (PolygonHasSelfIntersection(CorrectedUV))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("corrected cap self-intersects"));
+			return false;
+		}
+		for (int32 VertexIndex = 0; VertexIndex < Edges.Num(); ++VertexIndex)
+		{
+			const int32 PreviousIndex = (VertexIndex + Edges.Num() - 1) % Edges.Num();
+			const double OriginalTurn = FVector2D::CrossProduct(
+				Edges[PreviousIndex].DirectionUV.GetSafeNormal(),
+				Edges[VertexIndex].DirectionUV.GetSafeNormal());
+			const FVector2D CorrectedIncoming =
+				CorrectedUV[VertexIndex] - CorrectedUV[PreviousIndex];
+			const FVector2D CorrectedOutgoing =
+				CorrectedUV[(VertexIndex + 1) % CorrectedUV.Num()] - CorrectedUV[VertexIndex];
+			const double CorrectedTurn = FVector2D::CrossProduct(
+				CorrectedIncoming.GetSafeNormal(),
+				CorrectedOutgoing.GetSafeNormal());
+			if (FMath::Abs(OriginalTurn) >= 0.25 &&
+				OriginalTurn * CorrectedTurn < 0.0)
+			{
+				SetRegularizationFallback(
+					OutDebug,
+					TEXT("corrected cap changes a protected convex/concave turn"));
+				return false;
+			}
+		}
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("topology_validation"),
+			TEXT("self-intersection and protected turns checks passed"));
+
+		// Stage 10: metric_validation — diagnostic only, no hard rejection
+		BeginWorldOrthogonalStage(OutDebug, TEXT("metric_validation"));
+		ComputeBoundaryDistanceStats(
+			BoundarySamplesUV,
+			CorrectedUV,
+			OutDebug.WorldOrthogonalMeanBoundaryDistance,
+			OutDebug.WorldOrthogonalMaxBoundaryDistance);
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("metric_validation"),
+			FString::Printf(
+				TEXT("area ratio %.6f; boundary mean %.6f; max %.6f (diagnostic only)"),
+				OutDebug.WorldOrthogonalAreaRatio,
+				OutDebug.WorldOrthogonalMeanBoundaryDistance,
+				OutDebug.WorldOrthogonalMaxBoundaryDistance));
+
+		// Stage 11: world_conversion
+		BeginWorldOrthogonalStage(OutDebug, TEXT("world_conversion"));
+		if (!ConvertFaceUVLoopToWorld(
+			CorrectedUV,
+			Face.PlanePoint,
+			OutDebug.FaceAxisUWorld,
+			OutDebug.FaceAxisVWorld,
+			OutFinalCapWorld))
+		{
+			SetRegularizationFallback(OutDebug, TEXT("corrected world-UV cap failed conversion back to world space"));
+			return false;
+		}
+		PassWorldOrthogonalStage(
+			OutDebug,
+			TEXT("world_conversion"),
+			FString::Printf(TEXT("%d corrected vertices converted to world space"), OutFinalCapWorld.Num()));
+
+		OutDebug.CapArea = FMath::Abs(OriginalSignedArea);
+		OutDebug.bApplied = true;
+		OutDebug.bFallbackToOriginal = false;
+		OutDebug.SelectedGeometry = OutDebug.bContainsBlack
+			? TEXT("world_octilinear_black_anchored")
+			: TEXT("world_octilinear_pure_red");
+		OutDebug.RejectionReason.Reset();
+		OutDebug.FinalCapUV = CorrectedUV;
+		OutDebug.FinalCapWorld = OutFinalCapWorld;
+		return true;
 	}
 
 	static bool RegularizeCapToFaceBBox(
@@ -3060,9 +6166,33 @@ namespace
 
 		OutDebug.FaceAxisUWorld = AxisU;
 		OutDebug.FaceAxisVWorld = AxisV;
-		for (const FVector& Point : Face.KeyPoints3D)
+		OutDebug.FaceBoundarySource = TEXT("shared_camera_legacy");
+		bool bUsedPerFaceClean = false;
+		if (GFromLZUsePerFaceCapture != 0)
 		{
-			OutDebug.FaceBoundaryUV.Add(WorldPointToFaceUV(Point, Face.PlanePoint, AxisU, AxisV));
+			TArray<FVector2D> CleanBoundaryUV;
+			if (BuildPerFaceCleanBoundaryUV(
+				Face.KeyPoints2D,
+				Face.KeyPoints3D,
+				Face.PlanePoint,
+				AxisU,
+				AxisV,
+				Inputs.FacesWidth,
+				Inputs.FacesHeight,
+				GFromLZPerFaceClipMarginPixels,
+				CleanBoundaryUV))
+			{
+				OutDebug.FaceBoundaryUV = MoveTemp(CleanBoundaryUV);
+				OutDebug.FaceBoundarySource = TEXT("per_face_clip_clean");
+				bUsedPerFaceClean = true;
+			}
+		}
+		if (!bUsedPerFaceClean)
+		{
+			for (const FVector& Point : Face.KeyPoints3D)
+			{
+				OutDebug.FaceBoundaryUV.Add(WorldPointToFaceUV(Point, Face.PlanePoint, AxisU, AxisV));
+			}
 		}
 		if (!BuildConvexHull2D(OutDebug.FaceBoundaryUV, OutDebug.FaceHullUV))
 		{
@@ -3256,7 +6386,23 @@ namespace
 		if (!FMath::IsFinite(MinU) || !FMath::IsFinite(MaxU) ||
 			!FMath::IsFinite(MinV) || !FMath::IsFinite(MaxV))
 		{
-			return false;
+			DrawLineRGBA(
+				RGBA,
+				Size,
+				Size,
+				FVector2D(160.0, 160.0),
+				FVector2D(double(Size - 160), double(Size - 160)),
+				FColor(220, 70, 70, 255),
+				6);
+			DrawLineRGBA(
+				RGBA,
+				Size,
+				Size,
+				FVector2D(double(Size - 160), 160.0),
+				FVector2D(160.0, double(Size - 160)),
+				FColor(220, 70, 70, 255),
+				6);
+			return SaveRGBAToPng(RGBA, Size, Size, Path);
 		}
 
 		const double PadU = FMath::Max((MaxU - MinU) * 0.08, 1e-3);
@@ -3296,12 +6442,603 @@ namespace
 		return SaveRGBAToPng(RGBA, Size, Size, Path);
 	}
 
+	static FColor WorldOrthogonalAxisColor(int32 Axis, const FString& Type)
+	{
+		if (Type == TEXT("black"))
+		{
+			switch (Axis)
+			{
+			case Octi_U:         return FColor(235, 235, 235, 255);
+			case Octi_V:         return FColor(200, 200, 235, 255);
+			case Octi_DiagPlus:  return FColor(235, 200, 200, 255);
+			case Octi_DiagMinus: return FColor(200, 235, 200, 255);
+			default:             return FColor(235, 235, 235, 255);
+			}
+		}
+		switch (Axis)
+		{
+		case Octi_U:         return FColor(255, 90, 70, 255);   // red-ish
+		case Octi_V:         return FColor(70, 150, 255, 255);  // blue-ish
+		case Octi_DiagPlus:  return FColor(255, 180, 50, 255);  // orange
+		case Octi_DiagMinus: return FColor(50, 220, 140, 255);  // teal/green
+		default:             return FColor(255, 90, 70, 255);
+		}
+	}
+
+	static bool SaveWorldOrthogonalStepPng(
+		const FCapBBoxRegularizationResult& Debug,
+		const FString& Path,
+		int32 ViewIndex)
+	{
+		const int32 Size = CapBBoxDebugImageSize;
+		TArray<uint8> RGBA;
+		RGBA.SetNumUninitialized(Size * Size * 4);
+		for (int32 Pixel = 0; Pixel < Size * Size; ++Pixel)
+		{
+			const int32 Offset = Pixel * 4;
+			RGBA[Offset + 0] = 24;
+			RGBA[Offset + 1] = 24;
+			RGBA[Offset + 2] = 28;
+			RGBA[Offset + 3] = 255;
+		}
+
+		double MinU = TNumericLimits<double>::Max();
+		double MaxU = -TNumericLimits<double>::Max();
+		double MinV = TNumericLimits<double>::Max();
+		double MaxV = -TNumericLimits<double>::Max();
+		AccumulateUVBounds(Debug.OriginalCapUV, MinU, MaxU, MinV, MaxV);
+		AccumulateUVBounds(Debug.FinalCapUV, MinU, MaxU, MinV, MaxV);
+		AccumulateUVBounds(
+			Debug.WorldOrthogonalPhaseAlignedCapUV,
+			MinU,
+			MaxU,
+			MinV,
+			MaxV);
+		for (const FWorldOrthogonalRunDebug& Run : Debug.WorldOrthogonalRuns)
+		{
+			AccumulateUVBounds(Run.SamplesUV, MinU, MaxU, MinV, MaxV);
+		}
+		for (const FWorldOrthogonalEdgeDebug& Edge : Debug.WorldOrthogonalPrimitiveEdges)
+		{
+			AccumulateUVBounds(Edge.SamplesUV, MinU, MaxU, MinV, MaxV);
+		}
+		for (const FWorldOrthogonalEdgeDebug& Edge : Debug.WorldOrthogonalMergedEdges)
+		{
+			AccumulateUVBounds(Edge.SamplesUV, MinU, MaxU, MinV, MaxV);
+			AccumulateUVBounds(Edge.GraphNodeUV, MinU, MaxU, MinV, MaxV);
+			AccumulateUVBounds(Edge.SnappedGraphNodeUV, MinU, MaxU, MinV, MaxV);
+		}
+		for (const FWorldOrthogonalRootHypothesisDebug& Hypothesis :
+			Debug.WorldOrthogonalRootHypotheses)
+		{
+			AccumulateUVBounds(
+				TArray<FVector2D>{
+					Hypothesis.RootStartUV,
+					Hypothesis.RootEndUV,
+					Hypothesis.AlignedRootStartUV,
+					Hypothesis.AlignedRootEndUV
+				},
+				MinU,
+				MaxU,
+				MinV,
+				MaxV);
+		}
+		AccumulateUVBounds(Debug.WorldOrthogonalSolvedVerticesUV, MinU, MaxU, MinV, MaxV);
+		if (!FMath::IsFinite(MinU) || !FMath::IsFinite(MaxU) ||
+			!FMath::IsFinite(MinV) || !FMath::IsFinite(MaxV))
+		{
+			return false;
+		}
+
+		const double PadU = FMath::Max((MaxU - MinU) * 0.08, 1e-3);
+		const double PadV = FMath::Max((MaxV - MinV) * 0.08, 1e-3);
+		MinU -= PadU;
+		MaxU += PadU;
+		MinV -= PadV;
+		MaxV += PadV;
+		auto Map = [&](const TArray<FVector2D>& Points)
+		{
+			return MapUVPointsToDebugImage(Points, MinU, MaxU, MinV, MaxV, Size);
+		};
+
+		DrawClosedPolylineRGBA(
+			RGBA,
+			Size,
+			Size,
+			Map(Debug.OriginalCapUV),
+			FColor(85, 85, 92, 255),
+			1);
+
+		if (ViewIndex <= 1)
+		{
+			for (const FWorldOrthogonalRunDebug& Run : Debug.WorldOrthogonalRuns)
+			{
+				const FColor Color =
+					Run.Type == TEXT("black")
+						? FColor(240, 240, 240, 255)
+						: (Run.Type == TEXT("connector")
+							? FColor(255, 155, 45, 255)
+							: FColor(255, 75, 75, 255));
+				DrawOpenPolylineRGBA(RGBA, Size, Size, Map(Run.SamplesUV), Color, 2);
+				if (ViewIndex == 1)
+				{
+					for (const FVector2D& Point : Map(Run.ProtectedPointsUV))
+					{
+						DrawPointRGBA(
+							RGBA,
+							Size,
+							Size,
+							FMath::RoundToInt(Point.X),
+							FMath::RoundToInt(Point.Y),
+							FColor(255, 225, 40, 255),
+							5);
+					}
+				}
+			}
+		}
+		else if (ViewIndex == 2)
+		{
+			for (const FWorldOrthogonalEdgeDebug& Edge : Debug.WorldOrthogonalPrimitiveEdges)
+			{
+				DrawOpenPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Edge.SamplesUV),
+					WorldOrthogonalAxisColor(Edge.AxisType, Edge.Type),
+					2);
+			}
+		}
+		else if (ViewIndex == 3 || ViewIndex == 4)
+		{
+			for (const FWorldOrthogonalEdgeDebug& Edge : Debug.WorldOrthogonalMergedEdges)
+			{
+				DrawOpenPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Edge.SamplesUV),
+					WorldOrthogonalAxisColor(Edge.AxisType, Edge.Type),
+					3);
+				if (Edge.Type == TEXT("black"))
+				{
+					for (const FVector2D& Point : Map(Edge.GraphNodeUV))
+					{
+						DrawPointRGBA(
+							RGBA,
+							Size,
+							Size,
+							FMath::RoundToInt(Point.X),
+							FMath::RoundToInt(Point.Y),
+							FColor(50, 210, 255, 255),
+							5);
+					}
+				}
+			}
+		}
+		else if (ViewIndex == 5)
+		{
+			for (const FWorldOrthogonalEdgeDebug& Edge : Debug.WorldOrthogonalMergedEdges)
+			{
+				TArray<FVector2D> Support;
+				const EOctilinearAxis EdgeAxisType = static_cast<EOctilinearAxis>(Edge.AxisType);
+				switch (EdgeAxisType)
+				{
+				case Octi_U:
+					Support = {
+						FVector2D(MinU, Edge.SupportCoordinate),
+						FVector2D(MaxU, Edge.SupportCoordinate)
+					};
+					break;
+				case Octi_V:
+					Support = {
+						FVector2D(Edge.SupportCoordinate, MinV),
+						FVector2D(Edge.SupportCoordinate, MaxV)
+					};
+					break;
+				case Octi_DiagPlus:
+					{
+						const double D = Edge.SupportCoordinate;
+						const double V0 = MinV;
+						const double V1 = MaxV;
+						Support = {
+							FVector2D(V0 + D, V0),
+							FVector2D(V1 + D, V1)
+						};
+					}
+					break;
+				case Octi_DiagMinus:
+					{
+						const double D = Edge.SupportCoordinate;
+						const double V0 = MinV;
+						const double V1 = MaxV;
+						Support = {
+							FVector2D(D - V0, V0),
+							FVector2D(D - V1, V1)
+						};
+					}
+					break;
+				default:
+					continue;
+				}
+				DrawOpenPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Support),
+					WorldOrthogonalAxisColor(Edge.AxisType, Edge.Type),
+					1);
+				if (Edge.Type == TEXT("black"))
+				{
+					const int32 NodeCount = FMath::Min(
+						Edge.GraphNodeUV.Num(),
+						Edge.SnappedGraphNodeUV.Num());
+					for (int32 NodeIndex = 0; NodeIndex < NodeCount; ++NodeIndex)
+					{
+						DrawOpenPolylineRGBA(
+							RGBA,
+							Size,
+							Size,
+							Map(TArray<FVector2D>{
+								Edge.GraphNodeUV[NodeIndex],
+								Edge.SnappedGraphNodeUV[NodeIndex]
+							}),
+							FColor(255, 80, 220, 255),
+							2);
+						const FVector2D SnappedPixel =
+							Map(TArray<FVector2D>{ Edge.SnappedGraphNodeUV[NodeIndex] })[0];
+						DrawPointRGBA(
+							RGBA,
+							Size,
+							Size,
+							FMath::RoundToInt(SnappedPixel.X),
+							FMath::RoundToInt(SnappedPixel.Y),
+							FColor(255, 225, 40, 255),
+							5);
+					}
+				}
+				if (!Edge.SolvedStartUV.IsNearlyZero() ||
+					!Edge.SolvedEndUV.IsNearlyZero())
+				{
+					DrawOpenPolylineRGBA(
+						RGBA,
+						Size,
+						Size,
+						Map(TArray<FVector2D>{ Edge.SolvedStartUV, Edge.SolvedEndUV }),
+						FColor(255, 225, 40, 255),
+						3);
+				}
+			}
+		}
+		else if (ViewIndex == 8)
+		{
+			if (Debug.WorldOrthogonalPhaseAlignedCapUV.Num() >= 3)
+			{
+				DrawClosedPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Debug.WorldOrthogonalPhaseAlignedCapUV),
+					FColor(80, 160, 255, 255),
+					2);
+			}
+			for (const FWorldOrthogonalRootHypothesisDebug& Hypothesis :
+				Debug.WorldOrthogonalRootHypotheses)
+			{
+				if (Hypothesis.RootPrimitiveEdgeIndex == INDEX_NONE)
+				{
+					continue;
+				}
+				const FColor CandidateColor =
+					Hypothesis.bSelected
+						? FColor(255, 225, 40, 255)
+						: (Hypothesis.bValid
+							? FColor(110, 210, 130, 255)
+							: FColor(150, 70, 70, 255));
+				DrawOpenPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(TArray<FVector2D>{
+						Hypothesis.RootStartUV,
+						Hypothesis.RootEndUV
+					}),
+					CandidateColor,
+					Hypothesis.bSelected ? 4 : 2);
+			}
+			if (Debug.SelectedRootPrimitiveEdgeIndex != INDEX_NONE)
+			{
+				DrawOpenPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(TArray<FVector2D>{
+						Debug.SelectedAlignedRootStartUV,
+						Debug.SelectedAlignedRootEndUV
+					}),
+					FColor(255, 80, 220, 255),
+					4);
+				const FVector2D CenterPixel =
+					Map(TArray<FVector2D>{
+						Debug.RootRotationCenterUV
+					})[0];
+				DrawPointRGBA(
+					RGBA,
+					Size,
+					Size,
+					FMath::RoundToInt(CenterPixel.X),
+					FMath::RoundToInt(CenterPixel.Y),
+					FColor(255, 255, 255, 255),
+					5);
+			}
+		}
+		else
+		{
+			if (Debug.WorldOrthogonalSolvedVerticesUV.Num() >= 3)
+			{
+				DrawClosedPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Debug.WorldOrthogonalSolvedVerticesUV),
+					FColor(255, 225, 40, 255),
+					2);
+			}
+			if (Debug.bApplied)
+			{
+				DrawClosedPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Debug.FinalCapUV),
+					FColor(40, 240, 100, 255),
+					3);
+			}
+			else if (Debug.bFallbackToOriginal)
+			{
+				DrawClosedPolylineRGBA(
+					RGBA,
+					Size,
+					Size,
+					Map(Debug.OriginalCapUV),
+					FColor(255, 70, 70, 255),
+					2);
+			}
+		}
+
+		const double AxisLengthUV = 0.12 * FMath::Max(MaxU - MinU, MaxV - MinV);
+		const FVector2D AxisOrigin(MinU + 0.08 * (MaxU - MinU), MinV + 0.08 * (MaxV - MinV));
+		DrawArrowRGBA(
+			RGBA,
+			Size,
+			Size,
+			Map(TArray<FVector2D>{ AxisOrigin })[0],
+			Map(TArray<FVector2D>{ AxisOrigin + FVector2D(AxisLengthUV, 0.0) })[0],
+			FColor(255, 80, 80, 255),
+			2);
+		DrawArrowRGBA(
+			RGBA,
+			Size,
+			Size,
+			Map(TArray<FVector2D>{ AxisOrigin })[0],
+			Map(TArray<FVector2D>{ AxisOrigin + FVector2D(0.0, AxisLengthUV) })[0],
+			FColor(80, 160, 255, 255),
+			2);
+		return SaveRGBAToPng(RGBA, Size, Size, Path);
+	}
+
+	static void SetWorldOrthogonalTraceFields(
+		TSharedRef<FJsonObject> Root,
+		const FCapBBoxRegularizationResult& Debug)
+	{
+		TArray<TSharedPtr<FJsonValue>> StageValues;
+		for (int32 Index = 0; Index < Debug.WorldOrthogonalStages.Num(); ++Index)
+		{
+			const FWorldOrthogonalStageDebug& Stage = Debug.WorldOrthogonalStages[Index];
+			TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+			Object->SetNumberField(TEXT("index"), Index);
+			Object->SetStringField(TEXT("name"), Stage.Name);
+			Object->SetStringField(TEXT("status"), Stage.Status);
+			Object->SetStringField(TEXT("message"), Stage.Message);
+			StageValues.Add(MakeShared<FJsonValueObject>(Object));
+		}
+		Root->SetArrayField(TEXT("stages"), StageValues);
+
+		TArray<TSharedPtr<FJsonValue>> RunValues;
+		for (const FWorldOrthogonalRunDebug& Run : Debug.WorldOrthogonalRuns)
+		{
+			TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+			Object->SetNumberField(TEXT("run_index"), Run.RunIndex);
+			Object->SetNumberField(TEXT("stroke_id"), Run.StrokeId);
+			Object->SetStringField(TEXT("type"), Run.Type);
+			Object->SetBoolField(TEXT("ignored_connector"), Run.bIgnoredConnector);
+			Object->SetBoolField(TEXT("unprojected"), Run.bUnprojected);
+			Object->SetNumberField(TEXT("start_node_id"), Run.StartNodeId);
+			Object->SetNumberField(TEXT("end_node_id"), Run.EndNodeId);
+			Object->SetArrayField(TEXT("start_node_cap_space"), JsonVector2D(Run.StartNodeCapSpace)->AsArray());
+			Object->SetArrayField(TEXT("end_node_cap_space"), JsonVector2D(Run.EndNodeCapSpace)->AsArray());
+			Object->SetArrayField(TEXT("start_node_uv"), JsonVector2D(Run.StartNodeUV)->AsArray());
+			Object->SetArrayField(TEXT("end_node_uv"), JsonVector2D(Run.EndNodeUV)->AsArray());
+			SetVector2DArrayField(Object, TEXT("source_points_cap_space"), Run.SourcePointsCapSpace);
+			SetVector2DArrayField(Object, TEXT("face_pixels"), Run.FacePixels);
+			SetVector2DArrayField(Object, TEXT("samples_uv"), Run.SamplesUV);
+			SetIntArrayField(Object, TEXT("protected_point_indices"), Run.ProtectedPointIndices);
+			SetVector2DArrayField(Object, TEXT("protected_points_uv"), Run.ProtectedPointsUV);
+			Object->SetStringField(TEXT("red_protection_mode"), Run.RedProtectionMode);
+			Object->SetNumberField(
+				TEXT("red_max_chord_deviation_pixels"),
+				Run.RedMaxChordDeviationPixels);
+			{
+				TArray<TSharedPtr<FJsonValue>> AxisValues;
+				AxisValues.Reserve(Run.RedDirectionalGroupAxisTypes.Num());
+				for (const FString& AxisType : Run.RedDirectionalGroupAxisTypes)
+				{
+					AxisValues.Add(MakeShared<FJsonValueString>(AxisType));
+				}
+				Object->SetArrayField(
+					TEXT("red_directional_group_axis_types"),
+					AxisValues);
+			}
+			SetDoubleArrayField(
+				Object,
+				TEXT("red_directional_group_lengths_pixels"),
+				Run.RedDirectionalGroupLengthsPixels);
+			SetIntArrayField(
+				Object,
+				TEXT("red_directional_group_start_indices"),
+				Run.RedDirectionalGroupStartIndices);
+			SetIntArrayField(
+				Object,
+				TEXT("red_directional_group_end_indices"),
+				Run.RedDirectionalGroupEndIndices);
+			RunValues.Add(MakeShared<FJsonValueObject>(Object));
+		}
+		Root->SetArrayField(TEXT("boundary_runs"), RunValues);
+
+		auto SetEdges = [&](const TCHAR* Key, const TArray<FWorldOrthogonalEdgeDebug>& Edges)
+		{
+			TArray<TSharedPtr<FJsonValue>> EdgeValues;
+			for (const FWorldOrthogonalEdgeDebug& Edge : Edges)
+			{
+				TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+				Object->SetNumberField(TEXT("edge_index"), Edge.EdgeIndex);
+				Object->SetStringField(TEXT("type"), Edge.Type);
+				SetIntArrayField(Object, TEXT("source_run_indices"), Edge.SourceRunIndices);
+				SetIntArrayField(Object, TEXT("source_stroke_ids"), Edge.SourceStrokeIds);
+				SetIntArrayField(Object, TEXT("primitive_edge_indices"), Edge.PrimitiveEdgeIndices);
+				SetIntArrayField(Object, TEXT("graph_node_ids"), Edge.GraphNodeIds);
+				SetVector2DArrayField(
+					Object,
+					TEXT("graph_node_cap_space"),
+					Edge.GraphNodeCapSpace);
+				SetVector2DArrayField(Object, TEXT("graph_node_uv"), Edge.GraphNodeUV);
+				SetVector2DArrayField(
+					Object,
+					TEXT("snapped_graph_node_uv"),
+					Edge.SnappedGraphNodeUV);
+				SetDoubleArrayField(
+					Object,
+					TEXT("graph_node_snap_distances_pixels"),
+					Edge.GraphNodeSnapDistancesPixels);
+				SetVector2DArrayField(Object, TEXT("samples_uv"), Edge.SamplesUV);
+				Object->SetArrayField(TEXT("start_uv"), JsonVector2D(Edge.StartUV)->AsArray());
+				Object->SetArrayField(TEXT("end_uv"), JsonVector2D(Edge.EndUV)->AsArray());
+				Object->SetArrayField(TEXT("direction_uv"), JsonVector2D(Edge.DirectionUV)->AsArray());
+				Object->SetArrayField(TEXT("solved_start_uv"), JsonVector2D(Edge.SolvedStartUV)->AsArray());
+				Object->SetArrayField(TEXT("solved_end_uv"), JsonVector2D(Edge.SolvedEndUV)->AsArray());
+				Object->SetStringField(TEXT("axis_type_name"), Edge.AxisTypeName);
+				Object->SetNumberField(TEXT("axis_type"), Edge.AxisType);
+				Object->SetNumberField(TEXT("angle_to_u_degrees"), Edge.AngleToU);
+				Object->SetNumberField(TEXT("angle_to_v_degrees"), Edge.AngleToV);
+				Object->SetNumberField(TEXT("angle_to_diag_plus_degrees"), Edge.AngleToDiagPlus);
+				Object->SetNumberField(TEXT("angle_to_diag_minus_degrees"), Edge.AngleToDiagMinus);
+				Object->SetNumberField(TEXT("angle_to_assigned_axis_degrees"), Edge.AngleToAssignedAxis);
+				Object->SetNumberField(TEXT("support_coordinate"), Edge.SupportCoordinate);
+				Object->SetNumberField(TEXT("path_length"), Edge.PathLength);
+				EdgeValues.Add(MakeShared<FJsonValueObject>(Object));
+			}
+			Root->SetArrayField(Key, EdgeValues);
+		};
+		SetEdges(TEXT("primitive_edges"), Debug.WorldOrthogonalPrimitiveEdges);
+		SetEdges(TEXT("merged_edges"), Debug.WorldOrthogonalMergedEdges);
+		TArray<TSharedPtr<FJsonValue>> RootHypothesisValues;
+		for (const FWorldOrthogonalRootHypothesisDebug& Hypothesis :
+			Debug.WorldOrthogonalRootHypotheses)
+		{
+			TSharedRef<FJsonObject> Object = MakeShared<FJsonObject>();
+			Object->SetNumberField(
+				TEXT("hypothesis_index"),
+				Hypothesis.HypothesisIndex);
+			Object->SetNumberField(
+				TEXT("root_primitive_edge_index"),
+				Hypothesis.RootPrimitiveEdgeIndex);
+			SetIntArrayField(
+				Object,
+				TEXT("root_stroke_ids"),
+				Hypothesis.RootStrokeIds);
+			Object->SetStringField(
+				TEXT("target_axis_type_name"),
+				Hypothesis.TargetAxisTypeName);
+			Object->SetArrayField(
+				TEXT("root_start_uv"),
+				JsonVector2D(Hypothesis.RootStartUV)->AsArray());
+			Object->SetArrayField(
+				TEXT("root_end_uv"),
+				JsonVector2D(Hypothesis.RootEndUV)->AsArray());
+			Object->SetArrayField(
+				TEXT("aligned_root_start_uv"),
+				JsonVector2D(Hypothesis.AlignedRootStartUV)->AsArray());
+			Object->SetArrayField(
+				TEXT("aligned_root_end_uv"),
+				JsonVector2D(Hypothesis.AlignedRootEndUV)->AsArray());
+			Object->SetNumberField(
+				TEXT("root_length_pixels"),
+				Hypothesis.RootLengthPixels);
+			Object->SetNumberField(
+				TEXT("root_max_chord_deviation_pixels"),
+				Hypothesis.RootMaxChordDeviationPixels);
+			Object->SetNumberField(
+				TEXT("reliability"),
+				Hypothesis.Reliability);
+			Object->SetNumberField(
+				TEXT("rotation_degrees"),
+				Hypothesis.RotationDegrees);
+			Object->SetBoolField(TEXT("valid"), Hypothesis.bValid);
+			Object->SetBoolField(TEXT("selected"), Hypothesis.bSelected);
+			Object->SetStringField(
+				TEXT("rejection_reason"),
+				Hypothesis.RejectionReason);
+			Object->SetNumberField(
+				TEXT("geometry_edge_count"),
+				Hypothesis.GeometryEdgeCount);
+			Object->SetNumberField(
+				TEXT("angle_cost"),
+				Hypothesis.AngleCost);
+			Object->SetNumberField(
+				TEXT("area_ratio"),
+				Hypothesis.AreaRatio);
+			Object->SetNumberField(
+				TEXT("mean_boundary_distance"),
+				Hypothesis.MeanBoundaryDistance);
+			Object->SetNumberField(
+				TEXT("max_boundary_distance"),
+				Hypothesis.MaxBoundaryDistance);
+			RootHypothesisValues.Add(
+				MakeShared<FJsonValueObject>(Object));
+		}
+		Root->SetArrayField(
+			TEXT("pure_red_root_hypotheses"),
+			RootHypothesisValues);
+		SetVector2DArrayField(
+			Root,
+			TEXT("solved_vertices_uv"),
+			Debug.WorldOrthogonalSolvedVerticesUV);
+		SetVector2DArrayField(
+			Root,
+			TEXT("phase_aligned_cap_uv"),
+			Debug.WorldOrthogonalPhaseAlignedCapUV);
+	}
+
 	static void SaveCapBBoxRegularizationJson(
 		const FCapBBoxRegularizationResult& Debug,
 		const FString& Path,
-		bool bWorldOnly)
+		bool bWorldOnly,
+		const FString& FocusStage = FString())
 	{
 		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("focus_stage"), FocusStage);
+		if (!FocusStage.IsEmpty())
+		{
+			for (const FWorldOrthogonalStageDebug& Stage : Debug.WorldOrthogonalStages)
+			{
+				if (Stage.Name == FocusStage)
+				{
+					Root->SetStringField(TEXT("focus_stage_status"), Stage.Status);
+					Root->SetStringField(TEXT("focus_stage_message"), Stage.Message);
+					break;
+				}
+			}
+		}
 		Root->SetBoolField(TEXT("attempted"), Debug.bAttempted);
 		Root->SetBoolField(TEXT("regularization_applied"), Debug.bApplied);
 		Root->SetBoolField(TEXT("fallback_to_original"), Debug.bFallbackToOriginal);
@@ -3322,6 +7059,71 @@ namespace
 		Root->SetNumberField(TEXT("cap_minimum_bbox_area"), Debug.CapMinimumBBoxArea);
 		Root->SetNumberField(TEXT("cap_minimum_bbox_ratio"), Debug.CapMinimumBBoxRatio);
 		Root->SetBoolField(TEXT("cap_minimum_bbox_passed"), Debug.bCapMinimumBBoxPassed);
+		Root->SetBoolField(TEXT("world_orthogonal"), Debug.bWorldOrthogonal);
+		Root->SetBoolField(TEXT("contains_black"), Debug.bContainsBlack);
+		Root->SetNumberField(TEXT("boundary_run_count"), Debug.BoundaryRunCount);
+		Root->SetNumberField(TEXT("primitive_geometry_edge_count"), Debug.PrimitiveGeometryEdgeCount);
+		Root->SetNumberField(TEXT("geometry_edge_count"), Debug.GeometryEdgeCount);
+		Root->SetNumberField(TEXT("ignored_connector_count"), Debug.IgnoredConnectorCount);
+		Root->SetNumberField(TEXT("world_orthogonal_angle_cost"), Debug.WorldOrthogonalAngleCost);
+		Root->SetNumberField(TEXT("world_orthogonal_area_ratio"), Debug.WorldOrthogonalAreaRatio);
+		Root->SetNumberField(TEXT("world_orthogonal_mean_boundary_distance"), Debug.WorldOrthogonalMeanBoundaryDistance);
+		Root->SetNumberField(TEXT("world_orthogonal_max_boundary_distance"), Debug.WorldOrthogonalMaxBoundaryDistance);
+		Root->SetNumberField(TEXT("world_orthogonal_cap_diagonal"), Debug.WorldOrthogonalCapDiagonal);
+		Root->SetBoolField(
+			TEXT("pure_red_root_alignment_attempted"),
+			Debug.bPureRedRootAlignmentAttempted);
+		Root->SetNumberField(
+			TEXT("selected_root_hypothesis_index"),
+			Debug.SelectedRootHypothesisIndex);
+		Root->SetNumberField(
+			TEXT("selected_root_primitive_edge_index"),
+			Debug.SelectedRootPrimitiveEdgeIndex);
+		SetIntArrayField(
+			Root,
+			TEXT("selected_root_stroke_ids"),
+			Debug.SelectedRootStrokeIds);
+		Root->SetStringField(
+			TEXT("selected_root_target_axis_type_name"),
+			Debug.SelectedRootTargetAxisTypeName);
+		Root->SetNumberField(
+			TEXT("selected_root_rotation_degrees"),
+			Debug.SelectedRootRotationDegrees);
+		Root->SetArrayField(
+			TEXT("root_rotation_center_uv"),
+			JsonVector2D(Debug.RootRotationCenterUV)->AsArray());
+		Root->SetArrayField(
+			TEXT("selected_root_start_uv"),
+			JsonVector2D(Debug.SelectedRootStartUV)->AsArray());
+		Root->SetArrayField(
+			TEXT("selected_root_end_uv"),
+			JsonVector2D(Debug.SelectedRootEndUV)->AsArray());
+		Root->SetArrayField(
+			TEXT("selected_aligned_root_start_uv"),
+			JsonVector2D(Debug.SelectedAlignedRootStartUV)->AsArray());
+		Root->SetArrayField(
+			TEXT("selected_aligned_root_end_uv"),
+			JsonVector2D(Debug.SelectedAlignedRootEndUV)->AsArray());
+		Root->SetNumberField(TEXT("black_axis_tolerance_degrees"), WorldOrthoBlackAxisToleranceDegrees);
+		Root->SetNumberField(TEXT("diag_threshold_degrees"), WorldOrthoDiagThresholdDegrees);
+		Root->SetNumberField(
+			TEXT("short_red_edge_length_pixels"),
+			WorldOrthoShortRedEdgeLengthPixels);
+		Root->SetNumberField(
+			TEXT("minimum_area_ratio"),
+			WorldOrthoMinAreaRatio);
+		Root->SetNumberField(
+			TEXT("black_graph_node_snap_tolerance_pixels"),
+			WorldOrthoBlackNodeSnapTolerancePixels);
+		Root->SetNumberField(
+			TEXT("red_macro_corridor_pixels"),
+			WorldOrthoRedMacroCorridorPixels);
+		Root->SetNumberField(
+			TEXT("red_macro_group_min_length_pixels"),
+			WorldOrthoRedMacroGroupMinLengthPixels);
+		Root->SetNumberField(
+			TEXT("red_primitive_rdp_tolerance_pixels"),
+			WorldOrthoRedPrimitiveRdpTolerancePixels);
 		Root->SetArrayField(TEXT("original_source_to_copied_delta_pixels"), JsonVector2D(Debug.OriginalSourceToCopiedDeltaPixels)->AsArray());
 		Root->SetArrayField(TEXT("face_origin_world"), JsonVector(Debug.FaceOriginWorld)->AsArray());
 		Root->SetArrayField(TEXT("face_normal_world"), JsonVector(Debug.FaceNormalWorld)->AsArray());
@@ -3329,6 +7131,8 @@ namespace
 		Root->SetArrayField(TEXT("face_axis_v_world"), JsonVector(Debug.FaceAxisVWorld)->AsArray());
 		if (!bWorldOnly)
 		{
+			SetWorldOrthogonalTraceFields(Root, Debug);
+			Root->SetStringField(TEXT("face_boundary_source"), Debug.FaceBoundarySource);
 			SetVector2DArrayField(Root, TEXT("face_boundary_uv"), Debug.FaceBoundaryUV);
 			SetVector2DArrayField(Root, TEXT("face_convex_hull_uv"), Debug.FaceHullUV);
 			SetVector2DArrayField(Root, TEXT("face_oriented_bbox_uv"), Debug.FaceBBoxUV);
@@ -3351,10 +7155,70 @@ namespace
 		const FCapBBoxRegularizationResult& Debug,
 		const FString& OutputDir)
 	{
-		SaveCapBBoxDebugPng(Debug, OutputDir / TEXT("10_cap_face_uv_overview.png"), true);
-		SaveCapBBoxDebugPng(Debug, OutputDir / TEXT("10_cap_face_uv_detail.png"), false);
-		SaveCapBBoxRegularizationJson(Debug, OutputDir / TEXT("10_cap_bbox_regularization.json"), false);
-		SaveCapBBoxRegularizationJson(Debug, OutputDir / TEXT("10_cap_bbox_regularization_world.json"), true);
+		SaveCapBBoxDebugPng(Debug, OutputDir / TEXT("10_cap_world_orthogonal_overview.png"), true);
+		SaveCapBBoxDebugPng(Debug, OutputDir / TEXT("10_cap_world_orthogonal_detail.png"), false);
+		SaveCapBBoxRegularizationJson(Debug, OutputDir / TEXT("10_cap_world_orthogonal_regularization.json"), false);
+		SaveCapBBoxRegularizationJson(Debug, OutputDir / TEXT("10_cap_world_orthogonal_regularization_world.json"), true);
+
+		const FString StepsDir = OutputDir / TEXT("10_cap_world_orthogonal_steps");
+		IFileManager::Get().MakeDirectory(*StepsDir, true);
+		SaveCapBBoxRegularizationJson(
+			Debug,
+			StepsDir / TEXT("trace.json"),
+			false,
+			TEXT("complete_trace"));
+
+		struct FStepOutput
+		{
+			const TCHAR* Stem;
+			const TCHAR* FocusStage;
+			int32 ViewIndex;
+		};
+		const FStepOutput Outputs[] =
+		{
+			{ TEXT("00_world_uv_runs"), TEXT("boundary_run_unprojection"), 0 },
+			{ TEXT("01_protected_corners"), TEXT("red_corner_protection"), 1 },
+			{ TEXT("02_primitive_edges"), TEXT("primitive_edge_classification"), 2 },
+			{ TEXT("02a_root_alignment"), TEXT("pure_red_root_alignment"), 8 },
+			{ TEXT("03_same_axis_merged"), TEXT("same_axis_merge"), 3 },
+			{ TEXT("04_axis_validation"), TEXT("adjacency_validation"), 4 },
+			{ TEXT("05_support_lines"), TEXT("support_line_solve"), 5 },
+			{ TEXT("06_corrected_polygon"), TEXT("vertex_intersections"), 6 },
+			{ TEXT("07_final_validation"), TEXT("metric_validation"), 7 }
+		};
+		for (const FStepOutput& Output : Outputs)
+		{
+			SaveWorldOrthogonalStepPng(
+				Debug,
+				StepsDir / (FString(Output.Stem) + TEXT(".png")),
+				Output.ViewIndex);
+			SaveCapBBoxRegularizationJson(
+				Debug,
+				StepsDir / (FString(Output.Stem) + TEXT(".json")),
+				false,
+				Output.FocusStage);
+		}
+	}
+
+	static void PrepareWorldOrthogonalNotAttemptedDebug(
+		FCapBBoxRegularizationResult& Debug,
+		const FString& Reason)
+	{
+		if (Debug.WorldOrthogonalStages.Num() == 0)
+		{
+			InitializeWorldOrthogonalStages(Debug);
+		}
+		Debug.bAttempted = false;
+		Debug.bApplied = false;
+		Debug.bFallbackToOriginal = true;
+		Debug.bWorldOrthogonal = true;
+		Debug.SelectedGeometry = TEXT("original");
+		Debug.RejectionReason = Reason;
+		SetWorldOrthogonalStage(
+			Debug,
+			TEXT("input_validation"),
+			TEXT("failed"),
+			Reason);
 	}
 
 	// Debug overlay: the cap-connected green lines (green) and every candidate face's
@@ -3606,6 +7470,8 @@ namespace
 		double ScaleY,
 		const TArray<FVector2D>& SourcePolygonCapSpace,
 		const TArray<FVector2D>& CopiedPolygonCapSpace,
+		const TArray<FCapBoundaryRunInput>& BoundaryRuns,
+		const FVector2D& SourceTranslationCapSpace,
 		const FFaceInfo& SelectedFace,
 		const FCommonInputs& Inputs)
 	{
@@ -3676,11 +7542,15 @@ namespace
 		const TArray<FVector2D> OriginalCopiedLoop2D = Result.CopiedTargetLoop2D;
 		const TArray<FVector> OriginalSourceLoopWorld = Result.SourceLoopWorld;
 		TArray<FVector> RegularizedSourceLoopWorld;
-		const bool bRegularizationApplied = RegularizeCapToFaceBBox(
+		const bool bRegularizationApplied = RegularizeCapToWorldOrthogonalPolygon(
 			SelectedFace,
 			Inputs,
 			Result.SourceToCopiedVector2D,
 			OriginalSourceLoopWorld,
+			BoundaryRuns,
+			SourceTranslationCapSpace,
+			ScaleX,
+			ScaleY,
 			RegularizedSourceLoopWorld,
 			Result.CapBBoxRegularization);
 		Result.CapBBoxRegularization.SelectedFaceId = SelectedFace.Id;
@@ -3689,6 +7559,9 @@ namespace
 		Result.CapBBoxRegularization.CopiedPolygonKey = CopiedPolygonKey;
 		if (bRegularizationApplied)
 		{
+			BeginWorldOrthogonalStage(
+				Result.CapBBoxRegularization,
+				TEXT("orthographic_reprojection"));
 			Result.SourceLoopWorld = MoveTemp(RegularizedSourceLoopWorld);
 			Result.SourceLoop2D.Reset();
 			Result.CopiedTargetLoop2D.Reset();
@@ -3708,14 +7581,25 @@ namespace
 				Result.CopiedTargetLoop2D.Add(SourcePixel + Result.SourceToCopiedVector2D);
 			}
 
-			if (!bProjectionValid || Result.SourceLoop2D.Num() != 4 || Result.CopiedTargetLoop2D.Num() != 4)
+			if (!bProjectionValid ||
+				Result.SourceLoop2D.Num() < 3 ||
+				Result.CopiedTargetLoop2D.Num() != Result.SourceLoop2D.Num())
 			{
 				Result.SourceLoop2D = OriginalSourceLoop2D;
 				Result.CopiedTargetLoop2D = OriginalCopiedLoop2D;
 				Result.SourceLoopWorld = OriginalSourceLoopWorld;
 				SetRegularizationFallback(
 					Result.CapBBoxRegularization,
-					TEXT("regularized bbox corners failed orthographic reprojection; restored original cap"));
+					TEXT("regularized orthogonal polygon failed orthographic reprojection; restored original cap"));
+			}
+			else
+			{
+				PassWorldOrthogonalStage(
+					Result.CapBBoxRegularization,
+					TEXT("orthographic_reprojection"),
+					FString::Printf(
+						TEXT("%d corrected source vertices reprojected"),
+						Result.SourceLoop2D.Num()));
 			}
 		}
 		SaveCapBBoxRegularizationDebug(Result.CapBBoxRegularization, OutputDir);
@@ -3908,6 +7792,15 @@ namespace
 			Result.Solid.CapHeight = Result.CapHeight;
 			Result.Solid.SourcePolygonKey = Result.PolygonKey;
 			SaveComponentResultJson(Result, OutputJson);
+			PrepareWorldOrthogonalNotAttemptedDebug(
+				Result.Solid.CapBBoxRegularization,
+				SolidError);
+			Result.Solid.CapBBoxRegularization.SelectedFaceId = Result.SelectedFaceId;
+			Result.Solid.CapBBoxRegularization.Action = Result.Action;
+			Result.Solid.CapBBoxRegularization.SourcePolygonKey = Result.PolygonKey;
+			SaveCapBBoxRegularizationDebug(
+				Result.Solid.CapBBoxRegularization,
+				ComponentDir);
 			SaveSkippedSolidResult(Result.Solid, SolidJson, SolidError);
 		};
 
@@ -3957,8 +7850,10 @@ namespace
 
 		TArray<FVector2D> RawCapPolygon;
 		TArray<FVector2D> RawTranslatedPolygon;
+		TArray<FCapBoundaryRunInput> BoundaryRuns;
 		const bool bHasCapPolygon = ParseVector2DArray(CapJson, TEXT("cap_polygon"), RawCapPolygon);
 		const bool bHasTranslatedPolygon = ParseVector2DArray(CapJson, TEXT("cap_polygon_translated"), RawTranslatedPolygon);
+		ParseOrderedBoundaryRuns(CapJson, BoundaryRuns);
 		double PreselectedFaceIdNumber = -1.0;
 		CapJson->TryGetNumberField(TEXT("preselected_face_id"), PreselectedFaceIdNumber);
 		const int32 PreselectedFaceId = FMath::RoundToInt(PreselectedFaceIdNumber);
@@ -4282,14 +8177,29 @@ namespace
 		SaveComponentResultJson(Result, OutputJson);
 		if (!bHasCapPolygon || !bHasTranslatedPolygon)
 		{
+			const FString SolidError =
+				TEXT("Solid skipped because cap_polygon or cap_polygon_translated is missing from 09_cap_extrusion.json");
+			PrepareWorldOrthogonalNotAttemptedDebug(
+				Result.Solid.CapBBoxRegularization,
+				SolidError);
+			Result.Solid.CapBBoxRegularization.SelectedFaceId = Result.SelectedFaceId;
+			Result.Solid.CapBBoxRegularization.Action = Result.Action;
+			Result.Solid.CapBBoxRegularization.SourcePolygonKey = Result.Solid.SourcePolygonKey;
+			Result.Solid.CapBBoxRegularization.CopiedPolygonKey = Result.Solid.CopiedPolygonKey;
+			SaveCapBBoxRegularizationDebug(
+				Result.Solid.CapBBoxRegularization,
+				ComponentDir);
 			SaveSkippedSolidResult(
-				Result.Solid, SolidJson,
-				TEXT("Solid skipped because cap_polygon or cap_polygon_translated is missing from 09_cap_extrusion.json"));
+				Result.Solid,
+				SolidJson,
+				SolidError);
 			return Result;
 		}
 
 		const TArray<FVector2D>& SolidSourcePoly = Result.Action == TEXT("excavate") ? RawCapPolygon : RawTranslatedPolygon;
 		const TArray<FVector2D>& SolidCopiedPoly = Result.Action == TEXT("excavate") ? RawTranslatedPolygon : RawCapPolygon;
+		const FVector2D SourceRunTranslation =
+			Result.Action == TEXT("attach") ? SideVector : FVector2D::ZeroVector;
 
 		Result.Solid = BuildSolidReconstruction(
 			ComponentName,
@@ -4304,8 +8214,21 @@ namespace
 			ScaleY,
 			SolidSourcePoly,
 			SolidCopiedPoly,
+			BoundaryRuns,
+			SourceRunTranslation,
 			SelectedFace,
 			Inputs);
+		if (Result.Solid.CapBBoxRegularization.WorldOrthogonalStages.Num() == 0)
+		{
+			PrepareWorldOrthogonalNotAttemptedDebug(
+				Result.Solid.CapBBoxRegularization,
+				Result.Solid.Error.IsEmpty()
+					? TEXT("orthogonal regularization was not reached")
+					: Result.Solid.Error);
+		}
+		SaveCapBBoxRegularizationDebug(
+			Result.Solid.CapBBoxRegularization,
+			ComponentDir);
 		if (Result.Solid.bSuccess && Result.Action.Equals(TEXT("attach"), ESearchCase::IgnoreCase) && HasActorMaterialIdBuffer(Inputs))
 		{
 			SelectAttachMaterialFromIdBuffer(Inputs, Result.Solid, Result.Solid.AttachMaterialId);
@@ -7305,6 +11228,7 @@ namespace
 	static void SaveCommonFailureForComponents(
 		const TArray<FString>& ComponentNames, const FString& PressDir, const FString& Error)
 	{
+		TArray<TSharedPtr<FJsonValue>> IndexEntries;
 		for (const FString& ComponentName : ComponentNames)
 		{
 			MakeFailureResult(ComponentName, Error, PressDir / ComponentName);
@@ -7312,11 +11236,98 @@ namespace
 			FSolidReconstructionResult Solid;
 			Solid.ComponentName = ComponentName;
 			Solid.ActorName = FString::Printf(TEXT("FromLZ_ReconstructedSolid_%s_%s"), *FPaths::GetCleanFilename(PressDir), *ComponentName);
+			const FString SolidError =
+				FString::Printf(TEXT("Solid skipped because Step 10 common inputs failed: %s"), *Error);
+			PrepareWorldOrthogonalNotAttemptedDebug(
+				Solid.CapBBoxRegularization,
+				SolidError);
+			SaveCapBBoxRegularizationDebug(
+				Solid.CapBBoxRegularization,
+				PressDir / ComponentName);
 			SaveSkippedSolidResult(
 				Solid,
 				PressDir / ComponentName / TEXT("10_solid_reconstruction.json"),
-				FString::Printf(TEXT("Solid skipped because Step 10 common inputs failed: %s"), *Error));
+				SolidError);
+
+			TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("component"), ComponentName);
+			Entry->SetBoolField(TEXT("attempted"), false);
+			Entry->SetBoolField(TEXT("applied"), false);
+			Entry->SetBoolField(TEXT("fallback_to_original"), true);
+			Entry->SetStringField(TEXT("failed_stage"), TEXT("input_validation"));
+			Entry->SetStringField(TEXT("reason"), SolidError);
+			Entry->SetStringField(
+				TEXT("debug_directory"),
+				ComponentName / TEXT("10_cap_world_orthogonal_steps"));
+			IndexEntries.Add(MakeShared<FJsonValueObject>(Entry));
 		}
+		TSharedRef<FJsonObject> IndexRoot = MakeShared<FJsonObject>();
+		IndexRoot->SetStringField(TEXT("press"), FPaths::GetCleanFilename(PressDir));
+		IndexRoot->SetNumberField(TEXT("component_count"), ComponentNames.Num());
+		IndexRoot->SetNumberField(TEXT("attempted_count"), 0);
+		IndexRoot->SetNumberField(TEXT("applied_count"), 0);
+		IndexRoot->SetNumberField(TEXT("fallback_count"), ComponentNames.Num());
+		IndexRoot->SetArrayField(TEXT("components"), IndexEntries);
+		SaveJsonObject(
+			IndexRoot,
+			PressDir / TEXT("10_cap_world_orthogonal_index.json"));
+	}
+
+	static void SaveWorldOrthogonalPressIndex(
+		const FString& PressDir,
+		const TArray<FComponentResult>& Results)
+	{
+		int32 AttemptedCount = 0;
+		int32 AppliedCount = 0;
+		int32 FallbackCount = 0;
+		TArray<TSharedPtr<FJsonValue>> Entries;
+		for (const FComponentResult& Result : Results)
+		{
+			const FCapBBoxRegularizationResult& Debug =
+				Result.Solid.CapBBoxRegularization;
+			AttemptedCount += Debug.bAttempted ? 1 : 0;
+			AppliedCount += Debug.bApplied ? 1 : 0;
+			FallbackCount += Debug.bFallbackToOriginal ? 1 : 0;
+
+			FString FailedStage;
+			for (const FWorldOrthogonalStageDebug& Stage : Debug.WorldOrthogonalStages)
+			{
+				if (Stage.Status == TEXT("failed"))
+				{
+					FailedStage = Stage.Name;
+					break;
+				}
+			}
+
+			TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+			Entry->SetStringField(TEXT("component"), Result.ComponentName);
+			Entry->SetStringField(TEXT("action"), Result.Action);
+			Entry->SetNumberField(TEXT("selected_face_id"), Result.SelectedFaceId);
+			Entry->SetBoolField(TEXT("attempted"), Debug.bAttempted);
+			Entry->SetBoolField(TEXT("applied"), Debug.bApplied);
+			Entry->SetBoolField(TEXT("fallback_to_original"), Debug.bFallbackToOriginal);
+			Entry->SetStringField(TEXT("selected_geometry"), Debug.SelectedGeometry);
+			Entry->SetStringField(TEXT("failed_stage"), FailedStage);
+			Entry->SetStringField(TEXT("reason"), Debug.RejectionReason);
+			Entry->SetNumberField(TEXT("boundary_run_count"), Debug.BoundaryRunCount);
+			Entry->SetNumberField(TEXT("primitive_edge_count"), Debug.PrimitiveGeometryEdgeCount);
+			Entry->SetNumberField(TEXT("merged_edge_count"), Debug.GeometryEdgeCount);
+			Entry->SetStringField(
+				TEXT("debug_directory"),
+				Result.ComponentName / TEXT("10_cap_world_orthogonal_steps"));
+			Entries.Add(MakeShared<FJsonValueObject>(Entry));
+		}
+
+		TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+		Root->SetStringField(TEXT("press"), FPaths::GetCleanFilename(PressDir));
+		Root->SetNumberField(TEXT("component_count"), Results.Num());
+		Root->SetNumberField(TEXT("attempted_count"), AttemptedCount);
+		Root->SetNumberField(TEXT("applied_count"), AppliedCount);
+		Root->SetNumberField(TEXT("fallback_count"), FallbackCount);
+		Root->SetArrayField(TEXT("components"), Entries);
+		SaveJsonObject(
+			Root,
+			PressDir / TEXT("10_cap_world_orthogonal_index.json"));
 	}
 }
 
@@ -7532,6 +11543,7 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	{
 		Results[Index] = ProcessComponent(ComponentNames[Index], PressDir, ActionPressDir, Inputs);
 	});
+	SaveWorldOrthogonalPressIndex(PressDir, Results);
 
 	TArray<FReconstructedMesh> MeshesToSpawn;
 	for (const FComponentResult& Result : Results)

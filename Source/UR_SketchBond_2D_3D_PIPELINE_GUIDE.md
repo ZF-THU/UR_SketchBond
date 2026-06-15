@@ -1,935 +1,1591 @@
-# UR_SketchBond 2D Parsing and 3D Reconstruction Guide
+# UR_SketchBond Pipeline Guide
 
-This document describes the actual implementation of the project's capture,
-2D parsing, 3D reconstruction, material inheritance, runtime Boolean, undo,
-and session-reset pipelines.
+This guide documents the code as it exists in this repository. It is the
+authoritative map of runtime control flow, capture data, 2D parsing, cap
+selection, face validation, 3D reconstruction, octilinear regularization,
+material inheritance, Manifold3D Boolean operations, undo, and reset behavior.
 
-It is intended as the first document an agent should read before modifying the
-system. The descriptions below follow the current source behavior rather than
-an abstract design.
+The guide intentionally distinguishes active code from stale comments and
+unused helpers. When a comment disagrees with an executed call site, the
+executed call site described here wins.
 
-## 1. Recommended Reading Order
+## 1. Project Scope and Build
 
-Read the source in this order:
+The project is an Unreal Engine 5.7 runtime module named `Test_0529_1510`.
 
-1. `Test_0529_1510/FromLZGameViewportClient.cpp`
-   - Keyboard entry points and per-frame capture completion.
-2. `Test_0529_1510/FromLZCaptureUtils.cpp`
-   - Orthographic capture, line-art generation, face segmentation, and
-     actor/material ID rendering.
-3. `Test_0529_1510/FromLZSketchBoard.cpp`
-   - User drawing, saving, Proceed, and Undo.
-4. `Test_0529_1510/FromLZSketchProcessor.cpp`
-   - Selection and compositing of the latest sketch and capture.
-5. `Test_0529_1510/FromLZSketch2DProcessor.cpp`
-   - High-level 2D stage orchestration and per-press output directories.
-6. `Test_0529_1510/FromLZImageOps.cpp`
-   - Skeleton processing, stroke graph construction, cap-loop detection,
-     green-side analysis, and action generation.
-7. `Test_0529_1510/FromLZFaceReconstructor.cpp`
-   - Face selection, orthographic unprojection, solid construction, material
-     assignment, spawning, Boolean operations, and undo.
-8. `Test_0529_1510/FromLZManifoldBoolean.cpp`
-   - Manifold3D conversion and Boolean difference.
-9. `Test_0529_1510/FromLZSessionReset.cpp`
-   - Generation cancellation, output archiving, cleanup, and level reload.
+Important project configuration:
 
-## 2. End-to-End Execution
+- Default map: `/Game/Test1`.
+- Default game mode: `AFromLZGameMode`.
+- Game viewport client: `UFromLZGameViewportClient`.
+- Default pawn: `AFromLZCameraPawn`.
+- Rendering target: desktop, DX12/SM6 on Windows.
+- Enabled runtime plugin: `ProceduralMeshComponent`.
+- The module depends on Core, Engine, InputCore, EnhancedInput, JSON,
+  ImageWrapper, RenderCore, ProceduralMeshComponent, GeometryCore, Slate, and
+  SlateCore.
+- Manifold3D headers are taken from `ThirdParty/Manifold/manifold`.
+- Manifold is compiled into the UE module through the small translation units
+  in `Source/Test_0529_1510/ManifoldBuild`.
+- Build definitions disable Manifold cross sections, iostream, filesystem, and
+  Tracy support. `MANIFOLD_PAR=-1` leaves Manifold's parallel mode selected by
+  its own build configuration.
+
+Binary assets under `Content/` are scene/material/mesh data, not C++ control
+logic. The runtime code operates on visible static and procedural mesh
+components in the loaded level.
+
+## 2. Source Ownership and Reading Order
+
+Read custom source in this order:
+
+1. `Test_0529_1510.cpp`
+   - Module startup cleanup and global reset input initialization.
+2. `FromLZGameMode.*`, `FromLZCameraPawn.*`, `DefaultInput.ini`
+   - Pawn creation and camera navigation.
+3. `FromLZGameViewportClient.*`
+   - Runtime keyboard entry points and capture ticking.
+4. `FromLZCaptureUtils.*`
+   - Orthographic viewport state machine, line-art capture, face segmentation,
+     and actor/material ID rasterization.
+5. `FromLZSketchBoard.*`
+   - Slate drawing board, save/proceed, minimize, close, and undo controls.
+6. `FromLZSketchProcessor.*`
+   - Latest-file selection, sketch/capture alignment, compositing, and channel
+     exports.
+7. `FromLZSketch2DProcessor.*`
+   - Per-press orchestration, async execution, and Steps 1 through 10 dispatch.
+8. `FromLZImageOps.*`
+   - Skeleton graph processing, color splitting, Step 9 cap/action recovery,
+     and Step 9 output serialization.
+9. `FromLZFaceReconstructor.*`
+   - Step 9 face prevalidation, Step 10 face/solid reconstruction, world
+     octilinear regularization, spawning, Step 11 Booleans, material recovery,
+     undo, and OBJ/debug export.
+10. `FromLZManifoldBoolean.*`
+    - DynamicMesh/Manifold conversion and Boolean difference.
+11. `FromLZSessionReset.*`, `FromLZPressNaming.*`
+    - Session generations, Tab reset, archive behavior, and press numbering.
+
+The vendored `ThirdParty/Manifold/manifold` tree is upstream Manifold3D
+implementation code. Project-specific Boolean policy lives in
+`FromLZManifoldBoolean.cpp` and `FromLZFaceReconstructor.cpp`.
+
+## 3. Runtime Controls
+
+`UFromLZGameViewportClient::InputKey` owns the main workflow:
+
+| Input | Behavior |
+| --- | --- |
+| `Enter` | Start an orthographic scene capture. |
+| `Space` | If the board exists, save it and process; otherwise process the latest saved sketch. |
+| `B` | Restore a minimized sketch board. |
+| Left or Right `Shift` | Undo the newest active Step 11 press. |
+| `Tab` | Global Slate preprocessor starts a full session reset. |
+
+While reset is pending, viewport input is consumed and ignored.
+
+The viewport client also:
+
+- calls `FFromLZSessionReset::Tick` each frame;
+- calls `FFromLZCaptureUtils::CompletePendingCapture` each frame;
+- reports every rendered viewport frame through
+  `FFromLZCaptureUtils::NotifyViewportDrawn`.
+
+### 3.1 Camera pawn
+
+`AFromLZCameraPawn` has a scene root, a spring arm named `CameraBoom`, and a
+camera component named `FromLZ`.
+
+Defaults:
+
+- spring-arm length: `1200`;
+- spring-arm rotation: pitch `-45`, yaw `0`, roll `0`;
+- movement speed: `1200 units/s`;
+- wheel zoom step: `120`;
+- zoom range: `[300, 2400]`;
+- pitch range: `[-89, 89]`;
+- automatic possession: player 0.
+
+Input mapping:
+
+- `W/S`: planar forward/back;
+- `A/D`: planar left/right;
+- `Q/E`: world up/down;
+- mouse wheel: spring-arm zoom;
+- hold left mouse: enable mouse pitch/yaw rotation.
+
+Movement uses the current world delta time. Forward and right directions are
+the camera-boom directions projected onto the XY plane.
+
+## 4. Module Startup and Working Directories
+
+At module startup, the following directories are deleted and recreated:
+
+```text
+Saved/2DDebug
+Saved/FromAction
+Saved/FromLZCaptures
+Saved/FromProcess
+Saved/Logs
+```
+
+`Saved/FromSketch` is only created if missing; its contents survive ordinary
+module startup.
+
+The module registers:
+
+- a global Slate Tab-key input preprocessor;
+- a post-map-load callback that clears reset state.
+
+## 5. End-to-End Control Flow
 
 ```text
 Enter
-  -> switch the viewport to a stable orthographic projection
-  -> capture depth and normals
-  -> generate black scene contours
-  -> segment planar face regions
-  -> render actor/material IDs
+  -> save perspective viewport reference
+  -> temporarily switch the real camera to orthographic
+  -> wait for rendered orthographic frames and at least 2 seconds
+  -> use the stable viewport projection matrix for SceneCapture2D
+  -> capture line art, planar faces, and actor/material IDs
+  -> restore the original camera projection
+  -> wait until a restored-perspective frame is rendered
+  -> finalize projection diagnostics
   -> open the sketch board
 
-User draws red, green, or blue marks
-  -> Space or Proceed
-  -> save the sketch
-  -> composite sketch marks over the captured black line art
-  -> clean and skeletonize the image
-  -> trace and classify colored strokes
-  -> detect red/black cap loops
-  -> use green strokes to determine translation and action
-  -> write Action.json and cap geometry
+Proceed or Space
+  -> save composite sketch image
+  -> select latest sketch and latest main capture
+  -> center crop/pad sketch to capture size
+  -> composite user marks over capture line art
+  -> start a worker-thread press
+  -> Steps 1-8: binary/skeleton/stroke processing
+  -> Step 9: planar cap graph, green action, 3D face prevalidation
+  -> Step 10: repeat face validation, reconstruct and regularize solids
+  -> game thread: apply excavations, then spawn cutters/attachments
 
-Action data plus capture metadata
-  -> select a captured planar face
-  -> unproject the 2D cap through the exact orthographic matrix
-  -> construct a closed prism
-  -> attach: spawn the prism
-  -> excavate: subtract the prism from existing scene geometry
+Shift or board Undo
+  -> pop latest active press
+  -> destroy actors generated by that press
+  -> restore components hidden by that press
+
+Tab
+  -> advance session generation
+  -> cancel capture and close board
+  -> wait for worker tasks
+  -> restore all runtime geometry
+  -> archive working Saved folders
+  -> clear working folders
+  -> reload current level
 ```
 
-The pipeline does not infer arbitrary 3D geometry from a single image. It uses
-captured planar geometry, an exact orthographic projection, and a green 2D
-translation to create a prism along the selected face normal.
+## 6. Orthographic Capture State Machine
 
-## 3. Input and Runtime Entry Points
+Capture is deliberately asynchronous because reconstruction requires the
+projection actually rendered by the game viewport.
 
-`UFromLZGameViewportClient::InputKey` is the main interaction entry point.
+### 6.1 Begin
 
-- `Enter` calls `FFromLZCaptureUtils::BeginCaptureFromWorld`.
-- `Space` saves the current sketch and processes it. If no board is active, it
-  directly processes the latest saved sketch.
-- `Shift` calls
-  `FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans`.
-- The viewport client's `Tick` calls
-  `FFromLZCaptureUtils::CompletePendingCapture`.
-- Viewport draw notifications are used to determine when the temporary
-  orthographic view is actually stable.
+`BeginCaptureFromWorld`:
 
-The workflow is asynchronous. A session-generation integer prevents results
-from an old task from being applied after a reset or level reload.
+1. Rejects null world/viewport.
+2. Rejects a second pending capture in the same world.
+3. Finds a player controller whose pawn has a `FromLZ` camera.
+4. Creates timestamped output paths under `Saved/FromLZCaptures`.
+5. Saves the currently displayed perspective backbuffer.
+6. Records a detailed perspective view snapshot.
+7. Stores the original camera projection properties.
+8. Temporarily changes the real camera to orthographic:
+   - width: current valid `OrthoWidth`, otherwise `1536`;
+   - near plane: `0`;
+   - far plane: `2097152`;
+   - auto plane calculation: off;
+   - auto plane shift: `0`;
+   - ortho plane updates: off;
+   - camera-height-as-target: off.
 
-## 4. Orthographic Scene Capture
+The pending capture times out after `10 seconds`.
 
-The capture begins in `FFromLZCaptureUtils::BeginCaptureFromWorld`.
+### 6.2 Settle and capture
 
-### 4.1 Projection setup
+`NotifyViewportDrawn` counts rendered frames, captures the first orthographic
+snapshot, and records the stable orthographic snapshot after the view has been
+orthographic for at least `2 seconds`.
 
-The implementation:
+`CompletePendingCapture` performs the expensive capture only after a stable
+orthographic frame has been reported. The stable viewport's exact projection
+matrix is copied into `SceneCapture2D.CustomProjectionMatrix`.
 
-1. Saves the original perspective viewport state.
-2. Temporarily overrides the camera to orthographic projection.
-3. Uses an orthographic width of `1536` when no valid width is available.
-4. Uses a near/far range approximately equal to `0` and `2097152`.
-5. Waits roughly two seconds and requires stable orthographic viewport frames.
-6. Reads the final projection matrix from the real viewport.
-7. Gives that exact matrix to `SceneCapture2D` as its custom projection matrix.
-8. Restores the original perspective viewport after capture.
+The matrix is considered usable when:
 
-Temporal antialiasing, motion blur, and related effects are disabled to avoid
-breaking pixel-level correspondence.
+- `M00` and `M11` are finite and non-zero;
+- `M23` is approximately zero;
+- `M33` is approximately one.
 
-The final projection matrix is essential. Later reconstruction requires valid
-orthographic values for:
+There is no Step 10 fallback from a missing matrix to an `OrthoWidth`
+approximation.
+
+### 6.3 Restore and finalization
+
+After outputs are generated:
+
+1. The scoped override restores every original camera projection property.
+2. The state machine waits for the restored projection to be observed in both
+   the camera component and player camera manager.
+3. A restored-perspective rendered frame is recorded.
+4. Projection/transform debug JSON is finalized.
+
+Canceling a pending capture also restores the camera before dropping state.
+
+## 7. Capture Subject Filtering
+
+SceneCapture uses a show-only actor list.
+
+Eligible actors must:
+
+- not be the controlled pawn;
+- not be actor-hidden;
+- contain a registered, visible static mesh with a mesh, or a registered,
+  visible procedural-mesh section;
+- and satisfy one of:
+  - actor name/label starts with `Cube`;
+  - actor name/label contains `Plane`;
+  - actor is an active Step 11 attachment or Boolean result.
+
+Excavation cutter actors are never active capture subjects.
+
+An additional camera-relative bounding-box rule excludes an actor only when
+its entire AABB is above the capture camera and the camera lies inside that
+AABB's XY footprint. Actors above the camera but outside that XY footprint are
+kept.
+
+The selected actor counts and filtering mode are written into capture
+metadata.
+
+## 8. Capture Outputs
+
+For stem `FromLZ_YYYYMMDD_HHMMSS`, the capture directory contains:
 
 ```text
-M[0][0], M[1][1], M[3][0], M[3][1]
+FromLZ_<timestamp>.png
+FromLZ_<timestamp>.json
+FromLZ_<timestamp>_faces.png
+FromLZ_<timestamp>_faces.json
+FromLZ_<timestamp>_faces_debug.png
+FromLZ_<timestamp>_actor_material_id.png
+FromLZ_<timestamp>_actor_material_id.json
+FromLZ_<timestamp>_debug_viewport_perspective.png
+FromLZ_<timestamp>_debug_viewport_orthographic.png
+FromLZ_<timestamp>_debug_fromlz_camera.png
+FromLZ_<timestamp>_debug_transforms.json
+FromLZ_<timestamp>_debug_depth.png
+FromLZ_<timestamp>_debug_normal.png
+FromLZ_<timestamp>_debug_depth_lap.png
+FromLZ_<timestamp>_debug_normal_grad.png
 ```
 
-Reconstruction does not fall back to an approximate `OrthoWidth` conversion.
+The main JSON includes camera transforms, original/capture projection
+properties, viewport size, exact matrix, subject mode, focus/reference
+metadata, and debug paths.
 
-### 4.2 Depth and normal capture
+## 9. Line-Art Generation
 
-The scene capture renders floating-point scene depth and world-space normals.
-These buffers are used to generate line art and planar face regions.
+Two float render targets are captured with the same show-only actor set:
 
-### 4.3 Line-art generation
+- `SCS_SceneDepth`;
+- `SCS_Normal`.
 
-Scene line art is black on a white background.
+Capture settings disable temporal AA, motion blur, screen percentage
+distortion, and persistent render state so pixel correspondence does not
+depend on temporal history.
 
-- A depth edge is detected from relative second-order depth change.
-- The depth threshold is approximately `0.0015`.
-- A normal edge is detected with a Sobel-style normal gradient.
-- The normal-gradient threshold is approximately `0.3`.
-- A pixel becomes black when either depth or normal edge detection succeeds.
+For each pixel:
 
-These black lines become the environmental contours used by the 2D graph.
+- depth edge strength is the largest second-order depth deviation in X, Y, and
+  both diagonals divided by `max(depth, 1)`;
+- depth threshold: `0.0015`;
+- normal edge strength is the combined Sobel X/Y gradient magnitude;
+- normal threshold: `0.3`.
 
-## 5. Captured Face Segmentation
+A pixel is black if either threshold passes; otherwise it is white.
 
-`SaveNormalFaces` segments visible geometry into approximately planar regions.
+## 10. Planar Face Segmentation
 
-The segmentation rules are:
+`SaveNormalFaces` uses the second depth/normal pass.
 
-- Pixels near `maximumDepth * 0.999` are treated as background.
-- A usable normal must have length greater than `0.1`.
-- Flood fill uses 8-neighbor connectivity.
-- Neighboring normals may differ by at most `12` degrees.
-- Relative neighboring depth difference may not exceed `0.02`.
-- Regions smaller than `200` pixels are removed.
-- Remaining regions are sorted by area and assigned unique colors.
+Rules:
 
-For each accepted region, the code:
+- background depth: `depth >= maxDepth * 0.999` or `depth <= 1`;
+- usable normal length: greater than `0.1`;
+- connectivity: 8-neighbor;
+- normal continuity: at most `12 degrees`;
+- relative neighbor depth difference: at most `0.02`;
+- minimum region area: `200 pixels`;
+- contour simplification: RDP epsilon `4 pixels`.
 
-1. Traces its boundary with a Moore-neighborhood contour algorithm.
-2. Simplifies the boundary with Ramer-Douglas-Peucker, epsilon `4`.
-3. Calculates an average plane point and average normal.
-4. Unprojects representative pixels through the exact capture projection.
-5. Writes the 2D and 3D key points to the face JSON.
+Accepted regions are sorted by area and assigned unique RGB IDs. The first
+100 IDs use a fixed palette; additional IDs use deterministic fallback
+colors with collision checks.
 
-The face-color PNG is later used as a pixel-accurate lookup table during 3D
-source-face selection.
+For each face the code:
 
-## 6. Actor and Material ID Buffer
+1. traces a Moore-neighborhood contour;
+2. rotates the closed contour to a stable start;
+3. simplifies it;
+4. averages valid depth-derived world points and normals;
+5. calculates a representative 2D centroid;
+6. intersects contour pixel rays with the averaged plane;
+7. writes plane point, normal, 2D key points, 3D key points, ID color, area,
+   and projection scale metadata.
 
-The capture stage also builds an actor/material ID image on the CPU.
+`_faces.png` is a pixel ID lookup used by both Step 9 and Step 10.
 
-Static-mesh and procedural-mesh triangles are:
+## 11. Actor/Component/Material ID Buffer
 
-1. Transformed to world space.
-2. Projected with the same capture camera and projection matrix.
-3. Rasterized into an image-space Z-buffer.
-4. Assigned a unique color representing actor, component, and material slot.
+This image is rasterized on the CPU with the exact capture transform and
+projection matrix.
 
-Only the front-most triangle survives at each pixel. A JSON file maps each
-unique ID color back to its actor/component/material metadata.
+Supported sources:
 
-This buffer is optional for geometric reconstruction but is the preferred
-source for assigning the material of a newly attached solid.
+- static mesh LOD 0 sections;
+- visible procedural-mesh sections.
 
-## 7. Sketch Board and Source Selection
+Every actor/component/material-slot tuple receives an integer ID encoded as a
+unique RGB color. Each world-space triangle is projected and rasterized with
+barycentric interpolation into a depth buffer. Only the nearest triangle at a
+pixel survives.
 
-The sketch board draws RGB marks over the captured image.
+The JSON maps color IDs to:
 
-- Normal brush radius: `3` pixels.
-- Eraser radius: `10` pixels.
-- Available drawing colors: red, green, and blue.
-- Sketches are saved under `Saved/FromSketch`.
+- actor name/path;
+- component name/path/type;
+- material slot;
+- material name/path;
+- projection metadata and subject mode.
 
-When Proceed or Space is pressed, `FFromLZSketchProcessor`:
+This buffer is optional for geometry but preferred for attachment material
+inheritance. If it loads successfully, its projection must exactly match the
+capture and face projection.
 
-1. Finds the newest sketch PNG.
-2. Finds the newest compatible capture PNG, excluding face/debug/ID images.
-3. Center-crops or pads the sketch to the capture dimensions without scaling.
-4. Places every non-near-white sketch pixel over the capture.
-5. Preserves captured black pixels where the sketch is white.
+## 12. Sketch Board
 
-A sketch pixel is considered white only when its channels are above the
-near-white threshold. A captured pixel is treated as black when all channels
-are below approximately `128`.
+The board is a Slate overlay at viewport Z-order `200`.
 
-The processor also writes `capture_ref.json`, recording the exact sketch,
-capture, face, camera, and actor/material files consumed by that press. Agents
-should follow this file when debugging mismatched inputs.
+Behavior:
 
-## 8. 2D Processing Stages
+- capture image is loaded into a transient BGRA texture;
+- the drawing layer begins fully white;
+- the image is aspect-fitted without changing image coordinates;
+- mouse coordinates are converted back to source pixels;
+- line interpolation uses integer steps between the previous/current pixel;
+- red, green, blue, eraser, clear, proceed, undo, minimize, and close controls
+  are available.
 
-The high-level stage sequence is in `FromLZSketch2DProcessor.cpp`. Most
-algorithms are implemented in `FromLZImageOps.cpp`.
+Actual brush radii:
 
-### 8.1 Step 1: binarization and cleanup
+- red/green/blue: `1 pixel`;
+- eraser: `10 pixels`.
 
-- A pixel is background only when all RGB channels exceed `240`.
-- All other pixels are foreground.
-- Apply one `3x3` morphological close.
-- Apply one `2x2` dilation.
-- Delete 8-connected foreground components smaller than `12` pixels.
-
-### 8.2 Step 2: skeletonization
-
-The code applies Zhang-Suen thinning for at most `100` iterations.
-
-After thinning, skeleton components shorter than `6` pixels are removed.
-
-### 8.3 Stroke-color classification
-
-Skeleton pixels sample a color neighborhood of radius `2`.
-
-- All channels above `220`: no color.
-- A channel dominating the other channels by at least `30`: red, green, or
-  blue.
-- Otherwise: black.
-
-Mixed primary/black pixels are resolved in favor of the primary color:
-
-- red plus black becomes red;
-- green plus black becomes green;
-- blue plus black becomes blue.
-
-### 8.4 Step 3: endpoint repair
-
-Skeleton connectivity deliberately avoids ambiguous diagonal connections.
-
-- Cardinal neighbors are always considered.
-- A diagonal neighbor is considered only when both intervening cardinal
-  pixels are absent.
-- Degree `1` indicates an endpoint.
-- Crossing number at least `3` indicates a branch.
-
-Endpoint repair:
-
-1. Finds mutually nearest endpoint pairs within `50` pixels.
-2. Connects them with a one-pixel Bresenham line.
-3. Temporarily removes each connector and searches for an alternative path.
-4. Removes a connector when it creates an implausibly small loop.
-
-Red/black loop protection uses a bounding-box area threshold of approximately
-`1500` square pixels. Larger red/black loops are protected.
-
-Dangling branches are pruned up to:
+The board saves the full background-plus-drawing composite, not a transparent
+marks-only image, as:
 
 ```text
-max(30, 3 * endpointRepairDistance) = 150 pixels
+Saved/FromSketch/Sketch_##.png
 ```
 
-A branch is protected when at least half of its would-be-deleted samples are
-classified as red or black.
+The number is the next `Press_##` index found in `Saved/2DDebug`.
 
-### 8.5 Step 4: skeleton tracing
+Minimize removes only the widget and restores game-only input. `B` re-adds
+the same board state. Close destroys the board state. Proceed saves, closes,
+then invokes sketch processing.
 
-Stroke tracing has two passes:
+## 13. Sketch and Capture Pairing
 
-1. Trace from endpoints and branch nodes to other graph nodes.
-2. Trace remaining unvisited edges, including node-free cycles.
+`FFromLZSketchProcessor::ProcessLatestSketch`:
 
-At a choice point, continuation maximizes the direction dot product. Paths
-shorter than three points are discarded.
+1. Selects the newest PNG in `Saved/FromSketch`.
+2. Selects the newest main capture PNG in `Saved/FromLZCaptures`.
+3. A main capture filename must exactly match:
+   `FromLZ_YYYYMMDD_HHMMSS.png`.
+4. Auxiliary face/debug/ID PNGs therefore cannot be selected.
+5. Ties in modification time are resolved by filename.
 
-Color splitting then:
+If capture dimensions differ, the sketch is center-cropped or white-padded to
+the capture size. No scaling is performed.
 
-- infers uncolored runs from neighboring colors;
-- resolves primary/primary transitions using directional proximity;
-- absorbs short color runs below approximately `18` pixels of arc length;
-- outputs monochromatic strokes.
+Compositing rules:
 
-### 8.6 Step 5: corner splitting
+- a sketch pixel is a mark unless all RGB channels are greater than `240`;
+- sketch marks overwrite capture pixels;
+- where the sketch is white, a capture pixel becomes black only when all
+  capture RGB channels are below `128`;
+- all remaining pixels are white.
 
-Corner detection performs PCA on left and right arc-length windows of roughly
-`30` pixels.
+Outputs under `Saved/FromProcess`:
 
-- At least three points are required on each side.
-- The unoriented direction change must be at least `25` degrees.
-- Accepted peaks must be separated by at least `10` pixels of arc length.
-- Detection and non-maximum suppression iterate up to five times.
-- The split point is duplicated in the two resulting strokes.
+```text
+Sketch_fitted.png
+wContextSketch_raw.png
+Sketch_R.png
+Sketch_G.png
+Sketch_B.png
+```
 
-### 8.7 Step 6: collinear merging
+Channel images contain only exact `(255,0,0)`, `(0,255,0)`, or `(0,0,255)`
+pixels with transparent black elsewhere. They are auxiliary outputs; the
+active 2D pipeline consumes the composite buffer directly.
 
-Only same-color strokes are eligible.
+## 14. Press Directories and Async Lifetime
 
-- Endpoint gap must be no more than `3` pixels.
-- PCA/chord direction disagreement must be no more than `12` degrees.
-- A merge is rejected if a third endpoint is near the proposed join.
-- Candidate cost is `gap + 0.1 * angle`.
-- At most `80` merges are performed.
+Each processing run receives:
 
-### 8.8 Step 7: stroke metrics
+```text
+Saved/2DDebug/Press_##
+Saved/FromAction/Press_##
+```
 
-Each stroke records:
+Press numbering scans existing `Press_*` directories and uses max + 1.
+
+`capture_ref.json` records the exact sketch, capture, face PNG/JSON, and
+actor/material PNG/JSON paths consumed by the press.
+
+The heavy pipeline runs on the UE thread pool. Before dispatch:
+
+- the RGBA array is moved into the worker;
+- the current session-generation integer is captured;
+- active composite-task count is incremented.
+
+Generation is checked:
+
+- before 2D processing;
+- before Step 10/11 reconstruction;
+- before game-thread runtime spawning.
+
+The task count is decremented after worker completion. Tab reset waits for it
+to reach zero before deleting working data or reloading the map.
+
+## 15. Active 2D Stage Parameters
+
+The following values come from executed calls in
+`FromLZSketch2DProcessor.cpp`.
+
+### 15.1 Step 1: binary cleanup
+
+Active sequence:
+
+1. `BinarizeNonWhite(..., WhiteThreshold=240)`.
+2. `RemoveSmallComponents(..., MinArea=12)`.
+
+Foreground means any pixel whose RGB channels are not all greater than `240`.
+Components are 8-connected.
+
+Important: `MorphClose` and `Dilate2x2` helpers exist, but the current
+orchestrator does not call them. The active Step 1 performs no close or
+dilation.
+
+Outputs:
+
+```text
+00_input.png
+01_binary.png
+```
+
+### 15.2 Step 2: thinning
+
+- Zhang-Suen maximum iterations: `100`;
+- remove skeleton components smaller than `6 pixels`.
+
+Output: `02_skeleton.png`.
+
+### 15.3 Pixel color classification
+
+Per-pixel classes:
+
+- all channels greater than `220`: `none`;
+- one channel exceeds both others by at least `30`: red, green, or blue;
+- otherwise: black.
+
+The stroke color sample window radius is `2`.
+
+### 15.4 Step 3: endpoint cleanup
+
+Executed parameters:
+
+- endpoint gap tolerance: `20 pixels`;
+- connector thickness: `1`;
+- small-loop bounding-box threshold: `500 px²`;
+- branch-prune max: automatic, `max(30, 3 * gapTol) = 60 pixels`;
+- color sample radius: `2`.
+
+Skeleton neighborhood policy:
+
+- cardinal neighbors are always valid;
+- a diagonal neighbor is valid only when both intervening cardinal pixels are
+  absent;
+- degree 1 is an endpoint;
+- crossing number at least 3 is a branch.
+
+Connector search:
+
+1. mutual-nearest endpoint pairs within tolerance;
+2. both endpoint outward directions must face the other within `60 degrees`;
+3. unmatched endpoints may connect to a nearby skeleton segment in the same
+   forward cone;
+4. a directed fallback allows source deviation `60 degrees` and target
+   deviation `100 degrees`;
+5. a successful fallback consumes both endpoints.
+
+Every candidate connector is temporarily removed and an alternate shortest
+path is sought. A connector that only creates a loop below `500 px²` is
+removed. Red/black source geometry gets a protection pass: a connector that
+participates in a red/black loop at or above the threshold survives.
+
+Dangling branches up to `60 pixels` are pruned unless at least half of the
+would-be-deleted samples classify as red or black.
+
+Outputs:
+
+```text
+03a_red_black_connectors.png
+03a_red_black_reconnected.png
+03b_connector_prune_debug.json
+03a_skeleton_connected.png
+03b_skeleton_small_loop_pruned.png
+03_skeleton_clean.png
+```
+
+### 15.5 Step 4: graph tracing and color splitting
+
+- minimum traced path size: `3 points`;
+- graph-node pass traces endpoint/branch-to-node paths;
+- a second pass traces remaining edges, including pure cycles;
+- at choices, continuation maximizes direction dot product.
+
+Per-point labels are grouped into color runs. Unclassified connector runs are
+resolved from neighbors:
+
+- same/single neighbor color: use that color;
+- primary vs primary: use the directionally better aligned neighbor;
+- red with black: black wins;
+- green with black: green wins;
+- blue with black: blue wins;
+- no colored neighbors: black.
+
+This red/black rule is important: current code does not promote mixed
+red/black connector runs to red.
+
+Short color runs below `3 pixels` of arc length are absorbed into neighbors.
+
+Outputs:
+
+```text
+04_strokes.png
+04_strokes_colored.png
+04_strokes.json
+```
+
+### 15.6 Step 5: corner splitting
+
+- direction model: PCA over left/right arc windows;
+- angle threshold: `25 degrees`, unoriented;
+- arc window: `30 pixels`;
+- peak separation: `10 pixels`;
+- maximum iterations: `5`;
+- each child needs at least `3 points`;
+- split points are present at adjoining segment boundaries.
+
+Outputs:
+
+```text
+05_strokes_split.png
+05_strokes_split_colored.png
+05_strokes_split.json
+```
+
+### 15.7 Step 6: same-color merge
+
+- only identical color classes merge;
+- max endpoint gap: `3 pixels`;
+- max unoriented angle: `12 degrees`;
+- junction protection radius: `3 pixels`;
+- maximum merge iterations: `80`;
+- candidate cost: gap plus angle penalty.
+
+Outputs use stem `06_merged`.
+
+### 15.8 Step 7: metrics
+
+Each stroke receives:
 
 - arc length;
-- endpoint chord length;
-- straightness;
-- PCA direction;
-- PCA RMS deviation;
-- PCA 90th-percentile deviation;
+- endpoint chord;
+- straightness `chord / arc`;
+- PCA principal direction;
+- PCA RMS error;
+- PCA 90th-percentile error;
 - chord-line 90th-percentile deviation;
-- length/width-style ratios.
+- chord deviation ratio.
 
-### 8.9 Step 8: enclosed-region preview
+Outputs use stem `07_stroke_info`.
 
-All strokes are rasterized as barriers with thickness `3`.
+### 15.9 Step 8: enclosed preview
 
-Each endpoint is connected to its nearest endpoint. This particular preview
-has no maximum connection-distance cutoff.
+- raster barrier thickness: `3`;
+- every endpoint connects to its nearest endpoint;
+- there is no maximum endpoint-connection distance;
+- four-neighbor flood fill begins at image borders;
+- unreached non-barrier pixels are enclosed.
 
-A four-neighbor flood fill starts at the image border. Background pixels not
-reached by that flood are marked as enclosed.
-
-Important: Step 8 is primarily diagnostic. Step 9 does not consume this mask;
-it independently detects loops with a planar stroke graph.
-
-## 9. Step 9: Cap and Action Analysis
-
-Step 9 combines red user strokes, black captured contours, and green direction
-strokes.
-
-### 9.1 Red/black graph planarization
-
-The code detects intersections between all real red/black line segments,
-including collinear overlap, and splits strokes at those intersections.
-
-Graph endpoints are snapped with a tolerance of about `5` pixels.
-
-### 9.2 Red and black dead-end repair
-
-Only degree-one endpoints are repaired.
-
-1. A red endpoint first searches for a forward red segment within `20` pixels.
-2. Remaining red endpoints search for a forward black segment within
-   `20` pixels.
-3. Black endpoints may then connect to nearby red or black endpoints.
-4. Connecting to a segment interior splits that target segment.
-
-The endpoint's outward direction is estimated over approximately five pixels
-of arc length. Connections behind that direction are rejected.
-
-### 9.3 Loop candidates
-
-Candidate priority is:
-
-1. Pure red loop.
-2. One red component plus local black strokes.
-3. Red strokes plus global black fallback strokes.
-
-For each eligible non-black graph edge, the edge is removed and BFS searches
-for another path between its endpoints. That alternative path plus the removed
-edge forms a cycle.
-
-A candidate must:
-
-- contain at least two edges;
-- contain at least one real red stroke;
-- have a bounding-box area of at least `1500` square pixels when borrowing
-  local or fallback black lines.
-
-Candidates prefer:
-
-- a valid local green chain that produces `attach` or `excavate` is mandatory;
-- lower priority number;
-- shorter longest synthetic-connector arc length, with no synthetic edge
-  treated as zero;
-- shorter total black-stroke arc length;
-- larger loop area when both candidates are red-only;
-- more real red strokes;
-- fewer total graph edges;
-- lower anchor-stroke ID.
-
-A real red stroke can be consumed by only one selected cap loop.
-
-Local-green discovery and action measurement therefore happen before loop
-selection. A candidate is rejected before red-stroke consumption when:
-
-- no green endpoint is local to its real red strokes;
-- no non-zero green chain can be traced;
-- inside/outside measurement produces neither `attach` nor `excavate`.
-
-`09_loop_candidates.json` records the prefiltered action, local green IDs,
-longest synthetic length, total black length, and rejection reason for every
-candidate.
-
-### 9.4 Local green-chain tracing
-
-Green strokes are considered local when an endpoint is within `50` pixels of
-real red cap geometry.
-
-Green chain tracing:
-
-- begins at endpoints;
-- permits inter-stroke gaps up to `10` pixels;
-- requires continuation direction change below `45` degrees;
-- never revisits a stroke;
-- searches both directions;
-- selects the path with greatest total stroke-plus-gap length;
-- breaks ties using endpoint chord length.
-
-The chosen chain is oriented from the cap-near endpoint toward the cap-far
-endpoint. Its start-to-end vector translates the cap polygon.
-
-### 9.5 Attach versus excavate
-
-The cap polygon is rasterized and local green length is measured inside and
-outside it.
-
-- More green length inside the cap: `excavate`.
-- More green length outside the cap: `attach`.
-- Equal length or no valid local green chain: no action.
-
-The constant `InteriorGreenMinInsideLengthPx = 10` is calculated and emitted
-in diagnostics, but the final action is primarily chosen by the inside/outside
-length comparison.
-
-Step 9 writes per-component files including:
+Outputs:
 
 ```text
-Action.json
-09_cap_extrusion.json
+08a_enclosed_barrier.png
+08_enclosed_mask.png
+```
+
+Step 8 is diagnostic. Step 9 builds a separate planar graph and does not
+consume this mask.
+
+## 16. Step 9: Planar Red/Black Graph
+
+Only red and black strokes participate in cap topology. Green is used after
+candidate loops exist. Blue is ignored from this point onward.
+
+### 16.1 Planarization
+
+All real red/black segment intersections are found, including boundaries of
+collinear overlaps. Strokes are split at those intersection parameters.
+
+Endpoint direction is estimated over approximately `5 pixels` of arc.
+
+Synthetic repair sequence with `20-pixel` tolerance:
+
+1. red degree-1 endpoints search forward for a red segment/endpoint;
+2. remaining red degree-1 endpoints search forward for a black segment;
+3. connecting to an interior point splits the target stroke;
+4. black degree-1 endpoints may connect to nearby red/black endpoints;
+5. synthetic red and black connectors are appended to the planarized strokes.
+
+Only red degree-1 topology nodes initiate red repair. Degree-2 nodes,
+branches, and interior vertices do not.
+
+After repair, graph endpoints are snapped into shared nodes within `5 pixels`.
+
+Root diagnostic outputs:
+
+```text
+09_all_red_black_graph.png
+09_all_red_black_graph.json
+```
+
+### 16.2 Candidate generation
+
+Three passes generate cycles:
+
+1. `red_only`, priority 0;
+2. each red connected component plus the global black pool as `local_black`,
+   priority 1;
+3. all red and black as `fallback_trace`, priority 2.
+
+For each non-black graph edge:
+
+1. remove that edge;
+2. BFS for another path between its endpoints;
+3. combine the alternate path and removed edge into a cycle.
+
+A valid cycle:
+
+- has at least two graph edges;
+- has at least one non-synthetic red stroke;
+- produces a polygon with at least four samples;
+- has polygon area greater than `1`.
+
+Ordered boundary-run metadata is retained for Step 10:
+
+- stroke ID and color;
+- synthetic/reversed flags;
+- start/end graph node IDs and positions;
+- oriented polyline samples;
+- arc, chord, and straightness metrics.
+
+Synthetic connectors retain cyclic topology but are later ignored as fitted
+geometry.
+
+### 16.3 Interior-red rejection
+
+After green prefiltering, a candidate is rejected when red geometry not used
+as its cap boundary contributes an interior segment longer than `20 pixels`.
+
+### 16.4 Candidate minimum size
+
+Current code uses:
+
+- red-only minimum bounding-box area: `500 px²`;
+- borrowed-black/fallback minimum bounding-box area: `500 px²`.
+
+Both values are constants in `FromLZImageOps.cpp`.
+
+## 17. Step 9: Green Chain and Action
+
+### 17.1 Local green discovery
+
+A green stroke becomes a local seed when either endpoint is within
+`BlackSelectTol = 20 pixels` of any point belonging to the candidate's real
+red strokes.
+
+Locality is not measured against borrowed black geometry.
+
+### 17.2 Bidirectional chain tracing
+
+For every local seed:
+
+- trace from both endpoints;
+- connect to green endpoints within `10 pixels`;
+- require continuation angle less than `45 degrees`;
+- choose the highest direction dot, then smallest gap, then lowest stroke ID;
+- never revisit a green stroke;
+- total path length is stroke arcs plus inter-stroke gaps;
+- orient the completed chain from the endpoint nearest the cap to the endpoint
+  farthest from the cap.
+
+Duplicate chains are removed by their sorted stroke-ID set.
+
+Best-chain order:
+
+1. greatest path length;
+2. greatest endpoint chord when path lengths tie.
+
+The side vector is:
+
+```text
+side_vector = chain_end - chain_start
+```
+
+The translated cap is every cap point plus this vector.
+
+### 17.3 Attach/excavate decision
+
+The cap boundary is rasterized at one-pixel thickness and border flood fill
+builds the interior.
+
+For every local green polyline:
+
+- each rasterized pixel step contributes its Euclidean pixel length;
+- a boundary step contributes to inside, outside, and boundary totals;
+- an ambiguous crossing contributes to both inside and outside.
+
+Decision:
+
+- inside length greater than outside: `excavate`;
+- outside greater than inside: `attach`;
+- equal or no local green: `skip`.
+
+`InteriorGreenMinInsideLengthPx = 10` is written for compatibility/diagnostics.
+It does not gate the final attach/excavate comparison.
+
+## 18. Step 9: Face Prevalidation Before Selection
+
+Every loop candidate is sent to
+`FFromLZFaceReconstructor::EvaluateCandidateFaces` before red-stroke ownership
+is assigned.
+
+Source polygon semantics:
+
+- excavate: `cap_polygon`;
+- attach: `cap_polygon_translated`.
+
+The candidate is mapped from Step 9 image size to the captured face image and
+rasterized. A face survives only when its ID color occupies at least `85%` of
+the entire source polygon mask.
+
+For each surviving face:
+
+1. intersect the overlap centroid ray with the face plane;
+2. project the face normal into image space;
+3. compare it to every candidate side vector using the unoriented angle;
+4. require angle at most `30 degrees`;
+5. prefer angle strictly below `10 degrees`;
+6. within preferred or fallback group, select the face nearest the camera.
+
+The result, including selected face ID, overlap, angle, distance, and reject
+reason, is stored in the candidate and Step 9 cap JSON.
+
+Per-candidate validation artifacts are under:
+
+```text
+CandidateFaceValidation/Candidate_###_<source>/
+```
+
+### 18.1 Final candidate ordering
+
+Candidates are sorted by:
+
+1. lower source priority;
+2. shorter total borrowed black arc length;
+3. for two red-only candidates, larger polygon area;
+4. more real red strokes;
+5. fewer graph edges;
+6. lower anchor stroke ID;
+7. lexical stroke-set key.
+
+The synthetic maximum length is diagnostic and is not in the current sorting
+comparator.
+
+Before selection a candidate must pass:
+
+- valid local green attach/excavate action;
+- minimum bounding-box area;
+- interior-red check;
+- valid face prevalidation.
+
+Each real red stroke may belong to only one selected candidate. Conflicting
+later candidates are rejected.
+
+Root output: `09_loop_candidates.json`.
+
+## 19. Step 9 Component Outputs
+
+Selected candidates are numbered in final selection order:
+
+```text
+Saved/2DDebug/Press_##/Component_##
+Saved/FromAction/Press_##/Component_##
+```
+
+Debug component files:
+
+```text
+09a_caploop_candidate.png
+09a_caploop_candidate_graph.json
+09b_caploop_pruned.png
+09b_caploop_pruned_graph.json
 09_cap_extrusion.png
-graph and candidate diagnostics
+09_cap_extrusion.json
 ```
 
-### 9.6 Current blue-line behavior
-
-Blue strokes pass through binarization, skeletonization, color splitting,
-corner processing, merging, and metric calculation.
-
-They are not used by Step 9 for cap detection, action selection, or 3D
-reconstruction. Blue currently has no final 3D semantic meaning.
-
-## 10. 3D Input Validation
-
-`FFromLZFaceReconstructor::ProcessPress` loads the source reference, face data,
-camera data, action data, cap data, and optional actor/material ID data.
-
-Reconstruction requires:
-
-- orthographic capture metadata;
-- a usable exact projection matrix;
-- compatible capture, face, and actor/material projection matrices.
-
-The code compares the key matrix terms with a very strict relative tolerance,
-approximately `1e-8`. Inconsistent projection data causes reconstruction to
-stop rather than silently using approximate coordinates.
-
-## 11. Source Polygon Semantics
-
-The polygon used to select the source face depends on the action.
-
-For `excavate`:
+Action file:
 
 ```text
-source polygon = cap_polygon
-copied polygon = cap_polygon_translated
+Saved/FromAction/Press_##/Component_##/Action.json
 ```
 
-For `attach`:
+`09_cap_extrusion.json` is the main Step 9-to-Step 10 contract. It includes:
+
+- action and decision statistics;
+- cap/translated polygons;
+- side vector, side segments, chain IDs, path/gap metrics;
+- candidate source/anchor;
+- cap stroke/node IDs;
+- ordered boundary runs;
+- face-prevalidation result.
+
+## 20. Step 10 Common Input Validation
+
+`ProcessPress` enumerates `Component_*` folders and loads common data once.
+
+Required:
+
+- `capture_ref.json`;
+- face PNG and face JSON;
+- capture JSON with orthographic view and usable matrix;
+- unique face-color mapping.
+
+Optional:
+
+- actor/material ID PNG and JSON.
+
+Projection comparison uses only:
 
 ```text
-source polygon = cap_polygon_translated
-copied polygon = cap_polygon
+M00, M11, M30, M31
 ```
 
-The orientation is significant because the chosen source face provides the
-plane and normal used for unprojection and extrusion.
+Relative tolerance is `1e-8` with scale `max(1, |a|, |b|)`.
 
-## 12. Captured Face Selection
+The capture and face metadata must match. If actor/material metadata loaded,
+it must also match. A mismatch aborts every component instead of silently
+approximating coordinates.
 
-The source polygon is scaled into face-image coordinates and rasterized.
+Common failures still create component failure JSON, Step 10 skipped-solid
+JSON, regularization fallback diagnostics, and the press-level regularization
+index.
 
-Candidate faces:
+Components are reconstructed in `ParallelFor`. Runtime actor mutation remains
+on the game thread.
 
-1. Must overlap the polygon mask by at least approximately five percent of
-   the mask area.
-2. Are identified through their unique face-image colors.
-3. Receive a ray/plane intersection test from the polygon centroid.
-4. Have their world normal projected into image space.
-5. Are compared against all available green-side directions.
+## 21. Step 10 Face Selection Recheck
 
-The normal comparison is unoriented:
+For each component Step 10:
 
-- angle at most `30` degrees: accepted;
-- angle below `10` degrees: preferred.
+1. loads `Action.json`;
+2. rejects `skip`, `undetermined`, and unsupported actions;
+3. loads `09_cap_extrusion.json`;
+4. loads cap image dimensions;
+5. scales cap coordinates and side vectors to face-image space;
+6. rasterizes the source polygon;
+7. repeats the same `85%`, `30-degree`, `10-degree`, nearest-camera selection;
+8. requires the selected face ID to exactly equal Step 9's
+   `preselected_face_id`.
 
-Among preferred candidates, the face nearest the camera is chosen. If there is
-no preferred candidate, the nearest passing candidate is used.
+This duplicate check prevents Step 9 and Step 10 from reconstructing different
+faces after serialization or coordinate conversion.
 
-The selected face's full key-point polygon is triangulated for reconstruction
-diagnostics, but it is not itself the cap-prism mesh.
-
-## 13. Orthographic Pixel-to-World Conversion
-
-For pixel `(x, y)`:
-
-1. Convert the pixel center to NDC.
-2. Recover view-space right/up values:
+Outputs:
 
 ```text
+10_cap_mask.png
+10_face_overlap.png
+10_normal_green_check.png
+10_face_reconstruction.json
+```
+
+The selected face key-point polygon is triangulated and oriented toward the
+camera for diagnostics. It is not the generated solid cap.
+
+## 22. Pixel/World Projection
+
+For image pixel center `(x, y)`:
+
+```text
+ndcX = 2 * ((x + 0.5) / width) - 1
+ndcY = 1 - 2 * ((y + 0.5) / height)
+
 right = (ndcX - M30) / M00
 up    = (ndcY - M31) / M11
+
+rayOrigin = cameraLocation + cameraRight * right + cameraUp * up
+rayDirection = cameraForward
 ```
 
-3. Build a world-space orthographic ray from the capture camera basis.
-4. Intersect that ray with the selected source plane.
+The ray is intersected with the selected face plane.
 
-This produces one source-world point for each source-loop pixel.
+World projection performs the inverse operation with the same camera basis and
+matrix. Points behind the camera are rejected.
 
-## 14. Cap-Loop Preparation
+## 23. Paired Loop Cleanup
 
-Before solid construction, the paired source and copied loops are cleaned:
+The source and copied polygons must initially have equal point counts and at
+least three points.
 
-- remove extremely close points;
-- remove duplicate points;
-- remove nearly collinear points with a tolerance near `0.75` pixels;
-- keep the two loops paired;
-- when over `384` points, apply RDP with epsilon `1.25`;
-- decimate further when still above `384` points.
+Cleanup is paired so indices remain corresponding:
 
-The average paired 2D displacement is the screen-space extrusion vector.
+1. remove duplicate closing pair;
+2. remove coincident adjacent pairs;
+3. repeatedly remove points collinear in both loops, using approximately
+   `0.75 pixels`;
+4. when above `384` points, closed-loop RDP with tolerance `1.25 pixels`;
+5. decimate further to target at most `384`.
 
-## 15. Face-UV Cap BBOX Regularization
+The average paired delta after cleanup is the source-to-copied image vector.
+It must be non-zero.
 
-After the original source loop is unprojected onto the selected face plane, the
-reconstructor attempts to recognize and regularize a rectangular cap.
+## 24. Step 10 World-Octilinear Regularization
 
-This stage is an enhancement: any invalid or degenerate input falls back to the
-original cap and does not independently fail reconstruction.
+Regularization is attempted after the original source loop is unprojected.
+Failure restores the original cap and does not cancel reconstruction.
 
-### 15.1 Stable face UV axes
+Although legacy names still contain `BBox`, the active function is
+`RegularizeCapToWorldOrthogonalPolygon`. It supports U, V, +45-degree, and
+-45-degree octilinear directions.
 
-The captured face is viewed directly along its normal and treated as a 2D
-plane.
-
-1. Project the captured face boundary into a temporary face-plane basis.
-2. Compute the 2D convex hull.
-3. Enumerate hull-edge directions to find the minimum-area oriented BBOX.
-4. Use the longer BBOX direction as `U` and the shorter direction as `V`.
-5. When the two extents differ by no more than one percent, choose the axis
-   whose image projection is more horizontal as `U`.
-6. Flip both axes when required so `+U` projects toward image-right.
-7. Ensure `U x V` points in the captured face-normal direction.
-
-The first cap candidate uses these face-derived directions and computes its
-own independent axis-aligned UV BBOX. This candidate is called the
-`cap_base_bbox`. It is not expanded, clipped, or snapped to the face boundary.
-
-### 15.2 Two-stage 70-percent rule
-
-The first-stage fill ratio is:
+### 24.1 Runtime CVars
 
 ```text
-cap_base_bbox_ratio =
-    abs(area(original cap in face UV))
-    / area(cap_base_bbox)
+r.FromLZ.UsePerFaceCapture
 ```
 
-The configured threshold is exactly:
+- default `1`;
+- detects shared-camera contour points clipped by the image rectangle;
+- snaps those clip corners to the axis-aligned face-UV bounds;
+- replaces the debug/reference face boundary when successful;
+- `0` keeps the raw shared-camera contour.
 
 ```text
-ratio >= 0.70
+r.FromLZ.PureRedAllowDiagonalRoot
 ```
 
-When `cap_base_bbox_ratio >= 0.70`, the source cap is replaced by the four
-base-oriented BBOX corners and no second-stage test is needed.
+- default `0`;
+- pure-red root hypotheses may target only U/V;
+- non-zero restores diagonal root targets.
 
-Only when the base-oriented ratio fails, the code:
+### 24.2 World-aligned face basis
 
-1. Computes the original cap's convex hull in the same face UV plane.
-2. Finds the cap hull's own minimum-area oriented BBOX.
-3. Calls this candidate the `cap_minimum_bbox`.
-4. Calculates:
+The world axis most parallel to the face normal is excluded. The remaining
+world axes are projected into the face plane to form an oriented U/V basis.
+
+All UV values are in world units. Pixel distances for validation are measured
+by projecting UV points back through the exact camera and converting to cap
+space.
+
+### 24.3 Boundary-run semantics
+
+Runs are translated for attachment source semantics before unprojection:
+
+- excavate source run translation: zero;
+- attach source run translation: Step 9 side vector.
+
+Connector runs:
+
+- preserve cyclic run ordering and provenance;
+- are counted in diagnostics;
+- contribute no fitted geometry.
+
+Black runs:
+
+- become one primitive edge per run;
+- retain graph node IDs and original node UV positions.
+
+Red runs:
+
+- are simplified/protected into primitive edge fragments;
+- significant turns and directional macro groups are retained.
+
+Current constants:
+
+- black assigned-axis angle tolerance: `5 degrees`;
+- U/V-vs-diagonal classification threshold: `40 degrees`;
+- black node snap budget: `10 pixels`;
+- red macro corridor: `5 pixels`;
+- red macro minimum length: `20 pixels`;
+- red primitive RDP tolerance: `1 pixel`;
+- short red edge threshold: `20 pixels`;
+- minimum corrected/original area ratio: `0.4`;
+- maximum pure-red root candidates: `5`.
+
+### 24.4 Primitive classification
+
+Each primitive is assigned one of:
 
 ```text
-cap_minimum_bbox_ratio =
-    abs(area(original cap in face UV))
-    / area(cap_minimum_bbox)
+U
+V
+DiagPlus
+DiagMinus
 ```
 
-5. Uses the cap minimum BBOX when its ratio is at least `0.70`.
+Short adjacent red primitives may collapse. Adjacent primitives with the same
+octilinear axis are merged while preserving source run/stroke/primitive
+provenance.
 
-The final priority is:
+Every black edge must require at most `5 degrees` of rotation to its assigned
+axis.
+
+### 24.5 Pure-red root hypotheses
+
+When no black run exists:
+
+1. compute area centroid of the original cap;
+2. consider reliable primitive roots with:
+   - path length at least `20 pixels`;
+   - max chord deviation at most `5 pixels`;
+3. rank root candidates and keep at most five;
+4. generate rotation hypotheses to the root's assigned octilinear target;
+5. by default skip diagonal target roots;
+6. rotate all primitive/sample geometry around the cap centroid;
+7. solve and validate every hypothesis;
+8. select the best valid hypothesis by solve quality.
+
+Diagnostics retain every hypothesis, root stroke IDs, target axis, rotation,
+angle cost, area ratio, and boundary distance.
+
+When black exists, phase is locked to world axes and root rotation is zero.
+
+### 24.6 Adjacency and support solve
+
+After same-axis merge:
+
+- at least three support edges are required;
+- adjacent edges may not have the same axis type;
+- weighted squared angular cost is diagnostic.
+
+Black support:
+
+- support coordinate is the weighted median of samples;
+- graph nodes are projected to that support;
+- every node movement must be at most `10 pixels`.
+
+Red support:
+
+- between two black neighbors: average their fixed coordinates;
+- after one black neighbor: use that fixed coordinate;
+- otherwise: weighted median of red samples.
+
+### 24.7 Vertex solve
+
+Every output vertex is the analytic intersection of the previous/current
+octilinear support lines.
+
+For pure red, the solved polygon is translated so its area centroid matches
+the original cap centroid.
+
+Black graph nodes are checked again against final solved corners/supports and
+must remain within the `10-pixel` snap budget.
+
+### 24.8 Hard validation and diagnostic-only metrics
+
+Hard rejection:
+
+- corrected area ratio is non-finite or below `0.4`;
+- self-intersection;
+- reversal of a protected convex/concave turn;
+- failed world conversion;
+- failed orthographic reprojection;
+- any earlier stage-specific failure.
+
+Boundary mean/max distance and angle cost are currently diagnostic only. There
+is no active upper boundary-distance threshold and no upper area-ratio limit.
+
+This is a major difference from earlier implementations/documentation.
+
+### 24.9 Copied loop after correction
+
+The original average source-to-copy image delta is preserved:
 
 ```text
-if cap_base_bbox_ratio >= 0.70:
-    final_cap = cap_base_bbox
-else if cap_minimum_bbox_ratio >= 0.70:
-    final_cap = cap_minimum_bbox
-else:
-    final_cap = original_cap
+copiedPixel = project(correctedSourceWorld) + originalDeltaPixels
 ```
 
-The second BBOX remains on the selected face plane, but its orientation comes
-from the cap itself and may be rotated relative to the base face.
+The corrected source pixels and copied targets then continue through the
+ordinary extrusion-depth solver.
 
-Both stages intentionally use only the area-ratio rule. A circle can have a
-ratio near `0.785` and is therefore expected to be regularized as a rectangle.
-No circularity, edge-coverage, or corner test is applied.
+### 24.10 Stage state machine
 
-### 15.3 Copied-loop reconstruction
-
-Before regularization, the code preserves the original average source-to-copy
-pixel displacement:
+Every regularization attempt tracks:
 
 ```text
-original_delta_2d =
-    average(originalCopiedPixel[i] - originalSourcePixel[i])
+input_validation
+world_aligned_face_uv
+boundary_run_unprojection
+red_corner_protection
+primitive_edge_classification
+pure_red_root_alignment
+same_axis_merge
+adjacency_validation
+support_line_solve
+vertex_intersections
+topology_validation
+metric_validation
+world_conversion
+orthographic_reprojection
 ```
 
-After a successful BBOX replacement, each new source-world corner is projected
-back into the capture image and its copied target is:
+Statuses are `not_reached`, `in_progress`, `passed`, or `failed`.
+
+## 25. Regularization Debug Artifacts
+
+Every component receives, even when regularization is not reached:
 
 ```text
-copiedPixel[i] =
-    project(regularizedSourceWorld[i]) + original_delta_2d
+10_cap_world_orthogonal_overview.png
+10_cap_world_orthogonal_detail.png
+10_cap_world_orthogonal_regularization.json
+10_cap_world_orthogonal_regularization_world.json
+10_cap_world_orthogonal_steps/
 ```
 
-The displacement remains in capture-image pixel space. It is not converted
-into face UV, so existing green-stroke and attach/excavate direction semantics
-are preserved.
-
-### 15.4 Fallback cases
-
-The original cap is restored when any of the following occurs:
-
-- fewer than three usable face or cap points;
-- invalid face-plane basis;
-- degenerate face convex hull or oriented BBOX;
-- non-finite face, cap, UV, or world values;
-- degenerate cap polygon, base BBOX, cap hull, or minimum BBOX area;
-- failed UV-to-world conversion;
-- failed orthographic reprojection of regularized corners.
-
-Both ratios falling below `0.70` is a normal non-application decision, not a
-fallback error.
-
-### 15.5 Debug outputs
-
-The component's Step 10 output directory receives:
+The steps directory contains:
 
 ```text
-10_cap_face_uv_overview.png
-10_cap_face_uv_detail.png
-10_cap_bbox_regularization.json
-10_cap_bbox_regularization_world.json
+trace.json
+00_world_uv_runs.json/.png
+01_protected_corners.json/.png
+02_primitive_edges.json/.png
+02a_root_alignment.json/.png
+03_same_axis_merged.json/.png
+04_axis_validation.json/.png
+05_support_lines.json/.png
+06_corrected_polygon.json/.png
+07_final_validation.json/.png
 ```
 
-Both PNGs use equal UV scaling:
-
-- dark gray: captured face boundary;
-- light gray: face convex hull;
-- cyan: face minimum-area oriented BBOX;
-- red: original cap;
-- yellow: face-oriented `cap_base_bbox`;
-- purple: cap-oriented `cap_minimum_bbox`, when the second stage was computed;
-- green: final cap used by reconstruction;
-- red/blue arrows: stabilized `+U/+V`.
-
-The overview is framed around the face and cap, while the detail image is
-framed around the cap. The JSON files record both BBOX candidates, both ratios,
-the selected geometry (`cap_base_bbox`, `cap_minimum_bbox`, or `original`),
-the axes, threshold, fallback reason, UV loops, world loops, and original pixel
-displacement.
-
-## 16. Extrusion Depth
-
-The source face normal is oriented toward the source-to-copied screen
-translation.
-
-For world direction `n`, the pixel displacement caused by one world unit is:
+The press root contains:
 
 ```text
-pixelPerWorld.x =
-    dot(n, cameraRight) * 0.5 * imageWidth * M00
-
-pixelPerWorld.y =
-    -dot(n, cameraUp) * 0.5 * imageHeight * M11
+10_cap_world_orthogonal_index.json
 ```
 
-Given average source-to-copied displacement `delta2D`:
+It summarizes attempted/applied/fallback counts and each component's failed
+stage, reason, selected geometry, and debug directory.
+
+## 26. Extrusion Depth
+
+The face normal is oriented so its projected image direction points toward the
+source-to-copy vector.
+
+For oriented world normal `n`:
 
 ```text
-depth =
-    dot(pixelPerWorld, delta2D)
-    / dot(pixelPerWorld, pixelPerWorld)
+pixelPerWorld.x = dot(n, cameraRight) * 0.5 * width  * M00
+pixelPerWorld.y = -dot(n, cameraUp)   * 0.5 * height * M11
+
+depth = dot(pixelPerWorld, sourceToCopy)
+      / dot(pixelPerWorld, pixelPerWorld)
 ```
 
-The depth must exceed approximately `0.0001`.
+The depth must be finite and greater than `0.0001`.
 
-Copied 3D points are:
+Each copied world point is:
 
 ```text
-copiedWorld = sourceWorld + orientedNormal * depth
+sourceWorld + orientedNormal * depth
 ```
 
-Every copied point is projected back into the image for validation. Allowed
-reprojection error is:
+Per-vertex allowed reprojection error:
 
 ```text
-max(25 pixels, 0.75 * screenTranslationLength)
+max(25 pixels, 0.75 * sourceToCopyLength)
 ```
 
-At least three valid paired points are required.
+At least three depth samples must pass. Final max copied-loop error above the
+threshold becomes a warning, not a hard rejection, after the minimum valid
+sample check.
 
-## 17. Closed Solid Construction
+## 27. Closed Solid Construction
 
-The source 2D loop is triangulated with ear clipping.
+The source cap is triangulated by ear clipping. If no ear can be clipped, a
+triangle fan is emitted.
 
-If ear clipping cannot find a valid ear, the implementation falls back to a
-triangle fan.
+Before triangle emission, paired loops may be reversed so source-cap winding
+is opposite the extrusion direction.
 
-The final prism contains:
+The mesh contains:
 
-- a source cap;
-- a copied cap with opposite triangle winding;
-- two side triangles for every loop edge.
+- source cap;
+- copied cap with reversed triangle order;
+- two side triangles per polygon edge.
 
-Before triangle emission, paired loops may be reversed so the source-cap
-normal faces opposite the oriented extrusion direction.
+Step 10 outputs:
 
-For excavation, the cutter is enlarged:
+```text
+10_solid_reconstruction.json
+10_solid_projection_check.png
+```
 
-- approximately `1.2` along its primary axis;
-- approximately `1.1` perpendicular to that axis.
+Successful excavation cutters are enlarged only when converted to runtime
+spawn data:
 
-This makes Boolean penetration more reliable at boundaries.
+- along extrusion normal: `1.2`;
+- perpendicular to normal: `1.1`.
 
-## 18. Attach Material Selection
+## 28. Attachment Material Recovery
 
-For successful attach solids, the preferred material path is:
+Primary path:
 
-1. Rasterize the source polygon in actor/material-ID image space.
-2. Optionally filter samples to the selected captured face.
-3. Count valid actor/material colors.
-4. Select the majority color.
-5. Resolve its actor, primitive component, and material slot.
+1. rasterize the source polygon in actor/material image space;
+2. optionally restrict samples to the selected face;
+3. count valid ID colors;
+4. choose the majority entry;
+5. resolve a live component using path/name/type scoring;
+6. retrieve its material slot.
 
-If that lookup fails, visible geometry is searched using average
-point-to-triangle distance from loop samples and the loop centroid.
+Runtime-generated active attachments and Boolean results may be material
+sources; cutters and inactive runtime actors may not.
 
-If no source material can be recovered, the generated mesh uses its configured
-vertex-color/debug material path.
+Fallback path:
 
-## 19. Step 11 Runtime Boolean
+- convert candidate visible scene meshes;
+- calculate average point-to-triangle distance from source loop probes plus
+  centroid;
+- use the nearest plausible component/material.
 
-Excavation uses Manifold3D through `FFromLZManifoldBoolean::Difference`:
+If both fail, the generated attachment uses the project/debug material path
+and vertex color.
+
+## 29. Game-Thread Spawn Order
+
+`SpawnMeshesOnGameThread` first checks world validity and session generation.
+
+The important operation order is:
+
+1. collect excavation cutters from the current reconstructed mesh list;
+2. apply Step 11 excavation Booleans to eligible existing targets;
+3. spawn all current reconstructed actors;
+4. hide accepted current cutters;
+5. export the reconstruction scene OBJ.
+
+Therefore, a current-press attachment is not cut by a current-press
+excavation. It becomes an eligible target in a later press.
+
+Spawned reconstruction actors receive:
+
+- reconstructed-solid tag;
+- action tag for attachment or cutter;
+- generated-by-press actor/component tags.
+
+Procedural reconstruction drawing duplicates triangle vertices for flat
+normals and emits UE-facing winding.
+
+## 30. Step 11 Boolean Target Classes
+
+Eligible targets:
+
+- visible base static mesh components;
+- active attachment procedural meshes from previous presses;
+- active prior Boolean-result procedural meshes.
+
+Excluded:
+
+- reconstruction debug face actors;
+- excavation cutters;
+- inactive/undone runtime actors;
+- hidden or empty components.
+
+Bounds are checked first:
+
+- exact bounds intersection;
+- bounds expanded by `1 cm` for diagnostics/near-overlap handling.
+
+Static and procedural components are converted to world-space
+`FDynamicMesh3`. Vertices are welded by quantized position at `0.01 cm`.
+
+## 31. Manifold3D Difference
+
+Backend:
+
+```text
+Manifold3D 3.5.0+37125da
+```
+
+Conversion rules:
+
+- Manifold input tolerance: `0.001 cm`;
+- vertex properties contain XYZ only;
+- degenerate triangles are skipped;
+- `MeshGL64::Merge()` is called;
+- signed-negative target/cutter meshes are reversed before Manifold;
+- output vertices are welded at `0.01 cm`;
+- output orientation is restored to the requested render sign.
+
+Operation:
 
 ```text
 result = target - cutter
 ```
 
-Relevant tolerances:
+The primary attempt uses target render orientation. A fallback attempt reverses
+the target for the pass.
 
-- Manifold input tolerance: `0.001 cm`.
-- Vertex weld tolerance: `0.01 cm`.
-- Target/cutter bounds expansion: `1 cm`.
-- Minimum renderable result edge: `0.05 cm`.
+## 32. Boolean Acceptance
 
-Before Boolean evaluation:
+Before Manifold, cutter diagnostics require:
 
-- meshes are converted to `FDynamicMesh3`;
-- vertices within the weld tolerance are merged;
-- boundary and non-manifold edges are diagnosed;
-- signed volume is used to normalize orientation for Manifold.
+- triangles present;
+- zero boundary edges;
+- zero non-manifold edges.
 
-The primary pass uses the target's render orientation. A fallback pass tries
-the reversed target orientation.
+A non-empty result must have:
 
-A non-empty result is accepted only when:
-
-- it is a closed two-manifold;
-- it has no non-manifold edges;
-- its minimum edge length is at least `0.05 cm`;
-- volume reduction is at least:
+- zero boundary edges;
+- zero non-manifold edges;
+- minimum edge length at least `0.05 cm`;
+- volume reduction at least:
 
 ```text
-max(1 cubic centimeter, targetVolume * 0.0001)
+max(1 cm³, targetAbsVolume * 0.0001)
 ```
 
-An empty result can be valid when the cutter completely removes the target.
+An empty result is accepted as complete removal.
 
-After a successful operation:
+After accepted difference:
 
-- the original component is hidden and tagged for the current press;
-- a new procedural-mesh Boolean-result actor is created;
-- accepted cutters are hidden;
-- generated attach solids remain visible.
+- base source components are hidden and tagged by press;
+- prior procedural result actors may be replaced/hidden according to target
+  type;
+- a new Boolean-result procedural actor is created;
+- accepted cutter names are recorded and those cutter actors are hidden after
+  spawn.
 
-## 20. Boolean Target Selection and Ordering
+Boolean result rendering uses flat procedural sections. Source/cutter section
+provenance is retained where available so materials can be assigned to
+separate sections.
 
-Boolean targets include:
+Press-level output:
 
-- visible non-runtime static-mesh components;
-- procedural meshes created by previous attach operations;
-- prior Boolean-result procedural meshes.
+```text
+11_boolean_diagnostics.json
+```
 
-Debug reconstructed faces and cutter meshes are excluded as targets.
+## 33. Undo and Runtime Tagging
 
-Important ordering consequence:
-
-The current press applies its excavation cutters before spawning the current
-press's attach meshes. Therefore, an attach mesh created in the same press is
-not cut by that press's excavate operation. It can become a Boolean target in a
-later press.
-
-This is an inference from the current game-thread operation order and should
-be rechecked if spawning or Boolean scheduling is changed.
-
-## 21. Undo
-
-Each Step 11 operation is tagged with a press ID.
+Active press IDs are stored in a stack. The latest ID is also cached for
+compatibility.
 
 Undo:
 
-1. Pops the most recent active press.
-2. Destroys generated attach and Boolean-result actors for that press.
-3. Restores source components hidden by that press.
-4. Restores accepted cutters and related runtime visibility as required.
+1. pop the newest active press;
+2. find generated actors carrying that press tag;
+3. destroy generated attachment, cutter, and Boolean-result actors from that
+   press;
+4. remove that press's hidden-by tags from source components;
+5. restore visibility when no other active press still hides the component;
+6. refresh active runtime state.
 
-The sketch-board Undo button and the viewport `Shift` key use the same
-restoration entry point.
-
-## 22. Session Reset and Generated Data
-
-2D processing uses worker threads. Generation checks prevent stale tasks from
-spawning geometry after a reset.
-
-The Tab/reset sequence:
-
-1. Increments the session generation.
-2. Waits for active processing tasks.
-3. Cancels pending capture.
-4. Closes the sketch board.
-5. Restores runtime Step 11 state.
-6. Archives generated Saved folders.
-7. Clears the working folders.
-8. Reloads the current level.
-
-The module's startup cleanup removes most generated/debug directories but
-preserves `FromSketch`. A full Tab reset archives and clears `FromSketch` as
-well.
-
-Important generated directories include:
+Output:
 
 ```text
-Saved/FromLZCaptures
-Saved/FromSketch
-Saved/FromProcess
-Saved/2DDebug
-Saved/FromAction
+Saved/2DDebug/Press_##/11_undo_diagnostics.json
 ```
 
-## 23. Semantic Summary
+Capture includes only active runtime attachments and Boolean results.
 
-Current stroke semantics are:
+## 34. Full Session Reset
 
-- Red: defines the intended cap boundary.
-- Black: captured scene contours that may complete a red cap loop.
-- Green: defines screen-space translation and determines attach/excavate from
-  its outside/inside relationship to the cap.
-- Blue: parsed and diagnosed in 2D but currently unused for 3D actions.
+The global Tab handler:
 
-Current action semantics are:
+1. rejects a missing world;
+2. ignores repeated Tab while pending;
+3. marks reset pending;
+4. increments session generation immediately;
+5. cancels pending capture;
+6. closes the board;
+7. waits for all composite workers to finish.
 
-- `attach`: build and spawn a closed prism using the translated-side face as
-  the source plane.
-- `excavate`: build an enlarged closed cutter prism and subtract it from
-  existing visible targets.
+Finalization:
 
-## 24. Important Non-Obvious Constraints
+1. cancel capture/close board again defensively;
+2. restore all active presses in reverse order;
+3. destroy all remaining runtime-tagged actors;
+4. clear runtime visibility/tags and undo stack;
+5. copy working folders to a unique
+   `Saved/log_YYYYMMDD_HHMMSS[_NN]`;
+6. delete and recreate working folders;
+7. reload the current level.
 
-Agents modifying this pipeline should preserve or consciously replace these
-properties:
+Archived folders:
 
-1. Capture and reconstruction must use the exact same orthographic matrix.
-2. The 2D Step 8 enclosed mask is not the Step 9 cap detector.
-3. Green's `10 px` interior threshold is diagnostic; inside/outside comparison
-   is what chooses the action.
-4. Blue has no current Step 9 or 3D meaning.
-5. Real red strokes are allocated to at most one selected cap candidate.
-6. Borrowed-black loops below `1500 px^2` are rejected.
-7. Source/copy polygon order differs between attach and excavate.
-8. Current-press excavation occurs before current-press attach spawning.
-9. Face PNG, capture metadata, and material-ID metadata must describe the same
-   projection.
-10. Generated solids must remain closed and consistently wound for Manifold3D.
-11. `cap_base_bbox` uses the face's oriented axes but the cap's own extents; it
-    never expands or clips the cap to the face.
-12. `cap_minimum_bbox` is computed only after the base-oriented ratio fails,
-    and may rotate relative to the face BBOX.
-13. Both current `0.70` tests deliberately have no circle-rejection rule.
+```text
+2DDebug
+FromAction
+FromLZCaptures
+FromProcess
+FromSketch
+Logs
+```
 
-## 25. Debugging Strategy
+Unlike normal module startup, a full reset clears `FromSketch`.
 
-When a reconstruction fails, inspect data in this order:
+## 35. Stroke and Action Semantics
+
+- Red: intended cap topology and semantic boundary.
+- Black: captured scene contour that can close/anchor a red cap.
+- Green: local translation chain and attach/excavate classifier.
+- Blue: parsed, split, merged, measured, and debugged through Step 8, but has
+  no Step 9/3D meaning.
+
+Actions:
+
+- `attach`: source plane is under the translated cap; extrusion returns toward
+  the original cap and the solid is spawned.
+- `excavate`: source plane is under the original cap; extrusion follows the
+  translated cap and the enlarged solid becomes a Boolean cutter.
+
+## 36. Output Tree
+
+Typical successful press:
+
+```text
+Saved/
+  2DDebug/
+    Press_01/
+      capture_ref.json
+      00_input.png ... 08_enclosed_mask.png
+      09_all_red_black_graph.*
+      09_loop_candidates.json
+      CandidateFaceValidation/
+      Component_01/
+        09*.png/json
+        10_face_reconstruction.json
+        10_cap_mask.png
+        10_face_overlap.png
+        10_normal_green_check.png
+        10_solid_reconstruction.json
+        10_solid_projection_check.png
+        10_cap_world_orthogonal_*
+        10_cap_world_orthogonal_steps/
+      10_cap_world_orthogonal_index.json
+      10_reconstruction_scene.obj
+      10_reconstruction_scene.mtl
+      11_boolean_diagnostics.json
+  FromAction/
+    Press_01/
+      Component_01/
+        Action.json
+```
+
+## 37. Failure Localization
+
+Use this order:
 
 1. `capture_ref.json`
-   - Confirm the expected sketch and capture were paired.
-2. Capture camera/projection JSON
-   - Confirm orthographic mode and matrix availability.
-3. Step 1-7 debug images/JSON
-   - Confirm skeleton quality, colors, corners, and merging.
-4. Step 8 output
-   - Use only as a visual closure diagnostic.
-5. Step 9 graph and cap candidate files
-   - Confirm planarization, red/black repairs, and candidate priority.
-6. `Action.json`
-   - Confirm local green lengths and selected action.
-7. `09_cap_extrusion.json`
-   - Confirm source and translated polygons and direction.
-8. Face-selection diagnostics
-   - Confirm overlap and projected-normal tests.
-9. Face-UV BBOX regularization diagnostics
-   - Confirm stable axes, original cap, BBOX, fill ratio, and fallback reason.
-10. Solid-reconstruction diagnostics
-   - Confirm depth, reprojection error, triangulation, and winding.
-11. Step 11 Boolean diagnostics
-    - Confirm manifold validity, orientation attempts, volume change, and
-      minimum-edge rejection.
+   - Verify exact source pairing.
+2. capture JSON and `_debug_transforms.json`
+   - Verify stable/restored projection and exact matrix.
+3. main capture, depth, normal, face, and actor/material images
+   - Separate line-art/segmentation/ID failures.
+4. `01` through `07`
+   - Verify skeleton topology and color ownership.
+5. `03b_connector_prune_debug.json`
+   - Verify repair direction and loop pruning.
+6. Step 8 images
+   - Visual closure only.
+7. `09_all_red_black_graph.*`
+   - Verify planarization and connector topology.
+8. `09_loop_candidates.json`
+   - Check green, interior-red, face, conflict, and priority rejection.
+9. `CandidateFaceValidation`
+   - Check `85%` mask coverage and normal/green angle.
+10. `09_cap_extrusion.json` and `Action.json`
+    - Check source/copy semantics and ordered runs.
+11. `10_face_reconstruction.json`
+    - Check Step 9/10 face-ID agreement.
+12. world-octilinear index, trace, and numbered stages
+    - Find first failed stage and fallback reason.
+13. `10_solid_reconstruction.json`
+    - Check depth, orientation, and reprojection.
+14. `11_boolean_diagnostics.json`
+    - Check target/cutter manifold, bounds, attempts, edge length, and volume.
 
-Do not diagnose a late-stage Boolean failure by changing 2D thresholds until
-the projection, face selection, solid closure, and mesh diagnostics have been
-checked independently.
+Do not tune early 2D thresholds to hide a projection, face-selection, solid
+closure, or Boolean-manifold failure.
+
+## 38. Non-Obvious Invariants
+
+1. Capture, faces, actor/material IDs, Step 9 validation, and Step 10 must use
+   the same exact orthographic projection.
+2. Step 1 currently does not call morphology helpers.
+3. Red/black synthetic color resolution currently chooses black.
+4. Step 8 does not drive Step 9.
+5. Step 9 requires valid green action and valid 3D face before selecting a
+   cap.
+6. Face coverage is `85%` of the whole source polygon mask.
+7. Step 10 must reproduce Step 9's selected face ID.
+8. Real red strokes are single-owner across selected caps.
+9. Ordered boundary connectors preserve topology but are excluded from
+   regularized geometry.
+10. World regularization is octilinear, not only orthogonal.
+11. Pure-red phase may rotate; black-containing phase is world locked.
+12. Boundary distance is diagnostic only in the current regularizer.
+13. A regularization failure restores the original cap and continues.
+14. Source/copy order reverses between attach and excavate.
+15. Current-press excavation runs before current-press attachment spawn.
+16. Generated solids and cutters must be closed for Manifold.
+17. Session generation prevents post-reset worker results from spawning.
+18. Startup preserves sketches; full Tab reset archives and clears them.
+
+## 39. Known Code/Comment Drift
+
+Developers should not copy these stale descriptions without checking calls:
+
+- `FromLZSketch2DProcessor.h` still describes morphology and has duplicate
+  unchecked checklist lines, while active Step 1 performs only binarization
+  and small-component removal.
+- some comments describe older cap-area thresholds; active Step 9 constants
+  are `500 px²` for both red-only and borrowed loops.
+- older documentation described a `5%` face overlap; active code requires
+  `85%`.
+- older documentation treated black endpoints as immutable; current
+  octilinear code permits support snapping within `10 pixels`.
+- older documentation described upper area and boundary-distance rejection;
+  current hard metric check only enforces area ratio at least `0.4`.
+
+When changing parameters, update both this guide and the nearby stale source
+comments so future readers do not have two competing pipelines.

@@ -138,6 +138,22 @@ namespace FromLZImageOps
 		int32 Thickness, TArray<uint8>& OutMask, TArray<uint8>& OutBarrier);
 
 	// Step 9 cap-extrusion recovery result.
+	struct FCapBoundaryRun
+	{
+		int32 StrokeId = INDEX_NONE;
+		EStrokeColor Color = EStrokeColor::None;
+		bool bSynthetic = false;
+		bool bReversed = false;
+		int32 StartNodeId = INDEX_NONE;
+		int32 EndNodeId = INDEX_NONE;
+		FVector2D StartNodePosition = FVector2D::ZeroVector;
+		FVector2D EndNodePosition = FVector2D::ZeroVector;
+		FStroke Points;
+		double ArcLengthPixels = 0.0;
+		double ChordLengthPixels = 0.0;
+		double Straightness = 0.0;
+	};
+
 	struct FCapExtrusionResult
 	{
 		bool bFound = false;
@@ -170,6 +186,7 @@ namespace FromLZImageOps
 		FStroke CapPolygon;               // ordered closed loop points
 		FStroke CapPolygonTranslated;     // CapPolygon + SideVector
 		TArray<FVector2D> CapNodes;       // ordered loop vertices (junction points)
+		TArray<FCapBoundaryRun> OrderedBoundaryRuns; // loop order; connectors retain topology only
 
 		// Selected full green chain. Candidates are compared by path length, then the
 		// selected chain is oriented from its cap-near endpoint to its cap-far endpoint.
