@@ -604,6 +604,87 @@ namespace FromLZImageOps
 				}
 			}
 		}
+
+		FVector2D EndpointOutwardDirection(
+			const uint8* M,
+			int32 W,
+			int32 H,
+			const FIntPoint& Endpoint,
+			double InteriorArcPixels,
+			TArray<int32>* OutIncidentEdgePixels = nullptr)
+		{
+			if (OutIncidentEdgePixels)
+			{
+				OutIncidentEdgePixels->Reset();
+			}
+			if (!Fg(M, W, H, Endpoint.X, Endpoint.Y) ||
+				NodeType(M, W, H, Endpoint.X, Endpoint.Y) != ENode::Endpoint)
+			{
+				return FVector2D::ZeroVector;
+			}
+
+			const int32 EndpointIdx = Endpoint.Y * W + Endpoint.X;
+			if (OutIncidentEdgePixels)
+			{
+				OutIncidentEdgePixels->Add(EndpointIdx);
+			}
+
+			FIntPoint Prev = Endpoint;
+			FIntPoint Cur = Endpoint;
+			bool bHasPrev = false;
+			double Arc = 0.0;
+			int32 Safety = 0;
+			while (++Safety <= 20000)
+			{
+				int32 Neighbors[8];
+				const int32 Degree = SafeNeighbors(M, W, H, Cur.X, Cur.Y, Neighbors);
+				int32 Candidates[8];
+				int32 CandidateCount = 0;
+				const int32 PrevIdx = bHasPrev ? Prev.Y * W + Prev.X : INDEX_NONE;
+				for (int32 i = 0; i < Degree; ++i)
+				{
+					if (Neighbors[i] != PrevIdx)
+					{
+						Candidates[CandidateCount++] = Neighbors[i];
+					}
+				}
+				if (CandidateCount == 0)
+				{
+					break;
+				}
+
+				const FIntPoint Reference = bHasPrev ? Prev : Cur;
+				const int32 NextIdx = ChooseBestContinuation(Reference, Cur, Candidates, CandidateCount, W);
+				if (NextIdx < 0)
+				{
+					break;
+				}
+
+				const FIntPoint Next(NextIdx % W, NextIdx / W);
+				Arc += FVector2D::Distance(
+					FVector2D(Cur.X, Cur.Y),
+					FVector2D(Next.X, Next.Y));
+				Prev = Cur;
+				Cur = Next;
+				bHasPrev = true;
+				if (OutIncidentEdgePixels)
+				{
+					OutIncidentEdgePixels->Add(NextIdx);
+				}
+
+				if (Arc >= InteriorArcPixels)
+				{
+					break;
+				}
+				const ENode Type = NodeType(M, W, H, Cur.X, Cur.Y);
+				if (Type == ENode::Endpoint || Type == ENode::Branch)
+				{
+					break;
+				}
+			}
+
+			return (FVector2D(Endpoint.X, Endpoint.Y) - FVector2D(Cur.X, Cur.Y)).GetSafeNormal();
+		}
 	} // namespace SkelGraph
 
 	void CleanupSkeletonEndpoints(
@@ -613,13 +694,19 @@ namespace FromLZImageOps
 		const TArray<uint8>& SourceColorMap, int32 SourceColorSampleRadius,
 		const FString& RedBlackConnectorsDebugPngPath, const FString& RedBlackReconnectedDebugPngPath,
 		const FString& ConnectorPruneDebugJsonPath,
-		TArray<uint8>& OutConnected, TArray<uint8>& OutSmallLoopPruned, TArray<uint8>& OutCleaned)
+		TArray<uint8>& OutConnected, TArray<uint8>& OutReconnected,
+		TArray<uint8>& OutSmallLoopPruned, TArray<uint8>& OutCleaned,
+		TArray<uint8>& OutEffectiveColorMap)
 	{
 		const int32 N = Width * Height;
 		const bool bHasSourceColorMap = SourceColorMap.Num() >= N;
 		const int32 SampleRadius = FMath::Max(0, SourceColorSampleRadius);
+		const double Tol2 = double(GapTol) * double(GapTol);
+		constexpr double EndpointDirectionTracePixels = 5.0;
+		constexpr double EndpointForwardCosThreshold = 0.5; // cos(60 degrees)
+		constexpr double RelaxedTargetCosThreshold = -0.17364817766693033; // cos(100 degrees)
+		(void)ConnectThickness;
 
-		// work = binarized copy (foreground = 255).
 		TArray<uint8> Work;
 		Work.SetNumUninitialized(N);
 		for (int32 i = 0; i < N; ++i)
@@ -627,98 +714,54 @@ namespace FromLZImageOps
 			Work[i] = Skel[i] > 0 ? 255 : 0;
 		}
 
-		TArray<FIntPoint> EndpointsBefore;
-		SkelGraph::FindEndpoints(Work.GetData(), Width, Height, EndpointsBefore);
-
-		// Nothing to connect.
-		if (GapTol <= 0.0f || EndpointsBefore.Num() < 2)
+		auto SampleMapColorClass = [&](const TArray<uint8>& Map, const FIntPoint& P) -> EStrokeColor
 		{
-			OutConnected = Work;
-			OutSmallLoopPruned = Work;
-			OutCleaned = Work;
-			return;
-		}
+			if (Map.Num() < N)
+			{
+				return EStrokeColor::None;
+			}
 
-		// ---- 1. mutual-nearest endpoint pairs within GapTol --------------------
-		const int32 E = EndpointsBefore.Num();
-		const double Tol2 = double(GapTol) * double(GapTol);
-		constexpr double EndpointForwardCosThreshold = 0.5; // cos(60 degrees)
-		constexpr double RelaxedTargetCosThreshold = -0.17364817766693033; // cos(100 degrees)
-		auto AngleDegreesFromDot = [](double Dot) -> double
-		{
-			return FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0, 1.0)));
+			int32 Counts[5] = { 0, 0, 0, 0, 0 };
+			const int32 MinY = FMath::Max(0, P.Y - SampleRadius);
+			const int32 MaxY = FMath::Min(Height - 1, P.Y + SampleRadius);
+			const int32 MinX = FMath::Max(0, P.X - SampleRadius);
+			const int32 MaxX = FMath::Min(Width - 1, P.X + SampleRadius);
+			for (int32 y = MinY; y <= MaxY; ++y)
+			{
+				for (int32 x = MinX; x <= MaxX; ++x)
+				{
+					const uint8 C = Map[y * Width + x];
+					if (C > uint8(EStrokeColor::None) && C <= uint8(EStrokeColor::Blue))
+					{
+						++Counts[C];
+					}
+				}
+			}
+
+			int32 Best = int32(EStrokeColor::None);
+			int32 BestCount = 0;
+			for (int32 C = 1; C <= 4; ++C)
+			{
+				if (Counts[C] > BestCount)
+				{
+					Best = C;
+					BestCount = Counts[C];
+				}
+			}
+			return EStrokeColor(Best);
 		};
-		TArray<FVector2D> EndpointForward;
-		EndpointForward.Init(FVector2D::ZeroVector, E);
-		for (int32 i = 0; i < E; ++i)
+
+		auto SampleSourceColorClass = [&](const FIntPoint& P) -> EStrokeColor
 		{
-			const FIntPoint& Endpoint = EndpointsBefore[i];
-			int32 Neighbors[8];
-			const int32 Degree = SkelGraph::SafeNeighbors(
-				Work.GetData(), Width, Height, Endpoint.X, Endpoint.Y, Neighbors);
-			if (Degree != 1)
-			{
-				continue;
-			}
-
-			const FIntPoint Interior(Neighbors[0] % Width, Neighbors[0] / Width);
-			FVector2D Forward(
-				double(Endpoint.X - Interior.X),
-				double(Endpoint.Y - Interior.Y));
-			if (Forward.Normalize())
-			{
-				EndpointForward[i] = Forward;
-			}
-		}
-
-		TArray<int32> NearestJ;   // best partner index for endpoint i, or -1
-		TArray<double> NearestD2;
-		NearestJ.Init(-1, E);
-		NearestD2.Init(TNumericLimits<double>::Max(), E);
-		for (int32 i = 0; i < E; ++i)
-		{
-			for (int32 j = 0; j < E; ++j)
-			{
-				if (i == j)
-				{
-					continue;
-				}
-				const double ddx = double(EndpointsBefore[i].X - EndpointsBefore[j].X);
-				const double ddy = double(EndpointsBefore[i].Y - EndpointsBefore[j].Y);
-				const double D2 = ddx * ddx + ddy * ddy;
-				if (D2 > Tol2)
-				{
-					continue;
-				}
-				if (EndpointForward[i].IsNearlyZero() || EndpointForward[j].IsNearlyZero())
-				{
-					continue;
-				}
-
-				FVector2D ToTarget(
-					double(EndpointsBefore[j].X - EndpointsBefore[i].X),
-					double(EndpointsBefore[j].Y - EndpointsBefore[i].Y));
-				if (!ToTarget.Normalize())
-				{
-					continue;
-				}
-				const FVector2D ToSource = -ToTarget;
-				if (FVector2D::DotProduct(EndpointForward[i], ToTarget) < EndpointForwardCosThreshold ||
-					FVector2D::DotProduct(EndpointForward[j], ToSource) < EndpointForwardCosThreshold)
-				{
-					continue;
-				}
-				if (D2 < NearestD2[i])
-				{
-					NearestD2[i] = D2;
-					NearestJ[i] = j;
-				}
-			}
-		}
+			return bHasSourceColorMap
+				? SampleMapColorClass(SourceColorMap, P)
+				: EStrokeColor::None;
+		};
 
 		struct FConn
 		{
 			FString Source = TEXT("all_skeleton");
+			EStrokeColor Color = EStrokeColor::Black;
 			FIntPoint P0;
 			FIntPoint P1;
 			TArray<FIntPoint> LinePts;
@@ -740,202 +783,297 @@ namespace FromLZImageOps
 			FString Decision = TEXT("not_processed");
 		};
 		TArray<FConn> Connections;
-		TArray<bool> Used;
-		Used.Init(false, E);
+
+		auto AngleDegreesFromDot = [](double Dot) -> double
+		{
+			return FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Dot, -1.0, 1.0)));
+		};
+		auto ConnectorKey = [](const FIntPoint& A, const FIntPoint& B) -> FString
+		{
+			return (A.X < B.X || (A.X == B.X && A.Y <= B.Y))
+				? FString::Printf(TEXT("%d,%d-%d,%d"), A.X, A.Y, B.X, B.Y)
+				: FString::Printf(TEXT("%d,%d-%d,%d"), B.X, B.Y, A.X, A.Y);
+		};
+		auto ColorBit = [](EStrokeColor Color) -> uint8
+		{
+			return Color == EStrokeColor::None ? 0 : uint8(1u << uint8(Color));
+		};
+		auto PreferredColorFromMask = [](uint8 Mask) -> EStrokeColor
+		{
+			const EStrokeColor Priority[] =
+			{
+				EStrokeColor::Red,
+				EStrokeColor::Black,
+				EStrokeColor::Green,
+				EStrokeColor::Blue
+			};
+			for (EStrokeColor Color : Priority)
+			{
+				if ((Mask & uint8(1u << uint8(Color))) != 0)
+				{
+					return Color;
+				}
+			}
+			return EStrokeColor::None;
+		};
+
+		TArray<FIntPoint> EndpointsBefore;
+		SkelGraph::FindEndpoints(Work.GetData(), Width, Height, EndpointsBefore);
+		const int32 E = EndpointsBefore.Num();
+		TArray<FVector2D> EndpointForward;
+		TArray<TSet<int32>> EndpointIncidentPixels;
+		TArray<EStrokeColor> EndpointColors;
+		EndpointForward.Init(FVector2D::ZeroVector, E);
+		EndpointIncidentPixels.SetNum(E);
+		EndpointColors.Init(EStrokeColor::Black, E);
 		for (int32 i = 0; i < E; ++i)
 		{
-			const int32 j = NearestJ[i];
-			if (j < 0 || Used[i] || Used[j])
+			TArray<int32> IncidentPixels;
+			EndpointForward[i] = SkelGraph::EndpointOutwardDirection(
+				Work.GetData(),
+				Width,
+				Height,
+				EndpointsBefore[i],
+				EndpointDirectionTracePixels,
+				&IncidentPixels);
+			for (int32 Idx : IncidentPixels)
 			{
-				continue;
+				EndpointIncidentPixels[i].Add(Idx);
 			}
-			if (NearestJ[j] != i) // require mutual nearest
+
+			int32 ColorCounts[5] = { 0, 0, 0, 0, 0 };
+			for (int32 Idx : IncidentPixels)
 			{
-				continue;
+				const EStrokeColor Color = SampleSourceColorClass(FIntPoint(Idx % Width, Idx / Width));
+				if (Color != EStrokeColor::None)
+				{
+					++ColorCounts[uint8(Color)];
+				}
 			}
-			FConn Conn;
-			Conn.Source = TEXT("strict_endpoint_to_endpoint");
-			Conn.P0 = EndpointsBefore[i];
-			Conn.P1 = EndpointsBefore[j];
-			FVector2D ToTarget(
-				double(Conn.P1.X - Conn.P0.X),
-				double(Conn.P1.Y - Conn.P0.Y));
-			ToTarget.Normalize();
-			Conn.SourceAngleDegrees = AngleDegreesFromDot(
-				FVector2D::DotProduct(EndpointForward[i], ToTarget));
-			Conn.TargetAngleDegrees = AngleDegreesFromDot(
-				FVector2D::DotProduct(EndpointForward[j], -ToTarget));
-			Connections.Add(MoveTemp(Conn));
-			Used[i] = true;
-			Used[j] = true;
+			int32 BestColor = int32(EStrokeColor::Black);
+			int32 BestCount = 0;
+			for (int32 Color = 1; Color <= 4; ++Color)
+			{
+				if (ColorCounts[Color] > BestCount)
+				{
+					BestCount = ColorCounts[Color];
+					BestColor = Color;
+				}
+			}
+			EndpointColors[i] = EStrokeColor(BestColor);
 		}
 
-		// Remaining endpoints may face the middle of a nearby skeleton segment rather
-		// than another degree-1 pixel. Project them onto the closest segment in the
-		// endpoint's outward half-plane, matching the Step 9 connector strategy.
-		for (int32 i = 0; i < E; ++i)
+		TArray<bool> Used;
+		Used.Init(false, E);
+		TArray<int32> NearestJ;
+		TArray<double> NearestD2;
+		NearestJ.Init(INDEX_NONE, E);
+		NearestD2.Init(TNumericLimits<double>::Max(), E);
+		if (GapTol > 0.0f)
 		{
-			if (Used[i])
+			for (int32 i = 0; i < E; ++i)
 			{
-				continue;
-			}
-
-			const FIntPoint Endpoint = EndpointsBefore[i];
-			const FVector2D Forward = EndpointForward[i];
-			if (Forward.IsNearlyZero())
-			{
-				continue;
-			}
-
-			double BestD2 = TNumericLimits<double>::Max();
-			FVector2D BestPoint = FVector2D::ZeroVector;
-			const int32 SearchRadius = FMath::CeilToInt(GapTol);
-			const int32 MinX = FMath::Max(0, Endpoint.X - SearchRadius);
-			const int32 MaxX = FMath::Min(Width - 1, Endpoint.X + SearchRadius);
-			const int32 MinY = FMath::Max(0, Endpoint.Y - SearchRadius);
-			const int32 MaxY = FMath::Min(Height - 1, Endpoint.Y + SearchRadius);
-
-			for (int32 y = MinY; y <= MaxY; ++y)
-			{
-				for (int32 x = MinX; x <= MaxX; ++x)
+				for (int32 j = 0; j < E; ++j)
 				{
-					if (Work[y * Width + x] == 0)
+					if (i == j || EndpointForward[i].IsNearlyZero() || EndpointForward[j].IsNearlyZero())
 					{
 						continue;
 					}
-
-					int32 SegmentNeighbors[8];
-					const int32 SegmentDegree = SkelGraph::SafeNeighbors(
-						Work.GetData(), Width, Height, x, y, SegmentNeighbors);
-					const int32 AIdx = y * Width + x;
-					for (int32 n = 0; n < SegmentDegree; ++n)
+					const FVector2D Delta(
+						double(EndpointsBefore[j].X - EndpointsBefore[i].X),
+						double(EndpointsBefore[j].Y - EndpointsBefore[i].Y));
+					const double D2 = Delta.SizeSquared();
+					if (D2 <= 1e-8 || D2 > Tol2)
 					{
-						const int32 BIdx = SegmentNeighbors[n];
-						if (BIdx <= AIdx || AIdx == Endpoint.Y * Width + Endpoint.X ||
-							BIdx == Endpoint.Y * Width + Endpoint.X)
-						{
-							continue;
-						}
-
-						const FVector2D SegmentStart{ double(x), double(y) };
-						const FVector2D SegmentEnd{ double(BIdx % Width), double(BIdx / Width) };
-						const FVector2D Segment = SegmentEnd - SegmentStart;
-						const double SegmentLen2 = Segment.SizeSquared();
-						if (SegmentLen2 <= 1e-8)
-						{
-							continue;
-						}
-
-						const FVector2D EndpointPos{ double(Endpoint.X), double(Endpoint.Y) };
-						const double T = FMath::Clamp(
-							FVector2D::DotProduct(EndpointPos - SegmentStart, Segment) / SegmentLen2,
-							0.0, 1.0);
-						const FVector2D CandidatePoint = SegmentStart + Segment * T;
-						const FVector2D Delta = CandidatePoint - EndpointPos;
-						const double D2 = Delta.SizeSquared();
-						if (D2 <= 1.0 || D2 > Tol2 || D2 >= BestD2)
-						{
-							continue;
-						}
-						FVector2D TargetDirection = Delta;
-						if (!TargetDirection.Normalize() ||
-							FVector2D::DotProduct(TargetDirection, Forward) < EndpointForwardCosThreshold)
-						{
-							continue;
-						}
-
-						BestD2 = D2;
-						BestPoint = CandidatePoint;
+						continue;
+					}
+					const FVector2D ToTarget = Delta.GetSafeNormal();
+					if (FVector2D::DotProduct(EndpointForward[i], ToTarget) < EndpointForwardCosThreshold ||
+						FVector2D::DotProduct(EndpointForward[j], -ToTarget) < EndpointForwardCosThreshold)
+					{
+						continue;
+					}
+					if (D2 < NearestD2[i])
+					{
+						NearestD2[i] = D2;
+						NearestJ[i] = j;
 					}
 				}
 			}
 
-			if (BestD2 == TNumericLimits<double>::Max())
+			for (int32 i = 0; i < E; ++i)
 			{
-				continue;
+				const int32 j = NearestJ[i];
+				if (j < 0 || Used[i] || Used[j] || NearestJ[j] != i)
+				{
+					continue;
+				}
+				FConn Conn;
+				Conn.Source = TEXT("strict_endpoint_to_endpoint");
+				Conn.Color = EndpointColors[i];
+				Conn.P0 = EndpointsBefore[i];
+				Conn.P1 = EndpointsBefore[j];
+				const FVector2D ToTarget = (
+					FVector2D(Conn.P1.X, Conn.P1.Y) -
+					FVector2D(Conn.P0.X, Conn.P0.Y)).GetSafeNormal();
+				Conn.SourceAngleDegrees = AngleDegreesFromDot(
+					FVector2D::DotProduct(EndpointForward[i], ToTarget));
+				Conn.TargetAngleDegrees = AngleDegreesFromDot(
+					FVector2D::DotProduct(EndpointForward[j], -ToTarget));
+				Connections.Add(MoveTemp(Conn));
+				Used[i] = true;
+				Used[j] = true;
 			}
 
-			FConn Conn;
-			Conn.Source = TEXT("strict_endpoint_to_segment");
-			Conn.P0 = Endpoint;
-			Conn.P1 = FIntPoint(FMath::RoundToInt(BestPoint.X), FMath::RoundToInt(BestPoint.Y));
-			Conn.GapLength = FMath::Sqrt(BestD2);
-			FVector2D ToTarget = BestPoint - FVector2D(double(Endpoint.X), double(Endpoint.Y));
-			ToTarget.Normalize();
-			Conn.SourceAngleDegrees = AngleDegreesFromDot(
-				FVector2D::DotProduct(Forward, ToTarget));
-			Conn.TargetType = TEXT("segment");
-			Connections.Add(MoveTemp(Conn));
-			Used[i] = true;
+			for (int32 i = 0; i < E; ++i)
+			{
+				if (Used[i] || EndpointForward[i].IsNearlyZero())
+				{
+					continue;
+				}
+
+				const FIntPoint Endpoint = EndpointsBefore[i];
+				const FVector2D EndpointPos(Endpoint.X, Endpoint.Y);
+				double BestD2 = TNumericLimits<double>::Max();
+				FVector2D BestPoint = FVector2D::ZeroVector;
+				const int32 SearchRadius = FMath::CeilToInt(GapTol);
+				const int32 MinX = FMath::Max(0, Endpoint.X - SearchRadius);
+				const int32 MaxX = FMath::Min(Width - 1, Endpoint.X + SearchRadius);
+				const int32 MinY = FMath::Max(0, Endpoint.Y - SearchRadius);
+				const int32 MaxY = FMath::Min(Height - 1, Endpoint.Y + SearchRadius);
+				for (int32 y = MinY; y <= MaxY; ++y)
+				{
+					for (int32 x = MinX; x <= MaxX; ++x)
+					{
+						const int32 AIdx = y * Width + x;
+						if (Work[AIdx] == 0)
+						{
+							continue;
+						}
+						int32 SegmentNeighbors[8];
+						const int32 SegmentDegree = SkelGraph::SafeNeighbors(
+							Work.GetData(), Width, Height, x, y, SegmentNeighbors);
+						for (int32 n = 0; n < SegmentDegree; ++n)
+						{
+							const int32 BIdx = SegmentNeighbors[n];
+							if (BIdx <= AIdx ||
+								EndpointIncidentPixels[i].Contains(AIdx) ||
+								EndpointIncidentPixels[i].Contains(BIdx))
+							{
+								continue;
+							}
+							const FVector2D SegmentStart(x, y);
+							const FVector2D SegmentEnd(BIdx % Width, BIdx / Width);
+							const FVector2D Segment = SegmentEnd - SegmentStart;
+							const double SegmentLen2 = Segment.SizeSquared();
+							if (SegmentLen2 <= 1e-8)
+							{
+								continue;
+							}
+							const double T = FMath::Clamp(
+								FVector2D::DotProduct(EndpointPos - SegmentStart, Segment) / SegmentLen2,
+								0.0,
+								1.0);
+							const FVector2D Candidate = SegmentStart + Segment * T;
+							const FVector2D Delta = Candidate - EndpointPos;
+							const double D2 = Delta.SizeSquared();
+							if (D2 <= 1.0 || D2 > Tol2 || D2 >= BestD2)
+							{
+								continue;
+							}
+							const FVector2D Direction = Delta.GetSafeNormal();
+							if (Direction.IsNearlyZero() ||
+								FVector2D::DotProduct(EndpointForward[i], Direction) < EndpointForwardCosThreshold)
+							{
+								continue;
+							}
+							BestD2 = D2;
+							BestPoint = Candidate;
+						}
+					}
+				}
+
+				if (BestD2 < TNumericLimits<double>::Max())
+				{
+					FConn Conn;
+					Conn.Source = TEXT("strict_endpoint_to_segment");
+					Conn.Color = EndpointColors[i];
+					Conn.P0 = Endpoint;
+					Conn.P1 = FIntPoint(FMath::RoundToInt(BestPoint.X), FMath::RoundToInt(BestPoint.Y));
+					Conn.GapLength = FMath::Sqrt(BestD2);
+					Conn.SourceAngleDegrees = AngleDegreesFromDot(
+						FVector2D::DotProduct(
+							EndpointForward[i],
+							(BestPoint - EndpointPos).GetSafeNormal()));
+					Conn.TargetType = TEXT("segment");
+					Connections.Add(MoveTemp(Conn));
+					Used[i] = true;
+				}
+			}
+
+			for (int32 i = 0; i < E; ++i)
+			{
+				if (Used[i] || EndpointForward[i].IsNearlyZero())
+				{
+					continue;
+				}
+				int32 BestJ = INDEX_NONE;
+				double BestD2 = TNumericLimits<double>::Max();
+				double BestSourceAngle = -1.0;
+				double BestTargetAngle = -1.0;
+				for (int32 j = 0; j < E; ++j)
+				{
+					if (i == j || Used[j] || EndpointForward[j].IsNearlyZero())
+					{
+						continue;
+					}
+					const FVector2D Delta(
+						double(EndpointsBefore[j].X - EndpointsBefore[i].X),
+						double(EndpointsBefore[j].Y - EndpointsBefore[i].Y));
+					const double D2 = Delta.SizeSquared();
+					if (D2 <= 1e-8 || D2 > Tol2 || D2 >= BestD2)
+					{
+						continue;
+					}
+					const FVector2D ToTarget = Delta.GetSafeNormal();
+					const double SourceDot = FVector2D::DotProduct(EndpointForward[i], ToTarget);
+					const double TargetDot = FVector2D::DotProduct(EndpointForward[j], -ToTarget);
+					if (SourceDot < EndpointForwardCosThreshold ||
+						TargetDot < RelaxedTargetCosThreshold)
+					{
+						continue;
+					}
+					BestJ = j;
+					BestD2 = D2;
+					BestSourceAngle = AngleDegreesFromDot(SourceDot);
+					BestTargetAngle = AngleDegreesFromDot(TargetDot);
+				}
+				if (BestJ >= 0)
+				{
+					FConn Conn;
+					Conn.Source = TEXT("relaxed_endpoint_to_endpoint");
+					Conn.Color = EndpointColors[i];
+					Conn.P0 = EndpointsBefore[i];
+					Conn.P1 = EndpointsBefore[BestJ];
+					Conn.GapLength = FMath::Sqrt(BestD2);
+					Conn.SourceAngleDegrees = BestSourceAngle;
+					Conn.TargetAngleDegrees = BestTargetAngle;
+					Connections.Add(MoveTemp(Conn));
+					Used[i] = true;
+					Used[BestJ] = true;
+				}
+			}
 		}
 
-		// Final directed endpoint fallback. The source must still face the target
-		// within 60 degrees, while the target may accept an approach up to 100 degrees.
-		// Endpoints are visited in the stable FindEndpoints scan order. A successful
-		// pair consumes both endpoints immediately; an unmatched source remains
-		// available as a target for later sources.
-		for (int32 i = 0; i < E; ++i)
-		{
-			if (Used[i] || EndpointForward[i].IsNearlyZero())
-			{
-				continue;
-			}
-
-			int32 BestJ = -1;
-			double BestD2 = TNumericLimits<double>::Max();
-			double BestSourceAngle = -1.0;
-			double BestTargetAngle = -1.0;
-			for (int32 j = 0; j < E; ++j)
-			{
-				if (i == j || Used[j] || EndpointForward[j].IsNearlyZero())
-				{
-					continue;
-				}
-
-				const double Dx = double(EndpointsBefore[j].X - EndpointsBefore[i].X);
-				const double Dy = double(EndpointsBefore[j].Y - EndpointsBefore[i].Y);
-				const double D2 = Dx * Dx + Dy * Dy;
-				if (D2 <= 1e-8 || D2 > Tol2 || D2 >= BestD2)
-				{
-					continue;
-				}
-
-				FVector2D ToTarget(Dx, Dy);
-				ToTarget.Normalize();
-				const double SourceDot = FVector2D::DotProduct(EndpointForward[i], ToTarget);
-				const double TargetDot = FVector2D::DotProduct(EndpointForward[j], -ToTarget);
-				if (SourceDot < EndpointForwardCosThreshold ||
-					TargetDot < RelaxedTargetCosThreshold)
-				{
-					continue;
-				}
-
-				BestJ = j;
-				BestD2 = D2;
-				BestSourceAngle = AngleDegreesFromDot(SourceDot);
-				BestTargetAngle = AngleDegreesFromDot(TargetDot);
-			}
-
-			if (BestJ < 0)
-			{
-				continue;
-			}
-
-			FConn Conn;
-			Conn.Source = TEXT("relaxed_endpoint_to_endpoint");
-			Conn.P0 = EndpointsBefore[i];
-			Conn.P1 = EndpointsBefore[BestJ];
-			Conn.GapLength = FMath::Sqrt(BestD2);
-			Conn.SourceAngleDegrees = BestSourceAngle;
-			Conn.TargetAngleDegrees = BestTargetAngle;
-			Connections.Add(MoveTemp(Conn));
-			Used[i] = true;
-			Used[BestJ] = true;
-		}
-
-		// connected = work + drawn 1px connection lines.
 		TArray<uint8> Connected = Work;
-		for (FConn& C : Connections)
+		TArray<uint8> ConnectorColorMask;
+		ConnectorColorMask.Init(0, N);
+		TArray<int32> ConnectorOwnerCount;
+		ConnectorOwnerCount.Init(0, N);
+		TArray<int32> RedBlackOwnerCount;
+		RedBlackOwnerCount.Init(0, N);
+		TSet<FString> ConnectorKeys;
+		auto RasterizeConnector = [&](FConn& C)
 		{
 			if (C.GapLength <= 0.0)
 			{
@@ -944,6 +1082,7 @@ namespace FromLZImageOps
 					FVector2D(C.P1.X, C.P1.Y));
 			}
 			SkelGraph::LinePoints(C.P0, C.P1, C.LinePts);
+			ConnectorKeys.Add(ConnectorKey(C.P0, C.P1));
 			for (const FIntPoint& P : C.LinePts)
 			{
 				if (P.X >= 0 && P.X < Width && P.Y >= 0 && P.Y < Height)
@@ -952,102 +1091,190 @@ namespace FromLZImageOps
 					if (Work[Idx] == 0)
 					{
 						C.AddedPts.Add(P);
+						ConnectorColorMask[Idx] |= ColorBit(C.Color);
+						++ConnectorOwnerCount[Idx];
+						if (C.Color == EStrokeColor::Red || C.Color == EStrokeColor::Black)
+						{
+							++RedBlackOwnerCount[Idx];
+						}
 					}
 					Connected[Idx] = 255;
 				}
 			}
+		};
+		for (FConn& C : Connections)
+		{
+			RasterizeConnector(C);
 		}
 		OutConnected = Connected;
 
-		const float LoopThresh = FMath::Max(0.0f, SmallLoopBboxAreaThresh);
-
-		auto SampleSourceColorClass = [&](const FIntPoint& P) -> EStrokeColor
+		auto EffectiveColorAt = [&](const FIntPoint& P) -> EStrokeColor
 		{
-			if (!bHasSourceColorMap)
+			const int32 Idx = P.Y * Width + P.X;
+			if (Work[Idx] == 0 && ConnectorColorMask[Idx] != 0)
 			{
-				return EStrokeColor::None;
+				return PreferredColorFromMask(ConnectorColorMask[Idx]);
 			}
-
-			int32 Counts[5] = { 0, 0, 0, 0, 0 };
-			const int32 MinY = FMath::Max(0, P.Y - SampleRadius);
-			const int32 MaxY = FMath::Min(Height - 1, P.Y + SampleRadius);
-			const int32 MinX = FMath::Max(0, P.X - SampleRadius);
-			const int32 MaxX = FMath::Min(Width - 1, P.X + SampleRadius);
-			for (int32 yy = MinY; yy <= MaxY; ++yy)
-			{
-				for (int32 xx = MinX; xx <= MaxX; ++xx)
-				{
-					const uint8 C = SourceColorMap[yy * Width + xx];
-					if (C > uint8(EStrokeColor::None) && C <= uint8(EStrokeColor::Blue))
-					{
-						++Counts[C];
-					}
-				}
-			}
-
-			int32 Best = int32(EStrokeColor::None);
-			int32 BestCount = 0;
-			for (int32 c = 1; c <= 4; ++c)
-			{
-				if (Counts[c] > BestCount)
-				{
-					BestCount = Counts[c];
-					Best = c;
-				}
-			}
-			return EStrokeColor(Best);
-		};
-
-		auto LoopBboxArea = [](const TArray<FIntPoint>& Path, const TArray<FIntPoint>& AddedPts) -> int64
-		{
-			if (Path.Num() == 0 && AddedPts.Num() == 0)
-			{
-				return -1;
-			}
-			int32 MinX = MAX_int32, MinY = MAX_int32, MaxX = MIN_int32, MaxY = MIN_int32;
-			auto Acc = [&](const FIntPoint& P)
-			{
-				MinX = FMath::Min(MinX, P.X);
-				MinY = FMath::Min(MinY, P.Y);
-				MaxX = FMath::Max(MaxX, P.X);
-				MaxY = FMath::Max(MaxY, P.Y);
-			};
-			for (const FIntPoint& P : Path) { Acc(P); }
-			for (const FIntPoint& P : AddedPts) { Acc(P); }
-			return int64(MaxX - MinX + 1) * int64(MaxY - MinY + 1);
+			return SampleSourceColorClass(P);
 		};
 
 		TArray<uint8> RedBlackCandidate;
 		RedBlackCandidate.Init(0, N);
-		TArray<uint8> RedBlackDebugKind; // 0 background, 1 source black, 2 source/connector red
+		TArray<uint8> RedBlackDebugKind;
 		RedBlackDebugKind.Init(0, N);
-		if (bHasSourceColorMap)
+		auto RebuildRedBlackCandidate = [&]()
 		{
-			for (int32 y = 0; y < Height; ++y)
+			for (int32 Idx = 0; Idx < N; ++Idx)
 			{
-				for (int32 x = 0; x < Width; ++x)
+				RedBlackCandidate[Idx] = 0;
+				RedBlackDebugKind[Idx] = 0;
+				if (Connected[Idx] == 0)
 				{
-					const int32 Idx = y * Width + x;
-					if (Work[Idx] == 0)
-					{
-						continue;
-					}
-					const EStrokeColor C = SampleSourceColorClass(FIntPoint(x, y));
-					if (C == EStrokeColor::Red || C == EStrokeColor::Black)
-					{
-						RedBlackCandidate[Idx] = 255;
-						RedBlackDebugKind[Idx] = (C == EStrokeColor::Black) ? 1 : 2;
-					}
+					continue;
+				}
+				const FIntPoint P(Idx % Width, Idx / Width);
+				const EStrokeColor Color = EffectiveColorAt(P);
+				if (Color == EStrokeColor::Red || Color == EStrokeColor::Black)
+				{
+					RedBlackCandidate[Idx] = 255;
+					RedBlackDebugKind[Idx] = Color == EStrokeColor::Black ? 1 : 2;
 				}
 			}
-		}
-		for (const FConn& C : Connections)
+		};
+		RebuildRedBlackCandidate();
+
+		auto SaveRedBlackDebug = [&](const FString& Path)
 		{
-			if (C.Source == TEXT("strict_endpoint_to_segment"))
+			if (Path.IsEmpty())
 			{
-				continue;
+				return;
 			}
-			for (const FIntPoint& P : C.AddedPts)
+			TArray<uint8> RGBA;
+			RGBA.Init(255, N * 4);
+			for (int32 i = 0; i < N; ++i)
+			{
+				const int32 Off = i * 4;
+				if (RedBlackDebugKind[i] == 1)
+				{
+					RGBA[Off + 0] = 0;
+					RGBA[Off + 1] = 0;
+					RGBA[Off + 2] = 0;
+				}
+				else if (RedBlackDebugKind[i] == 2)
+				{
+					RGBA[Off + 0] = 220;
+					RGBA[Off + 1] = 20;
+					RGBA[Off + 2] = 60;
+				}
+				RGBA[Off + 3] = 255;
+			}
+			IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+			TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
+			if (IW.IsValid())
+			{
+				IW->SetRaw(RGBA.GetData(), RGBA.Num(), Width, Height, ERGBFormat::RGBA, 8);
+				const TArray64<uint8>& Compressed = IW->GetCompressed();
+				FFileHelper::SaveArrayToFile(
+					TArrayView<const uint8>(Compressed.GetData(), static_cast<int32>(Compressed.Num())),
+					*Path);
+			}
+		};
+		SaveRedBlackDebug(RedBlackConnectorsDebugPngPath);
+		const TArray<uint8> RedBlackSearchSnapshot = RedBlackCandidate;
+
+		struct FRbEndpoint
+		{
+			FIntPoint Pos;
+			FVector2D Forward = FVector2D::ZeroVector;
+			EStrokeColor Color = EStrokeColor::None;
+			TSet<int32> IncidentPixels;
+		};
+		TArray<FIntPoint> RbEndpointPoints;
+		SkelGraph::FindEndpoints(RedBlackCandidate.GetData(), Width, Height, RbEndpointPoints);
+		TArray<FRbEndpoint> RbEndpoints;
+		RbEndpoints.SetNum(RbEndpointPoints.Num());
+		for (int32 i = 0; i < RbEndpointPoints.Num(); ++i)
+		{
+			FRbEndpoint& Endpoint = RbEndpoints[i];
+			Endpoint.Pos = RbEndpointPoints[i];
+			TArray<int32> IncidentPixels;
+			Endpoint.Forward = SkelGraph::EndpointOutwardDirection(
+				RedBlackSearchSnapshot.GetData(),
+				Width,
+				Height,
+				Endpoint.Pos,
+				EndpointDirectionTracePixels,
+				&IncidentPixels);
+			int32 RedCount = 0;
+			int32 BlackCount = 0;
+			for (int32 Idx : IncidentPixels)
+			{
+				Endpoint.IncidentPixels.Add(Idx);
+				const EStrokeColor Color = EffectiveColorAt(FIntPoint(Idx % Width, Idx / Width));
+				RedCount += Color == EStrokeColor::Red ? 1 : 0;
+				BlackCount += Color == EStrokeColor::Black ? 1 : 0;
+			}
+			Endpoint.Color = RedCount > BlackCount ? EStrokeColor::Red : EStrokeColor::Black;
+		}
+
+		struct FRbProposal
+		{
+			int32 SourceEndpoint = INDEX_NONE;
+			int32 TargetEndpoint = INDEX_NONE;
+			FIntPoint TargetPoint;
+			double D2 = TNumericLimits<double>::Max();
+			double SourceAngle = -1.0;
+			double TargetAngle = -1.0;
+			FString Source;
+			FString TargetType = TEXT("endpoint");
+		};
+		auto ProposalLess = [](const FRbProposal& A, const FRbProposal& B)
+		{
+			if (!FMath::IsNearlyEqual(A.D2, B.D2, 1e-8))
+			{
+				return A.D2 < B.D2;
+			}
+			if (A.SourceEndpoint != B.SourceEndpoint)
+			{
+				return A.SourceEndpoint < B.SourceEndpoint;
+			}
+			if (A.TargetEndpoint != B.TargetEndpoint)
+			{
+				return A.TargetEndpoint < B.TargetEndpoint;
+			}
+			if (A.TargetPoint.Y != B.TargetPoint.Y)
+			{
+				return A.TargetPoint.Y < B.TargetPoint.Y;
+			}
+			return A.TargetPoint.X < B.TargetPoint.X;
+		};
+
+		TArray<bool> RbUsed;
+		RbUsed.Init(false, RbEndpoints.Num());
+		auto AppendRbProposal = [&](const FRbProposal& Proposal)
+		{
+			if (!RbEndpoints.IsValidIndex(Proposal.SourceEndpoint))
+			{
+				return false;
+			}
+			const FIntPoint P0 = RbEndpoints[Proposal.SourceEndpoint].Pos;
+			const FIntPoint P1 = Proposal.TargetPoint;
+			const FString Key = ConnectorKey(P0, P1);
+			if (P0 == P1 || ConnectorKeys.Contains(Key))
+			{
+				return false;
+			}
+			FConn Conn;
+			Conn.Source = Proposal.Source;
+			Conn.Color = EStrokeColor::Red;
+			Conn.P0 = P0;
+			Conn.P1 = P1;
+			Conn.GapLength = FMath::Sqrt(Proposal.D2);
+			Conn.SourceAngleDegrees = Proposal.SourceAngle;
+			Conn.TargetAngleDegrees = Proposal.TargetAngle;
+			Conn.TargetType = Proposal.TargetType;
+			RasterizeConnector(Conn);
+			for (const FIntPoint& P : Conn.LinePts)
 			{
 				if (P.X >= 0 && P.X < Width && P.Y >= 0 && P.Y < Height)
 				{
@@ -1056,189 +1283,295 @@ namespace FromLZImageOps
 					RedBlackDebugKind[Idx] = 2;
 				}
 			}
-		}
-
-		if (!RedBlackConnectorsDebugPngPath.IsEmpty())
-		{
-			TArray<uint8> RGBA;
-			RGBA.Init(255, N * 4);
-			for (int32 i = 0; i < N; ++i)
-			{
-				const int32 Off = i * 4;
-				if (RedBlackDebugKind[i] == 1)
-				{
-					RGBA[Off + 0] = 0;
-					RGBA[Off + 1] = 0;
-					RGBA[Off + 2] = 0;
-				}
-				else if (RedBlackDebugKind[i] == 2)
-				{
-					RGBA[Off + 0] = 220;
-					RGBA[Off + 1] = 20;
-					RGBA[Off + 2] = 60;
-				}
-				RGBA[Off + 3] = 255;
-			}
-			IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-			TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
-			if (IW.IsValid())
-			{
-				IW->SetRaw(RGBA.GetData(), RGBA.Num(), Width, Height, ERGBFormat::RGBA, 8);
-				const TArray64<uint8>& C = IW->GetCompressed();
-				FFileHelper::SaveArrayToFile(TArrayView<const uint8>(C.GetData(), static_cast<int32>(C.Num())), *RedBlackConnectorsDebugPngPath);
-			}
-		}
-
-		// Re-run the endpoint repair on the red/black candidate graph. These
-		// second-pass connectors are promoted into the same connector list, so they
-		// participate in the red/black protection check and the full-skeleton prune.
-		TArray<FIntPoint> RbEndpoints;
-		SkelGraph::FindEndpoints(RedBlackCandidate.GetData(), Width, Height, RbEndpoints);
-		const int32 RbE = RbEndpoints.Num();
-		TArray<int32> RbNearestJ;
-		TArray<double> RbNearestD2;
-		RbNearestJ.Init(-1, RbE);
-		RbNearestD2.Init(TNumericLimits<double>::Max(), RbE);
-		for (int32 i = 0; i < RbE; ++i)
-		{
-			for (int32 j = 0; j < RbE; ++j)
-			{
-				if (i == j)
-				{
-					continue;
-				}
-				const double ddx = double(RbEndpoints[i].X - RbEndpoints[j].X);
-				const double ddy = double(RbEndpoints[i].Y - RbEndpoints[j].Y);
-				const double D2 = ddx * ddx + ddy * ddy;
-				if (D2 > Tol2)
-				{
-					continue;
-				}
-				if (D2 < RbNearestD2[i])
-				{
-					RbNearestD2[i] = D2;
-					RbNearestJ[i] = j;
-				}
-			}
-		}
-
-		TArray<bool> RbUsed;
-		RbUsed.Init(false, RbE);
-		for (int32 i = 0; i < RbE; ++i)
-		{
-			const int32 j = RbNearestJ[i];
-			if (j < 0 || RbUsed[i] || RbUsed[j])
-			{
-				continue;
-			}
-			if (RbNearestJ[j] != i)
-			{
-				continue;
-			}
-
-			FConn Conn;
-			Conn.Source = TEXT("red_black_reconnect");
-			Conn.P0 = RbEndpoints[i];
-			Conn.P1 = RbEndpoints[j];
-			SkelGraph::LinePoints(Conn.P0, Conn.P1, Conn.LinePts);
-
-			bool bAddsRedBlackPixel = false;
-			for (const FIntPoint& P : Conn.LinePts)
-			{
-				if (P.X < 0 || P.X >= Width || P.Y < 0 || P.Y >= Height)
-				{
-					continue;
-				}
-				const int32 Idx = P.Y * Width + P.X;
-				if (RedBlackCandidate[Idx] == 0)
-				{
-					bAddsRedBlackPixel = true;
-				}
-				if (Connected[Idx] == 0)
-				{
-					Conn.AddedPts.Add(P);
-				}
-			}
-
-			if (!bAddsRedBlackPixel && Conn.AddedPts.Num() == 0)
-			{
-				RbUsed[i] = true;
-				RbUsed[j] = true;
-				continue;
-			}
-
-			for (const FIntPoint& P : Conn.LinePts)
-			{
-				if (P.X < 0 || P.X >= Width || P.Y < 0 || P.Y >= Height)
-				{
-					continue;
-				}
-				const int32 Idx = P.Y * Width + P.X;
-				RedBlackCandidate[Idx] = 255;
-				RedBlackDebugKind[Idx] = 2;
-				Connected[Idx] = 255;
-			}
 			Connections.Add(MoveTemp(Conn));
-			RbUsed[i] = true;
-			RbUsed[j] = true;
+			return true;
+		};
+
+		if (GapTol > 0.0f)
+		{
+			TArray<FRbProposal> StrictEndpointProposals;
+			TSet<FString> StrictEndpointPairKeys;
+			for (int32 i = 0; i < RbEndpoints.Num(); ++i)
+			{
+				if (RbEndpoints[i].Color != EStrokeColor::Red ||
+					RbEndpoints[i].Forward.IsNearlyZero())
+				{
+					continue;
+				}
+				for (int32 j = 0; j < RbEndpoints.Num(); ++j)
+				{
+					if (i == j || RbEndpoints[j].Forward.IsNearlyZero())
+					{
+						continue;
+					}
+					const FVector2D Delta(
+						double(RbEndpoints[j].Pos.X - RbEndpoints[i].Pos.X),
+						double(RbEndpoints[j].Pos.Y - RbEndpoints[i].Pos.Y));
+					const double D2 = Delta.SizeSquared();
+					if (D2 <= 1e-8 || D2 > Tol2)
+					{
+						continue;
+					}
+					const FVector2D Direction = Delta.GetSafeNormal();
+					const double SourceDot = FVector2D::DotProduct(RbEndpoints[i].Forward, Direction);
+					const double TargetDot = FVector2D::DotProduct(RbEndpoints[j].Forward, -Direction);
+					if (SourceDot < EndpointForwardCosThreshold ||
+						TargetDot < EndpointForwardCosThreshold)
+					{
+						continue;
+					}
+					const FString PairKey = ConnectorKey(RbEndpoints[i].Pos, RbEndpoints[j].Pos);
+					if (StrictEndpointPairKeys.Contains(PairKey))
+					{
+						continue;
+					}
+					StrictEndpointPairKeys.Add(PairKey);
+					FRbProposal Proposal;
+					Proposal.SourceEndpoint = i;
+					Proposal.TargetEndpoint = j;
+					Proposal.TargetPoint = RbEndpoints[j].Pos;
+					Proposal.D2 = D2;
+					Proposal.SourceAngle = AngleDegreesFromDot(SourceDot);
+					Proposal.TargetAngle = AngleDegreesFromDot(TargetDot);
+					Proposal.Source = TEXT("red_reconnect_strict_endpoint_to_endpoint");
+					StrictEndpointProposals.Add(MoveTemp(Proposal));
+				}
+			}
+			StrictEndpointProposals.Sort(ProposalLess);
+			for (const FRbProposal& Proposal : StrictEndpointProposals)
+			{
+				if (RbUsed[Proposal.SourceEndpoint] || RbUsed[Proposal.TargetEndpoint])
+				{
+					continue;
+				}
+				if (AppendRbProposal(Proposal))
+				{
+					RbUsed[Proposal.SourceEndpoint] = true;
+					RbUsed[Proposal.TargetEndpoint] = true;
+				}
+			}
+
+			for (int32 i = 0; i < RbEndpoints.Num(); ++i)
+			{
+				if (RbUsed[i] ||
+					RbEndpoints[i].Color != EStrokeColor::Red ||
+					RbEndpoints[i].Forward.IsNearlyZero())
+				{
+					continue;
+				}
+				const FVector2D SourcePos(RbEndpoints[i].Pos.X, RbEndpoints[i].Pos.Y);
+				FRbProposal Best;
+				Best.SourceEndpoint = i;
+				Best.Source = TEXT("red_reconnect_strict_endpoint_to_segment");
+				Best.TargetType = TEXT("segment");
+
+				for (int32 y = 0; y < Height; ++y)
+				{
+					for (int32 x = 0; x < Width; ++x)
+					{
+						const int32 AIdx = y * Width + x;
+						if (RedBlackSearchSnapshot[AIdx] == 0)
+						{
+							continue;
+						}
+						int32 Neighbors[8];
+						const int32 Degree = SkelGraph::SafeNeighbors(
+							RedBlackSearchSnapshot.GetData(), Width, Height, x, y, Neighbors);
+						if (SkelGraph::NodeType(RedBlackSearchSnapshot.GetData(), Width, Height, x, y) == SkelGraph::ENode::Branch)
+						{
+							const FVector2D Delta = FVector2D(x, y) - SourcePos;
+							const double D2 = Delta.SizeSquared();
+							if (D2 > 1.0 && D2 <= Tol2 && D2 < Best.D2)
+							{
+								const FVector2D Direction = Delta.GetSafeNormal();
+								const double SourceDot = FVector2D::DotProduct(RbEndpoints[i].Forward, Direction);
+								if (SourceDot >= EndpointForwardCosThreshold)
+								{
+									Best.TargetPoint = FIntPoint(x, y);
+									Best.D2 = D2;
+									Best.SourceAngle = AngleDegreesFromDot(SourceDot);
+									Best.TargetType = TEXT("topology_node");
+								}
+							}
+						}
+						for (int32 n = 0; n < Degree; ++n)
+						{
+							const int32 BIdx = Neighbors[n];
+							if (BIdx <= AIdx ||
+								RbEndpoints[i].IncidentPixels.Contains(AIdx) ||
+								RbEndpoints[i].IncidentPixels.Contains(BIdx))
+							{
+								continue;
+							}
+							const FVector2D A(x, y);
+							const FVector2D B(BIdx % Width, BIdx / Width);
+							const FVector2D Segment = B - A;
+							const double SegmentLen2 = Segment.SizeSquared();
+							if (SegmentLen2 <= 1e-8)
+							{
+								continue;
+							}
+							const double T = FMath::Clamp(
+								FVector2D::DotProduct(SourcePos - A, Segment) / SegmentLen2,
+								0.0,
+								1.0);
+							if (T <= 1e-6 || T >= 1.0 - 1e-6)
+							{
+								continue;
+							}
+							const FVector2D Candidate = A + Segment * T;
+							const FVector2D Delta = Candidate - SourcePos;
+							const double D2 = Delta.SizeSquared();
+							if (D2 <= 1.0 || D2 > Tol2 || D2 >= Best.D2)
+							{
+								continue;
+							}
+							const FVector2D Direction = Delta.GetSafeNormal();
+							const double SourceDot = FVector2D::DotProduct(RbEndpoints[i].Forward, Direction);
+							if (SourceDot < EndpointForwardCosThreshold)
+							{
+								continue;
+							}
+							Best.TargetPoint = FIntPoint(
+								FMath::RoundToInt(Candidate.X),
+								FMath::RoundToInt(Candidate.Y));
+							Best.D2 = D2;
+							Best.SourceAngle = AngleDegreesFromDot(SourceDot);
+							Best.TargetType = TEXT("segment");
+						}
+					}
+				}
+				if (Best.D2 < TNumericLimits<double>::Max() && AppendRbProposal(Best))
+				{
+					RbUsed[i] = true;
+				}
+			}
+
+			TArray<FRbProposal> RelaxedEndpointProposals;
+			TSet<FString> RelaxedEndpointPairKeys;
+			for (int32 i = 0; i < RbEndpoints.Num(); ++i)
+			{
+				if (RbUsed[i] ||
+					RbEndpoints[i].Color != EStrokeColor::Red ||
+					RbEndpoints[i].Forward.IsNearlyZero())
+				{
+					continue;
+				}
+				for (int32 j = 0; j < RbEndpoints.Num(); ++j)
+				{
+					if (i == j || RbUsed[j] || RbEndpoints[j].Forward.IsNearlyZero())
+					{
+						continue;
+					}
+					const FVector2D Delta(
+						double(RbEndpoints[j].Pos.X - RbEndpoints[i].Pos.X),
+						double(RbEndpoints[j].Pos.Y - RbEndpoints[i].Pos.Y));
+					const double D2 = Delta.SizeSquared();
+					if (D2 <= 1e-8 || D2 > Tol2)
+					{
+						continue;
+					}
+					const FVector2D Direction = Delta.GetSafeNormal();
+					const double SourceDot = FVector2D::DotProduct(RbEndpoints[i].Forward, Direction);
+					const double TargetDot = FVector2D::DotProduct(RbEndpoints[j].Forward, -Direction);
+					if (SourceDot < EndpointForwardCosThreshold ||
+						TargetDot < RelaxedTargetCosThreshold)
+					{
+						continue;
+					}
+					const FString PairKey = ConnectorKey(RbEndpoints[i].Pos, RbEndpoints[j].Pos);
+					if (RelaxedEndpointPairKeys.Contains(PairKey))
+					{
+						continue;
+					}
+					RelaxedEndpointPairKeys.Add(PairKey);
+					FRbProposal Proposal;
+					Proposal.SourceEndpoint = i;
+					Proposal.TargetEndpoint = j;
+					Proposal.TargetPoint = RbEndpoints[j].Pos;
+					Proposal.D2 = D2;
+					Proposal.SourceAngle = AngleDegreesFromDot(SourceDot);
+					Proposal.TargetAngle = AngleDegreesFromDot(TargetDot);
+					Proposal.Source = TEXT("red_reconnect_relaxed_endpoint_to_endpoint");
+					RelaxedEndpointProposals.Add(MoveTemp(Proposal));
+				}
+			}
+			RelaxedEndpointProposals.Sort(ProposalLess);
+			for (const FRbProposal& Proposal : RelaxedEndpointProposals)
+			{
+				if (RbUsed[Proposal.SourceEndpoint] || RbUsed[Proposal.TargetEndpoint])
+				{
+					continue;
+				}
+				if (AppendRbProposal(Proposal))
+				{
+					RbUsed[Proposal.SourceEndpoint] = true;
+					RbUsed[Proposal.TargetEndpoint] = true;
+				}
+			}
 		}
 
-		if (!RedBlackReconnectedDebugPngPath.IsEmpty())
+		OutReconnected = Connected;
+		SaveRedBlackDebug(RedBlackReconnectedDebugPngPath);
+		const float LoopThresh = FMath::Max(0.0f, SmallLoopBboxAreaThresh);
+		auto LoopBboxArea = [](const TArray<FIntPoint>& Path, const TArray<FIntPoint>& AddedPts) -> int64
 		{
-			TArray<uint8> RGBA;
-			RGBA.Init(255, N * 4);
-			for (int32 i = 0; i < N; ++i)
+			if (Path.Num() == 0 && AddedPts.Num() == 0)
 			{
-				const int32 Off = i * 4;
-				if (RedBlackDebugKind[i] == 1)
-				{
-					RGBA[Off + 0] = 0;
-					RGBA[Off + 1] = 0;
-					RGBA[Off + 2] = 0;
-				}
-				else if (RedBlackDebugKind[i] == 2)
-				{
-					RGBA[Off + 0] = 220;
-					RGBA[Off + 1] = 20;
-					RGBA[Off + 2] = 60;
-				}
-				RGBA[Off + 3] = 255;
+				return -1;
 			}
-			IImageWrapperModule& IWM = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
-			TSharedPtr<IImageWrapper> IW = IWM.CreateImageWrapper(EImageFormat::PNG);
-			if (IW.IsValid())
+			int32 MinX = MAX_int32;
+			int32 MinY = MAX_int32;
+			int32 MaxX = MIN_int32;
+			int32 MaxY = MIN_int32;
+			auto Accumulate = [&](const FIntPoint& P)
 			{
-				IW->SetRaw(RGBA.GetData(), RGBA.Num(), Width, Height, ERGBFormat::RGBA, 8);
-				const TArray64<uint8>& C = IW->GetCompressed();
-				FFileHelper::SaveArrayToFile(TArrayView<const uint8>(C.GetData(), static_cast<int32>(C.Num())), *RedBlackReconnectedDebugPngPath);
-			}
-		}
+				MinX = FMath::Min(MinX, P.X);
+				MinY = FMath::Min(MinY, P.Y);
+				MaxX = FMath::Max(MaxX, P.X);
+				MaxY = FMath::Max(MaxY, P.Y);
+			};
+			for (const FIntPoint& P : Path) { Accumulate(P); }
+			for (const FIntPoint& P : AddedPts) { Accumulate(P); }
+			return int64(MaxX - MinX + 1) * int64(MaxY - MinY + 1);
+		};
 
 		TArray<uint8> ProtectedConnectorPixels;
 		ProtectedConnectorPixels.Init(0, N);
-		if (LoopThresh > 0.0f)
+		for (FConn& C : Connections)
 		{
-			for (FConn& C : Connections)
+			if (C.Color == EStrokeColor::Green)
 			{
-				if (C.AddedPts.Num() == 0)
-				{
-					C.Decision = TEXT("skip_no_added_pixels");
-					continue;
-				}
-
-				TArray<uint8> Probe = RedBlackCandidate;
+				C.bProtectedKeep = true;
+				C.Decision = TEXT("keep_green_connector");
 				for (const FIntPoint& P : C.AddedPts)
 				{
-					Probe[P.Y * Width + P.X] = 0;
+					ProtectedConnectorPixels[P.Y * Width + P.X] = 255;
 				}
+				continue;
+			}
+			if (LoopThresh <= 0.0f ||
+				(C.Color != EStrokeColor::Red && C.Color != EStrokeColor::Black) ||
+				C.AddedPts.Num() == 0)
+			{
+				continue;
+			}
 
-				TArray<FIntPoint> RbPath;
-				C.bRbAltPath = SkelGraph::ShortestPath(Probe.GetData(), Width, Height, C.P0, C.P1, RbPath);
-				if (!C.bRbAltPath)
+			TArray<uint8> Probe = RedBlackCandidate;
+			for (const FIntPoint& P : C.AddedPts)
+			{
+				const int32 Idx = P.Y * Width + P.X;
+				if (RedBlackOwnerCount[Idx] <= 1)
 				{
-					continue;
+					Probe[Idx] = 0;
 				}
+			}
 
+			TArray<FIntPoint> RbPath;
+			C.bRbAltPath = SkelGraph::ShortestPath(
+				Probe.GetData(), Width, Height, C.P0, C.P1, RbPath);
+			if (C.bRbAltPath)
+			{
 				C.RbAltPathPixels = RbPath.Num();
 				C.RbBboxArea = LoopBboxArea(RbPath, C.AddedPts);
 				if (double(C.RbBboxArea) >= double(LoopThresh))
@@ -1252,8 +1585,8 @@ namespace FromLZImageOps
 			}
 		}
 
-		// ---- 2. prune connections that only close a small loop -----------------
 		TArray<uint8> Current = Connected;
+		TArray<int32> ActiveOwnerCount = ConnectorOwnerCount;
 		if (LoopThresh > 0.0f)
 		{
 			for (FConn& C : Connections)
@@ -1262,47 +1595,47 @@ namespace FromLZImageOps
 				{
 					C.bFullSkippedByProtection = true;
 					C.bKept = true;
-					C.Decision = TEXT("keep_red_black_large_loop_protected");
+					if (C.Color != EStrokeColor::Green)
+					{
+						C.Decision = TEXT("keep_red_black_large_loop_protected");
+					}
 					continue;
 				}
 
-				// Pixels added by this connection (background in original Work) that are
-				// currently still foreground. Pixels owned by a protected connector are
-				// never removed through another connector's full-skeleton prune.
-				TArray<FIntPoint> AddedPts;
-				for (const FIntPoint& P : C.LinePts)
+				TArray<FIntPoint> RemovedPixels;
+				for (const FIntPoint& P : C.AddedPts)
 				{
-					if (P.X < 0 || P.X >= Width || P.Y < 0 || P.Y >= Height)
-					{
-						continue;
-					}
 					const int32 Idx = P.Y * Width + P.X;
-					if (Work[Idx] == 0 && Current[Idx] > 0 && ProtectedConnectorPixels[Idx] == 0)
+					ActiveOwnerCount[Idx] = FMath::Max(0, ActiveOwnerCount[Idx] - 1);
+					if (ActiveOwnerCount[Idx] == 0 &&
+						ProtectedConnectorPixels[Idx] == 0 &&
+						Current[Idx] > 0)
 					{
-						AddedPts.Add(P);
+						Current[Idx] = 0;
+						RemovedPixels.Add(P);
 					}
 				}
-				C.FullAddedPixels = AddedPts.Num();
-				if (AddedPts.Num() == 0)
+				C.FullAddedPixels = RemovedPixels.Num();
+				if (RemovedPixels.Num() == 0)
 				{
 					C.bKept = true;
 					C.Decision = C.AddedPts.Num() == 0 ? TEXT("skip_no_added_pixels") : TEXT("keep_no_unprotected_added_pixels");
+					for (const FIntPoint& P : C.AddedPts)
+					{
+						++ActiveOwnerCount[P.Y * Width + P.X];
+					}
 					continue;
 				}
 
-				// Temporarily remove the added pixels and check for an alternate path.
-				for (const FIntPoint& P : AddedPts)
-				{
-					Current[P.Y * Width + P.X] = 0;
-				}
 				TArray<FIntPoint> Path;
 				C.bFullAltPath = SkelGraph::ShortestPath(Current.GetData(), Width, Height, C.P0, C.P1, Path);
 				if (!C.bFullAltPath)
 				{
-					// No alternate path => not a loop; restore the connection.
-					for (const FIntPoint& P : AddedPts)
+					for (const FIntPoint& P : C.AddedPts)
 					{
-						Current[P.Y * Width + P.X] = 255;
+						const int32 Idx = P.Y * Width + P.X;
+						++ActiveOwnerCount[Idx];
+						Current[Idx] = 255;
 					}
 					C.bKept = true;
 					C.Decision = TEXT("keep_no_full_alt_path");
@@ -1310,20 +1643,20 @@ namespace FromLZImageOps
 				}
 
 				C.FullAltPathPixels = Path.Num();
-				C.FullBboxArea = LoopBboxArea(Path, AddedPts);
+				C.FullBboxArea = LoopBboxArea(Path, C.AddedPts);
 
 				if (double(C.FullBboxArea) < double(LoopThresh))
 				{
-					// Small loop: keep the added pixels removed.
 					C.bKept = false;
 					C.Decision = TEXT("delete_full_small_loop");
 				}
 				else
 				{
-					// Large loop: restore the connection.
-					for (const FIntPoint& P : AddedPts)
+					for (const FIntPoint& P : C.AddedPts)
 					{
-						Current[P.Y * Width + P.X] = 255;
+						const int32 Idx = P.Y * Width + P.X;
+						++ActiveOwnerCount[Idx];
+						Current[Idx] = 255;
 					}
 					C.bKept = true;
 					C.Decision = TEXT("keep_full_large_loop");
@@ -1332,64 +1665,32 @@ namespace FromLZImageOps
 		}
 		OutSmallLoopPruned = Current;
 
-		if (!ConnectorPruneDebugJsonPath.IsEmpty())
+		auto BuildEffectiveColorMap = [&](const TArray<uint8>& Skeleton, TArray<uint8>& OutMap)
 		{
-			FString Json;
-			Json += TEXT("{\n");
-			Json += FString::Printf(TEXT("  \"gap_tol\": %.3f,\n"), GapTol);
-			Json += FString::Printf(TEXT("  \"small_loop_bbox_area_thresh\": %.3f,\n"), SmallLoopBboxAreaThresh);
-			Json += FString::Printf(TEXT("  \"red_black_source_sample_radius\": %d,\n"), SampleRadius);
-			Json += FString::Printf(TEXT("  \"connector_count\": %d,\n"), Connections.Num());
-			Json += TEXT("  \"connectors\": [\n");
-			for (int32 i = 0; i < Connections.Num(); ++i)
+			if (bHasSourceColorMap)
 			{
-				const FConn& C = Connections[i];
-				Json += TEXT("    {\n");
-				Json += FString::Printf(TEXT("      \"id\": %d,\n"), i + 1);
-				Json += FString::Printf(TEXT("      \"source\": \"%s\",\n"), *C.Source);
-				Json += FString::Printf(TEXT("      \"p0\": [%d, %d],\n"), C.P0.X, C.P0.Y);
-				Json += FString::Printf(TEXT("      \"p1\": [%d, %d],\n"), C.P1.X, C.P1.Y);
-				Json += FString::Printf(TEXT("      \"gap_length\": %.3f,\n"), C.GapLength);
-				Json += FString::Printf(TEXT("      \"target_type\": \"%s\",\n"), *C.TargetType);
-				Json += FString::Printf(TEXT("      \"source_angle_degrees\": %.3f,\n"), C.SourceAngleDegrees);
-				Json += FString::Printf(TEXT("      \"target_angle_degrees\": %.3f,\n"), C.TargetAngleDegrees);
-				Json += FString::Printf(TEXT("      \"line_pixels\": %d,\n"), C.LinePts.Num());
-				Json += FString::Printf(TEXT("      \"added_pixels\": %d,\n"), C.AddedPts.Num());
-				Json += FString::Printf(TEXT("      \"rb_alt_path_found\": %s,\n"), C.bRbAltPath ? TEXT("true") : TEXT("false"));
-				Json += FString::Printf(TEXT("      \"rb_alt_path_pixels\": %d,\n"), C.RbAltPathPixels);
-				Json += FString::Printf(TEXT("      \"rb_bbox_area\": %lld,\n"), C.RbBboxArea);
-				Json += FString::Printf(TEXT("      \"protected_keep\": %s,\n"), C.bProtectedKeep ? TEXT("true") : TEXT("false"));
-				Json += FString::Printf(TEXT("      \"full_skipped_by_protection\": %s,\n"), C.bFullSkippedByProtection ? TEXT("true") : TEXT("false"));
-				Json += FString::Printf(TEXT("      \"full_added_pixels_checked\": %d,\n"), C.FullAddedPixels);
-				Json += FString::Printf(TEXT("      \"full_alt_path_found\": %s,\n"), C.bFullAltPath ? TEXT("true") : TEXT("false"));
-				Json += FString::Printf(TEXT("      \"full_alt_path_pixels\": %d,\n"), C.FullAltPathPixels);
-				Json += FString::Printf(TEXT("      \"full_bbox_area\": %lld,\n"), C.FullBboxArea);
-				Json += FString::Printf(TEXT("      \"kept\": %s,\n"), C.bKept ? TEXT("true") : TEXT("false"));
-				Json += FString::Printf(TEXT("      \"decision\": \"%s\"\n"), *C.Decision);
-				Json += FString::Printf(TEXT("    }%s\n"), (i + 1 < Connections.Num()) ? TEXT(",") : TEXT(""));
+				OutMap = SourceColorMap;
 			}
-			Json += TEXT("  ]\n");
-			Json += TEXT("}\n");
-			FFileHelper::SaveStringToFile(Json, *ConnectorPruneDebugJsonPath);
-		}
-
-		// ---- 3. trim dangling branches ----------------------------------------
-		// Branch-prune endpoint set + stop nodes are taken from the small-loop-pruned snapshot.
-		TArray<FIntPoint> PrunePoints;
-		if (LoopThresh > 0.0f)
-		{
-			SkelGraph::FindEndpoints(Current.GetData(), Width, Height, PrunePoints);
-		}
-		else
-		{
-			for (int32 i = 0; i < E; ++i)
+			else
 			{
-				if (!Used[i])
+				OutMap.Init(uint8(EStrokeColor::None), N);
+			}
+			for (const FConn& C : Connections)
+			{
+				if (!C.bKept)
 				{
-					PrunePoints.Add(EndpointsBefore[i]);
+					continue;
+				}
+				for (const FIntPoint& P : C.AddedPts)
+				{
+					const int32 Idx = P.Y * Width + P.X;
+					if (Skeleton[Idx] > 0)
+					{
+						OutMap[Idx] = uint8(C.Color);
+					}
 				}
 			}
-		}
+		};
 
 		float MaxPixels = -1.0f;
 		if (BranchPruneMaxPixels > 0.0f)
@@ -1401,16 +1702,15 @@ namespace FromLZImageOps
 			MaxPixels = FMath::Max(30.0f, 3.0f * GapTol);
 		}
 
+		TArray<uint8> EffectiveBeforeBranchPrune;
+		BuildEffectiveColorMap(Current, EffectiveBeforeBranchPrune);
+		TArray<FIntPoint> PrunePoints;
+		SkelGraph::FindEndpoints(Current.GetData(), Width, Height, PrunePoints);
 		TSet<int32> StopNodes;
 		SkelGraph::BranchStopPoints(Current.GetData(), Width, Height, StopNodes);
 
 		auto SamplesAsProtectedSourceColor = [&](const FIntPoint& P) -> bool
 		{
-			if (!bHasSourceColorMap)
-			{
-				return false;
-			}
-
 			int32 ProtectedSamples = 0;
 			int32 ColoredSamples = 0;
 			const int32 MinY = FMath::Max(0, P.Y - SampleRadius);
@@ -1421,7 +1721,7 @@ namespace FromLZImageOps
 			{
 				for (int32 xx = MinX; xx <= MaxX; ++xx)
 				{
-					const uint8 C = SourceColorMap[yy * Width + xx];
+					const uint8 C = EffectiveBeforeBranchPrune[yy * Width + xx];
 					if (C == uint8(EStrokeColor::None))
 					{
 						continue;
@@ -1460,6 +1760,18 @@ namespace FromLZImageOps
 			return ProtectedPathSamples >= Needed;
 		};
 
+		auto PathArcLength = [](const TArray<FIntPoint>& BranchPath) -> double
+		{
+			double Arc = 0.0;
+			for (int32 i = 1; i < BranchPath.Num(); ++i)
+			{
+				Arc += FVector2D::Distance(
+					FVector2D(BranchPath[i - 1].X, BranchPath[i - 1].Y),
+					FVector2D(BranchPath[i].X, BranchPath[i].Y));
+			}
+			return Arc;
+		};
+
 		TArray<uint8> Cleaned = Current;
 		TArray<FIntPoint> Path;
 		for (const FIntPoint& P : PrunePoints)
@@ -1482,15 +1794,14 @@ namespace FromLZImageOps
 			{
 				continue;
 			}
-			if (MaxPixels > 0.0f && Path.Num() > MaxPixels)
+			if (MaxPixels > 0.0f && PathArcLength(Path) > MaxPixels)
 			{
-				continue; // branch too long to be noise
+				continue;
 			}
 			if (BranchHasProtectedSourceColor(Path))
 			{
-				continue; // preserve short branches that still map to source red/black strokes
+				continue;
 			}
-			// Remove all but the terminal node.
 			for (int32 k = 0; k < Path.Num() - 1; ++k)
 			{
 				Cleaned[Path[k].Y * Width + Path[k].X] = 0;
@@ -1505,6 +1816,50 @@ namespace FromLZImageOps
 		}
 
 		OutCleaned = MoveTemp(Cleaned);
+		BuildEffectiveColorMap(OutCleaned, OutEffectiveColorMap);
+
+		if (!ConnectorPruneDebugJsonPath.IsEmpty())
+		{
+			FString Json;
+			Json += TEXT("{\n");
+			Json += FString::Printf(TEXT("  \"gap_tol\": %.3f,\n"), GapTol);
+			Json += FString::Printf(TEXT("  \"endpoint_direction_trace_pixels\": %.3f,\n"), EndpointDirectionTracePixels);
+			Json += FString::Printf(TEXT("  \"small_loop_bbox_area_thresh\": %.3f,\n"), SmallLoopBboxAreaThresh);
+			Json += FString::Printf(TEXT("  \"red_black_source_sample_radius\": %d,\n"), SampleRadius);
+			Json += FString::Printf(TEXT("  \"connector_count\": %d,\n"), Connections.Num());
+			Json += TEXT("  \"connectors\": [\n");
+			for (int32 i = 0; i < Connections.Num(); ++i)
+			{
+				const FConn& C = Connections[i];
+				Json += TEXT("    {\n");
+				Json += FString::Printf(TEXT("      \"id\": %d,\n"), i + 1);
+				Json += FString::Printf(TEXT("      \"source\": \"%s\",\n"), *C.Source);
+				Json += FString::Printf(TEXT("      \"color\": \"%s\",\n"), StrokeColorToString(C.Color));
+				Json += FString::Printf(TEXT("      \"p0\": [%d, %d],\n"), C.P0.X, C.P0.Y);
+				Json += FString::Printf(TEXT("      \"p1\": [%d, %d],\n"), C.P1.X, C.P1.Y);
+				Json += FString::Printf(TEXT("      \"gap_length\": %.3f,\n"), C.GapLength);
+				Json += FString::Printf(TEXT("      \"target_type\": \"%s\",\n"), *C.TargetType);
+				Json += FString::Printf(TEXT("      \"source_angle_degrees\": %.3f,\n"), C.SourceAngleDegrees);
+				Json += FString::Printf(TEXT("      \"target_angle_degrees\": %.3f,\n"), C.TargetAngleDegrees);
+				Json += FString::Printf(TEXT("      \"line_pixels\": %d,\n"), C.LinePts.Num());
+				Json += FString::Printf(TEXT("      \"added_pixels\": %d,\n"), C.AddedPts.Num());
+				Json += FString::Printf(TEXT("      \"rb_alt_path_found\": %s,\n"), C.bRbAltPath ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"rb_alt_path_pixels\": %d,\n"), C.RbAltPathPixels);
+				Json += FString::Printf(TEXT("      \"rb_bbox_area\": %lld,\n"), C.RbBboxArea);
+				Json += FString::Printf(TEXT("      \"protected_keep\": %s,\n"), C.bProtectedKeep ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"full_skipped_by_protection\": %s,\n"), C.bFullSkippedByProtection ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"full_added_pixels_checked\": %d,\n"), C.FullAddedPixels);
+				Json += FString::Printf(TEXT("      \"full_alt_path_found\": %s,\n"), C.bFullAltPath ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"full_alt_path_pixels\": %d,\n"), C.FullAltPathPixels);
+				Json += FString::Printf(TEXT("      \"full_bbox_area\": %lld,\n"), C.FullBboxArea);
+				Json += FString::Printf(TEXT("      \"kept\": %s,\n"), C.bKept ? TEXT("true") : TEXT("false"));
+				Json += FString::Printf(TEXT("      \"decision\": \"%s\"\n"), *C.Decision);
+				Json += FString::Printf(TEXT("    }%s\n"), (i + 1 < Connections.Num()) ? TEXT(",") : TEXT(""));
+			}
+			Json += TEXT("  ]\n");
+			Json += TEXT("}\n");
+			FFileHelper::SaveStringToFile(Json, *ConnectorPruneDebugJsonPath);
+		}
 	}
 
 	// ====================================================================
@@ -3401,6 +3756,8 @@ namespace FromLZImageOps
 	static constexpr float CapLoopGraphNodeSnapTol = 5.0f;
 	static constexpr double CapGeometryEpsilon = 1e-6;
 	static constexpr double CapEndpointDirectionArc = 5.0;
+	static constexpr double CapBlackContactDistancePx = 2.0;
+	static constexpr double CapBlackPreferenceBiasPx = 2.0;
 	static constexpr double CapRedOnlyLoopMinBboxArea = 500.0;
 	static constexpr double CapBorrowedLoopMinBboxArea = 500.0;
 	static constexpr double CapInteriorRedMaxLineLengthPx = 20.0;
@@ -3635,12 +3992,51 @@ namespace FromLZImageOps
 
 	struct FCapRedDeadEnd
 	{
+		int32 DeadEndId = INDEX_NONE;
 		FVector2D Pos = FVector2D::ZeroVector;
 		FVector2D Forward = FVector2D::ZeroVector;
 		int32 SourceStrokeId = INDEX_NONE;
 		int32 TopologyStrokeId = INDEX_NONE;
 		int32 EndpointIndex = 0;
 		bool bSynthetic = false;
+	};
+
+	struct FCapPlanarStrokeMeta
+	{
+		int32 SourceStrokeId = INDEX_NONE;
+		int32 ConnectorId = INDEX_NONE;
+		bool bSynthetic = false;
+	};
+
+	struct FCapSegmentCandidate
+	{
+		bool bValid = false;
+		int32 TargetStrokeId = INDEX_NONE;
+		int32 TargetSegmentIndex = INDEX_NONE;
+		double TargetT = 0.0;
+		double Distance = TNumericLimits<double>::Max();
+		FVector2D Point = FVector2D::ZeroVector;
+	};
+
+	enum class ECapConnectorKind : uint8
+	{
+		BlackContact,
+		RedEndpointPair,
+		RedSegmentFallback,
+		BlackSegmentFallback,
+		BlackEndpointRepair
+	};
+
+	struct FCapConnectorProposal
+	{
+		ECapConnectorKind Kind = ECapConnectorKind::RedSegmentFallback;
+		EStrokeColor Color = EStrokeColor::Red;
+		int32 SourceDeadEndId = INDEX_NONE;
+		int32 TargetDeadEndId = INDEX_NONE;
+		int32 TargetStrokeId = INDEX_NONE;
+		FVector2D Start = FVector2D::ZeroVector;
+		FVector2D End = FVector2D::ZeroVector;
+		double Distance = 0.0;
 	};
 
 	struct FCapRedTopologyNode
@@ -3652,53 +4048,21 @@ namespace FromLZImageOps
 	};
 
 	static void CollectPlanarRedDeadEnds(
-		const TArray<FColoredStroke>& SourceStrokes,
-		const TArray<int32>& RedIdx,
-		const TArray<TArray<FCapStrokeSplit>>& SplitsByStroke,
-		const TArray<FColoredStroke>* ExtraRedStrokes,
+		const TArray<FColoredStroke>& PlanarStrokes,
+		const TArray<FCapPlanarStrokeMeta>& PlanarMeta,
 		TArray<FCapRedDeadEnd>& OutDeadEnds)
 	{
 		OutDeadEnds.Reset();
 
-		TArray<FColoredStroke> PlanarRedStrokes;
-		TArray<int32> PlanarRedSourceIds;
-		TArray<uint8> PlanarRedSynthetic;
-		const TArray<FCapStrokeSplit> EmptySplits;
-
-		auto AppendRedTopologyStroke = [&](const FColoredStroke& Stroke, const TArray<FCapStrokeSplit>& Splits, int32 SourceStrokeId, bool bSynthetic)
-		{
-			const int32 Before = PlanarRedStrokes.Num();
-			AppendPlanarStrokeFragments(Stroke, Splits, PlanarRedStrokes);
-			for (int32 i = Before; i < PlanarRedStrokes.Num(); ++i)
-			{
-				PlanarRedSourceIds.Add(SourceStrokeId);
-				PlanarRedSynthetic.Add(bSynthetic ? 1 : 0);
-			}
-		};
-
-		for (int32 RedStrokeId : RedIdx)
-		{
-			if (SourceStrokes.IsValidIndex(RedStrokeId) && SplitsByStroke.IsValidIndex(RedStrokeId))
-			{
-				AppendRedTopologyStroke(SourceStrokes[RedStrokeId], SplitsByStroke[RedStrokeId], RedStrokeId, false);
-			}
-		}
-		if (ExtraRedStrokes)
-		{
-			for (const FColoredStroke& Extra : *ExtraRedStrokes)
-			{
-				if (Extra.Color == EStrokeColor::Red)
-				{
-					AppendRedTopologyStroke(Extra, EmptySplits, INDEX_NONE, true);
-				}
-			}
-		}
-
 		TArray<FCapRedTopologyNode> Nodes;
 		const double TopologyTol2 = CapGeometryEpsilon * CapGeometryEpsilon;
-		for (int32 StrokeId = 0; StrokeId < PlanarRedStrokes.Num(); ++StrokeId)
+		for (int32 StrokeId = 0; StrokeId < PlanarStrokes.Num(); ++StrokeId)
 		{
-			const FStroke& Points = PlanarRedStrokes[StrokeId].Points;
+			if (PlanarStrokes[StrokeId].Color != EStrokeColor::Red)
+			{
+				continue;
+			}
+			const FStroke& Points = PlanarStrokes[StrokeId].Points;
 			if (Points.Num() < 2)
 			{
 				continue;
@@ -3732,13 +4096,13 @@ namespace FromLZImageOps
 
 		for (const FCapRedTopologyNode& Node : Nodes)
 		{
-			if (Node.Degree != 1 || !PlanarRedStrokes.IsValidIndex(Node.IncidentStrokeId))
+			if (Node.Degree != 1 || !PlanarStrokes.IsValidIndex(Node.IncidentStrokeId))
 			{
 				continue;
 			}
 
 			const FVector2D Forward = GetEndpointOutwardDirection(
-				PlanarRedStrokes[Node.IncidentStrokeId].Points,
+				PlanarStrokes[Node.IncidentStrokeId].Points,
 				Node.IncidentEndpointIndex);
 			if (Forward.IsNearlyZero())
 			{
@@ -3748,11 +4112,24 @@ namespace FromLZImageOps
 			FCapRedDeadEnd DeadEnd;
 			DeadEnd.Pos = Node.Pos;
 			DeadEnd.Forward = Forward;
-			DeadEnd.SourceStrokeId = PlanarRedSourceIds.IsValidIndex(Node.IncidentStrokeId) ? PlanarRedSourceIds[Node.IncidentStrokeId] : INDEX_NONE;
+			DeadEnd.SourceStrokeId = PlanarMeta.IsValidIndex(Node.IncidentStrokeId) ? PlanarMeta[Node.IncidentStrokeId].SourceStrokeId : INDEX_NONE;
 			DeadEnd.TopologyStrokeId = Node.IncidentStrokeId;
 			DeadEnd.EndpointIndex = Node.IncidentEndpointIndex;
-			DeadEnd.bSynthetic = PlanarRedSynthetic.IsValidIndex(Node.IncidentStrokeId) && PlanarRedSynthetic[Node.IncidentStrokeId] != 0;
+			DeadEnd.bSynthetic = PlanarMeta.IsValidIndex(Node.IncidentStrokeId) && PlanarMeta[Node.IncidentStrokeId].bSynthetic;
 			OutDeadEnds.Add(DeadEnd);
+		}
+
+		OutDeadEnds.Sort([](const FCapRedDeadEnd& A, const FCapRedDeadEnd& B)
+		{
+			if (A.SourceStrokeId != B.SourceStrokeId) { return A.SourceStrokeId < B.SourceStrokeId; }
+			if (A.TopologyStrokeId != B.TopologyStrokeId) { return A.TopologyStrokeId < B.TopologyStrokeId; }
+			if (A.EndpointIndex != B.EndpointIndex) { return A.EndpointIndex < B.EndpointIndex; }
+			if (!FMath::IsNearlyEqual(A.Pos.X, B.Pos.X, CapGeometryEpsilon)) { return A.Pos.X < B.Pos.X; }
+			return A.Pos.Y < B.Pos.Y;
+		});
+		for (int32 DeadEndId = 0; DeadEndId < OutDeadEnds.Num(); ++DeadEndId)
+		{
+			OutDeadEnds[DeadEndId].DeadEndId = DeadEndId;
 		}
 	}
 
@@ -3810,110 +4187,246 @@ namespace FromLZImageOps
 			: FString::Printf(TEXT("%d,%d-%d,%d"), Bx, By, Ax, Ay);
 	}
 
-	static int32 AddRedForwardConnectorsToRedTargets(
-		const TArray<FColoredStroke>& SourceStrokes,
-		const TArray<int32>& RedIdx,
-		const TArray<FCapRedDeadEnd>& RedDeadEnds,
-		float ConnectorTol,
-		TArray<TArray<FCapStrokeSplit>>& SplitsByStroke,
-		TArray<FColoredStroke>& SyntheticConnectors)
+	static bool IsCapTopologyColor(EStrokeColor Color)
 	{
-		const double ConnectorTol2 = double(ConnectorTol) * double(ConnectorTol);
-		TSet<FString> ConnectorKeys;
-		for (const FColoredStroke& Existing : SyntheticConnectors)
+		return Color == EStrokeColor::Red || Color == EStrokeColor::Black;
+	}
+
+	static void BuildRepairPlanarGeometry(
+		const TArray<FColoredStroke>& SourceStrokes,
+		const TArray<FColoredStroke>& SyntheticConnectors,
+		TArray<FColoredStroke>& OutPlanarStrokes,
+		TArray<FCapPlanarStrokeMeta>& OutPlanarMeta,
+		int32& OutFirstSyntheticStrokeId,
+		int32* OutRealRedBlackIntersectionCount = nullptr,
+		int32* OutRealRedRedIntersectionCount = nullptr)
+	{
+		TArray<FColoredStroke> Combined = SourceStrokes;
+		Combined.Append(SyntheticConnectors);
+		TArray<TArray<FCapStrokeSplit>> SplitsByStroke;
+		SplitsByStroke.SetNum(Combined.Num());
+		int32 RealRedBlackIntersectionCount = 0;
+		int32 RealRedRedIntersectionCount = 0;
+		TArray<FCapSegmentHit> Hits;
+
+		for (int32 AId = 0; AId < Combined.Num(); ++AId)
 		{
-			if (Existing.Color == EStrokeColor::Red && Existing.Points.Num() >= 2)
+			if (!IsCapTopologyColor(Combined[AId].Color))
 			{
-				ConnectorKeys.Add(RoundedConnectorKey(Existing.Points[0], Existing.Points.Last()));
+				continue;
 			}
-		}
-
-		int32 AddedCount = 0;
-		for (const FCapRedDeadEnd& DeadEnd : RedDeadEnds)
-		{
-			const FVector2D Endpoint = DeadEnd.Pos;
-			int32 BestRedStrokeId = INDEX_NONE;
-			int32 BestRedSegment = INDEX_NONE;
-			double BestRedT = 0.0;
-			double BestD2 = TNumericLimits<double>::Max();
-			FVector2D BestPoint = FVector2D::ZeroVector;
-
-			for (int32 RedStrokeId : RedIdx)
+			const bool bASynthetic = AId >= SourceStrokes.Num();
+			const FStroke& APoints = Combined[AId].Points;
+			for (int32 BId = AId + 1; BId < Combined.Num(); ++BId)
 			{
-				if (!SourceStrokes.IsValidIndex(RedStrokeId) || RedStrokeId == DeadEnd.SourceStrokeId)
+				if (!IsCapTopologyColor(Combined[BId].Color))
 				{
 					continue;
 				}
-				const FStroke& RedPoints = SourceStrokes[RedStrokeId].Points;
-				for (int32 SegmentIndex = 0; SegmentIndex + 1 < RedPoints.Num(); ++SegmentIndex)
+				const bool bBSynthetic = BId >= SourceStrokes.Num();
+				const bool bRealRedBlack =
+					!bASynthetic &&
+					!bBSynthetic &&
+					Combined[AId].Color != Combined[BId].Color;
+				const bool bRealRedRed =
+					!bASynthetic &&
+					!bBSynthetic &&
+					Combined[AId].Color == EStrokeColor::Red &&
+					Combined[BId].Color == EStrokeColor::Red;
+				if (!bASynthetic && !bBSynthetic && !bRealRedBlack && !bRealRedRed)
 				{
-					double SegmentT = 0.0;
-					FVector2D CandidatePoint;
-					if (!ClosestPointOnSegmentInForwardHalfPlane(
-						Endpoint, DeadEnd.Forward,
-						RedPoints[SegmentIndex], RedPoints[SegmentIndex + 1],
-						SegmentT, CandidatePoint))
-					{
-						continue;
-					}
+					continue;
+				}
 
-					const double D2 = FVector2D::DistSquared(Endpoint, CandidatePoint);
-					if (D2 <= CapGeometryEpsilon * CapGeometryEpsilon || D2 > ConnectorTol2 || D2 >= BestD2)
+				const FStroke& BPoints = Combined[BId].Points;
+				for (int32 ASegment = 0; ASegment + 1 < APoints.Num(); ++ASegment)
+				{
+					for (int32 BSegment = 0; BSegment + 1 < BPoints.Num(); ++BSegment)
 					{
-						continue;
+						FindSegmentIntersections(
+							APoints[ASegment], APoints[ASegment + 1],
+							BPoints[BSegment], BPoints[BSegment + 1],
+							Hits);
+						for (const FCapSegmentHit& Hit : Hits)
+						{
+							const int32 BeforeA = SplitsByStroke[AId].Num();
+							AddStrokeSplit(SplitsByStroke, AId, ASegment, Hit.T, Hit.Pos);
+							AddStrokeSplit(SplitsByStroke, BId, BSegment, Hit.U, Hit.Pos);
+							if (bRealRedBlack && SplitsByStroke[AId].Num() > BeforeA)
+							{
+								++RealRedBlackIntersectionCount;
+							}
+							else if (bRealRedRed && SplitsByStroke[AId].Num() > BeforeA)
+							{
+								++RealRedRedIntersectionCount;
+							}
+						}
 					}
-
-					BestRedStrokeId = RedStrokeId;
-					BestRedSegment = SegmentIndex;
-					BestRedT = SegmentT;
-					BestD2 = D2;
-					BestPoint = CandidatePoint;
 				}
 			}
-
-			if (BestRedStrokeId == INDEX_NONE)
-			{
-				continue;
-			}
-
-			const FString Key = RoundedConnectorKey(Endpoint, BestPoint);
-			if (ConnectorKeys.Contains(Key))
-			{
-				continue;
-			}
-			ConnectorKeys.Add(Key);
-
-			AddStrokeSplit(
-				SplitsByStroke,
-				BestRedStrokeId,
-				BestRedSegment,
-				BestRedT,
-				BestPoint);
-
-			FColoredStroke Connector;
-			Connector.Points.Add(Endpoint);
-			Connector.Points.Add(BestPoint);
-			Connector.Color = EStrokeColor::Red;
-			Connector.ConnectionPointCount = Connector.Points.Num();
-			SyntheticConnectors.Add(MoveTemp(Connector));
-			++AddedCount;
 		}
 
-		return AddedCount;
+		OutPlanarStrokes.Reset();
+		OutPlanarMeta.Reset();
+		auto AppendStroke = [&](
+			const FColoredStroke& Stroke,
+			const TArray<FCapStrokeSplit>& Splits,
+			int32 SourceStrokeId,
+			int32 ConnectorId,
+			bool bSynthetic)
+		{
+			const int32 Before = OutPlanarStrokes.Num();
+			AppendPlanarStrokeFragments(Stroke, Splits, OutPlanarStrokes);
+			for (int32 FragmentId = Before; FragmentId < OutPlanarStrokes.Num(); ++FragmentId)
+			{
+				FCapPlanarStrokeMeta Meta;
+				Meta.SourceStrokeId = SourceStrokeId;
+				Meta.ConnectorId = ConnectorId;
+				Meta.bSynthetic = bSynthetic;
+				OutPlanarMeta.Add(Meta);
+			}
+		};
+
+		for (int32 SourceStrokeId = 0; SourceStrokeId < SourceStrokes.Num(); ++SourceStrokeId)
+		{
+			AppendStroke(
+				SourceStrokes[SourceStrokeId],
+				SplitsByStroke[SourceStrokeId],
+				SourceStrokeId,
+				INDEX_NONE,
+				false);
+		}
+		OutFirstSyntheticStrokeId = OutPlanarStrokes.Num();
+		for (int32 ConnectorId = 0; ConnectorId < SyntheticConnectors.Num(); ++ConnectorId)
+		{
+			const int32 CombinedId = SourceStrokes.Num() + ConnectorId;
+			AppendStroke(
+				SyntheticConnectors[ConnectorId],
+				SplitsByStroke[CombinedId],
+				INDEX_NONE,
+				ConnectorId,
+				true);
+		}
+
+		if (OutRealRedBlackIntersectionCount)
+		{
+			*OutRealRedBlackIntersectionCount = RealRedBlackIntersectionCount;
+		}
+		if (OutRealRedRedIntersectionCount)
+		{
+			*OutRealRedRedIntersectionCount = RealRedRedIntersectionCount;
+		}
 	}
 
-	static bool EndpointTouchesAnyBlackStroke(
-		const FVector2D& Endpoint,
-		const TArray<FColoredStroke>& SourceStrokes,
-		const TArray<int32>& BlackIdx)
+	static bool ConnectorCrossesRealGeometry(
+		const FVector2D& Start,
+		const FVector2D& End,
+		const TArray<FColoredStroke>& SourceStrokes)
 	{
-		for (int32 BlackStrokeId : BlackIdx)
+		if (FVector2D::DistSquared(Start, End) <= CapGeometryEpsilon * CapGeometryEpsilon)
 		{
-			if (!SourceStrokes.IsValidIndex(BlackStrokeId))
+			return false;
+		}
+
+		TArray<FCapSegmentHit> Hits;
+		static constexpr double ParamEpsilon = 1e-6;
+		for (const FColoredStroke& Stroke : SourceStrokes)
+		{
+			if (!IsCapTopologyColor(Stroke.Color))
 			{
 				continue;
 			}
-			const FStroke& Points = SourceStrokes[BlackStrokeId].Points;
+			for (int32 SegmentIndex = 0; SegmentIndex + 1 < Stroke.Points.Num(); ++SegmentIndex)
+			{
+				FindSegmentIntersections(
+					Start,
+					End,
+					Stroke.Points[SegmentIndex],
+					Stroke.Points[SegmentIndex + 1],
+					Hits);
+				for (const FCapSegmentHit& Hit : Hits)
+				{
+					if (Hit.T > ParamEpsilon && Hit.T < 1.0 - ParamEpsilon)
+					{
+						return true;
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	static bool ConnectorIntersectsAcceptedConnector(
+		const FVector2D& Start,
+		const FVector2D& End,
+		const TArray<FColoredStroke>& AcceptedConnectors)
+	{
+		TArray<FCapSegmentHit> Hits;
+		static constexpr double ParamEpsilon = 1e-6;
+		for (const FColoredStroke& Existing : AcceptedConnectors)
+		{
+			if (Existing.Points.Num() < 2)
+			{
+				continue;
+			}
+			FindSegmentIntersections(
+				Start,
+				End,
+				Existing.Points[0],
+				Existing.Points.Last(),
+				Hits);
+			for (const FCapSegmentHit& Hit : Hits)
+			{
+				const bool bProposalEndpoint = Hit.T <= ParamEpsilon || Hit.T >= 1.0 - ParamEpsilon;
+				const bool bExistingEndpoint = Hit.U <= ParamEpsilon || Hit.U >= 1.0 - ParamEpsilon;
+				if (!bProposalEndpoint || !bExistingEndpoint)
+				{
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	static bool IsStrictInteriorTarget(const FStroke& Points, int32 SegmentIndex, double T)
+	{
+		static constexpr double ParamEpsilon = 1e-6;
+		if (Points.Num() < 2)
+		{
+			return false;
+		}
+		if (SegmentIndex == 0 && T <= ParamEpsilon)
+		{
+			return false;
+		}
+		if (SegmentIndex + 1 == Points.Num() - 1 && T >= 1.0 - ParamEpsilon)
+		{
+			return false;
+		}
+		return true;
+	}
+
+	static FCapSegmentCandidate FindBestForwardSegmentCandidate(
+		const TArray<FColoredStroke>& SourceStrokes,
+		const TArray<int32>& TargetStrokeIds,
+		const FCapRedDeadEnd& DeadEnd,
+		double MaxDistance,
+		bool bStrictInteriorTarget,
+		bool bAllowExactContactWithoutForward,
+		const TArray<FColoredStroke>& ExistingConnectors)
+	{
+		const double MaxDistance2 = MaxDistance * MaxDistance;
+		const double GeometryEpsilon2 = CapGeometryEpsilon * CapGeometryEpsilon;
+		FCapSegmentCandidate Best;
+
+		for (int32 TargetStrokeId : TargetStrokeIds)
+		{
+			if (!SourceStrokes.IsValidIndex(TargetStrokeId) ||
+				TargetStrokeId == DeadEnd.SourceStrokeId)
+			{
+				continue;
+			}
+			const FStroke& Points = SourceStrokes[TargetStrokeId].Points;
 			for (int32 SegmentIndex = 0; SegmentIndex + 1 < Points.Num(); ++SegmentIndex)
 			{
 				const FVector2D Segment = Points[SegmentIndex + 1] - Points[SegmentIndex];
@@ -3922,17 +4435,161 @@ namespace FromLZImageOps
 				{
 					continue;
 				}
-				const double T = FMath::Clamp(
-					FVector2D::DotProduct(Endpoint - Points[SegmentIndex], Segment) / SegmentLen2,
-					0.0, 1.0);
-				const FVector2D Closest = Points[SegmentIndex] + Segment * T;
-				if (FVector2D::DistSquared(Endpoint, Closest) <= CapGeometryEpsilon * CapGeometryEpsilon)
+
+				double T = FMath::Clamp(
+					FVector2D::DotProduct(DeadEnd.Pos - Points[SegmentIndex], Segment) / SegmentLen2,
+					0.0,
+					1.0);
+				FVector2D Point = Points[SegmentIndex] + Segment * T;
+				double D2 = FVector2D::DistSquared(DeadEnd.Pos, Point);
+				if (!(bAllowExactContactWithoutForward && D2 <= GeometryEpsilon2))
 				{
-					return true;
+					if (!ClosestPointOnSegmentInForwardHalfPlane(
+						DeadEnd.Pos,
+						DeadEnd.Forward,
+						Points[SegmentIndex],
+						Points[SegmentIndex + 1],
+						T,
+						Point))
+					{
+						continue;
+					}
+					D2 = FVector2D::DistSquared(DeadEnd.Pos, Point);
 				}
+
+				if (D2 > MaxDistance2 ||
+					(!bAllowExactContactWithoutForward && D2 <= GeometryEpsilon2) ||
+					(bStrictInteriorTarget && !IsStrictInteriorTarget(Points, SegmentIndex, T)))
+				{
+					continue;
+				}
+				if (D2 > GeometryEpsilon2 &&
+					(ConnectorCrossesRealGeometry(DeadEnd.Pos, Point, SourceStrokes) ||
+					 ConnectorIntersectsAcceptedConnector(DeadEnd.Pos, Point, ExistingConnectors)))
+				{
+					continue;
+				}
+
+				const double Distance = FMath::Sqrt(D2);
+				const bool bBetter =
+					!Best.bValid ||
+					Distance < Best.Distance - CapGeometryEpsilon ||
+					(FMath::IsNearlyEqual(Distance, Best.Distance, CapGeometryEpsilon) &&
+						(TargetStrokeId < Best.TargetStrokeId ||
+							(TargetStrokeId == Best.TargetStrokeId &&
+								(SegmentIndex < Best.TargetSegmentIndex ||
+									(SegmentIndex == Best.TargetSegmentIndex && T < Best.TargetT)))));
+				if (!bBetter)
+				{
+					continue;
+				}
+
+				Best.bValid = true;
+				Best.TargetStrokeId = TargetStrokeId;
+				Best.TargetSegmentIndex = SegmentIndex;
+				Best.TargetT = T;
+				Best.Distance = Distance;
+				Best.Point = Point;
 			}
 		}
-		return false;
+		return Best;
+	}
+
+	static bool ConnectorProposalLess(
+		const FCapConnectorProposal& A,
+		const FCapConnectorProposal& B)
+	{
+		if (!FMath::IsNearlyEqual(A.Distance, B.Distance, CapGeometryEpsilon))
+		{
+			return A.Distance < B.Distance;
+		}
+		if (A.SourceDeadEndId != B.SourceDeadEndId)
+		{
+			return A.SourceDeadEndId < B.SourceDeadEndId;
+		}
+		if (A.TargetDeadEndId != B.TargetDeadEndId)
+		{
+			return A.TargetDeadEndId < B.TargetDeadEndId;
+		}
+		if (A.TargetStrokeId != B.TargetStrokeId)
+		{
+			return A.TargetStrokeId < B.TargetStrokeId;
+		}
+		return static_cast<uint8>(A.Kind) < static_cast<uint8>(B.Kind);
+	}
+
+	static bool TryAppendConnectorProposal(
+		const FCapConnectorProposal& Proposal,
+		const TArray<FColoredStroke>& SourceStrokes,
+		TArray<FColoredStroke>& AcceptedConnectors,
+		TSet<FString>& ConnectorKeys)
+	{
+		if (Proposal.Distance <= CapGeometryEpsilon)
+		{
+			return true;
+		}
+		const FString Key = RoundedConnectorKey(Proposal.Start, Proposal.End);
+		if (ConnectorKeys.Contains(Key) ||
+			ConnectorCrossesRealGeometry(Proposal.Start, Proposal.End, SourceStrokes) ||
+			ConnectorIntersectsAcceptedConnector(Proposal.Start, Proposal.End, AcceptedConnectors))
+		{
+			return false;
+		}
+
+		FColoredStroke Connector;
+		Connector.Points.Add(Proposal.Start);
+		Connector.Points.Add(Proposal.End);
+		Connector.Color = Proposal.Color;
+		Connector.ConnectionPointCount = Connector.Points.Num();
+		AcceptedConnectors.Add(MoveTemp(Connector));
+		ConnectorKeys.Add(Key);
+		return true;
+	}
+
+	static void CollectUnresolvedInitialRedDeadEnds(
+		const TArray<FColoredStroke>& PlanarStrokes,
+		int32 FirstSyntheticStrokeId,
+		const TArray<FCapRedDeadEnd>& InitialDeadEnds,
+		TArray<FCapRedDeadEnd>& OutUnresolved)
+	{
+		using namespace CapOps;
+		OutUnresolved.Reset();
+		TArray<int32> EdgeIds;
+		for (int32 StrokeId = 0; StrokeId < PlanarStrokes.Num(); ++StrokeId)
+		{
+			if (IsCapTopologyColor(PlanarStrokes[StrokeId].Color))
+			{
+				EdgeIds.Add(StrokeId);
+			}
+		}
+
+		FGraph G;
+		BuildGraph(PlanarStrokes, EdgeIds, static_cast<float>(CapGeometryEpsilon), FirstSyntheticStrokeId, G);
+		TArray<int32> Degree;
+		Degree.Init(0, G.NumNodes);
+		for (int32 EdgeId = 0; EdgeId < G.StrokeId.Num(); ++EdgeId)
+		{
+			if (Degree.IsValidIndex(G.NodeU[EdgeId])) { ++Degree[G.NodeU[EdgeId]]; }
+			if (Degree.IsValidIndex(G.NodeV[EdgeId])) { ++Degree[G.NodeV[EdgeId]]; }
+		}
+
+		const double Tol2 = CapGeometryEpsilon * CapGeometryEpsilon;
+		for (const FCapRedDeadEnd& DeadEnd : InitialDeadEnds)
+		{
+			int32 NodeId = INDEX_NONE;
+			for (int32 CandidateNodeId = 0; CandidateNodeId < G.NodePos.Num(); ++CandidateNodeId)
+			{
+				if (FVector2D::DistSquared(DeadEnd.Pos, G.NodePos[CandidateNodeId]) <= Tol2)
+				{
+					NodeId = CandidateNodeId;
+					break;
+				}
+			}
+			if (!Degree.IsValidIndex(NodeId) || Degree[NodeId] <= 1)
+			{
+				OutUnresolved.Add(DeadEnd);
+			}
+		}
 	}
 
 	static void BuildPlanarEndpointConnectorStrokes(
@@ -3943,152 +4600,291 @@ namespace FromLZImageOps
 		TArray<FColoredStroke>& OutStrokes,
 		int32& OutFirstSyntheticStrokeId)
 	{
-		TArray<TArray<FCapStrokeSplit>> SplitsByStroke;
-		SplitsByStroke.SetNum(SourceStrokes.Num());
-		int32 TrueIntersectionCount = 0;
-
-		// First planarize every real red/black polyline intersection.
-		TArray<FCapSegmentHit> Hits;
-		for (int32 RedStrokeId : RedIdx)
-		{
-			if (!SourceStrokes.IsValidIndex(RedStrokeId))
-			{
-				continue;
-			}
-			const FStroke& RedPoints = SourceStrokes[RedStrokeId].Points;
-			for (int32 BlackStrokeId : BlackIdx)
-			{
-				if (!SourceStrokes.IsValidIndex(BlackStrokeId))
-				{
-					continue;
-				}
-				const FStroke& BlackPoints = SourceStrokes[BlackStrokeId].Points;
-				for (int32 RedSegment = 0; RedSegment + 1 < RedPoints.Num(); ++RedSegment)
-				{
-					for (int32 BlackSegment = 0; BlackSegment + 1 < BlackPoints.Num(); ++BlackSegment)
-					{
-						FindSegmentIntersections(
-							RedPoints[RedSegment], RedPoints[RedSegment + 1],
-							BlackPoints[BlackSegment], BlackPoints[BlackSegment + 1],
-							Hits);
-						for (const FCapSegmentHit& Hit : Hits)
-						{
-							const int32 BeforeRed = SplitsByStroke[RedStrokeId].Num();
-							AddStrokeSplit(SplitsByStroke, RedStrokeId, RedSegment, Hit.T, Hit.Pos);
-							AddStrokeSplit(SplitsByStroke, BlackStrokeId, BlackSegment, Hit.U, Hit.Pos);
-							if (SplitsByStroke[RedStrokeId].Num() > BeforeRed)
-							{
-								++TrueIntersectionCount;
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Build the red topology after real intersection splitting. Only nodes with one
-		// incident red fragment are dead ends; shared red endpoints, loops, and branches
-		// must not initiate connectors. This uses only geometric equality, not the final
-		// 5px graph-node snap.
 		TArray<FColoredStroke> SyntheticConnectors;
-		TArray<FCapRedDeadEnd> RedDeadEnds;
-		CollectPlanarRedDeadEnds(SourceStrokes, RedIdx, SplitsByStroke, nullptr, RedDeadEnds);
-		const double ConnectorTol2 = double(ConnectorTol) * double(ConnectorTol);
-		const int32 InitialRedDeadEndCount = RedDeadEnds.Num();
+		TSet<FString> ConnectorKeys;
 
-		// Prefer repairing red topology with red targets before borrowing black edges.
-		const int32 RedToRedConnectorCount = AddRedForwardConnectorsToRedTargets(
+		TArray<FColoredStroke> InitialPlanarStrokes;
+		TArray<FCapPlanarStrokeMeta> InitialPlanarMeta;
+		int32 InitialFirstSyntheticStrokeId = INDEX_NONE;
+		int32 RealRedBlackIntersectionCount = 0;
+		int32 RealRedRedIntersectionCount = 0;
+		BuildRepairPlanarGeometry(
 			SourceStrokes,
-			RedIdx,
-			RedDeadEnds,
-			ConnectorTol,
-			SplitsByStroke,
-			SyntheticConnectors);
+			SyntheticConnectors,
+			InitialPlanarStrokes,
+			InitialPlanarMeta,
+			InitialFirstSyntheticStrokeId,
+			&RealRedBlackIntersectionCount,
+			&RealRedRedIntersectionCount);
 
-		TArray<FCapRedDeadEnd> RedDeadEndsAfterRedRepair;
-		CollectPlanarRedDeadEnds(SourceStrokes, RedIdx, SplitsByStroke, &SyntheticConnectors, RedDeadEndsAfterRedRepair);
-
-		int32 RedToBlackConnectorCount = 0;
-		for (const FCapRedDeadEnd& DeadEnd : RedDeadEndsAfterRedRepair)
+		TArray<FCapRedDeadEnd> InitialRedDeadEnds;
+		CollectPlanarRedDeadEnds(InitialPlanarStrokes, InitialPlanarMeta, InitialRedDeadEnds);
+		InitialRedDeadEnds.RemoveAll([](const FCapRedDeadEnd& DeadEnd)
 		{
-			const FVector2D Endpoint = DeadEnd.Pos;
-			if (EndpointTouchesAnyBlackStroke(Endpoint, SourceStrokes, BlackIdx))
+			return DeadEnd.bSynthetic;
+		});
+		for (int32 DeadEndId = 0; DeadEndId < InitialRedDeadEnds.Num(); ++DeadEndId)
+		{
+			InitialRedDeadEnds[DeadEndId].DeadEndId = DeadEndId;
+		}
+		const int32 InitialRedDeadEndCount = InitialRedDeadEnds.Num();
+		const double ConnectorMaxDistance = FMath::Max(0.0, static_cast<double>(ConnectorTol));
+
+		// Stage A. Exact/near black contacts are resolved first. A zero-distance
+		// contact needs no connector because real red/black planarization already
+		// created the shared node.
+		TArray<uint8> bStageAResolved;
+		bStageAResolved.Init(0, InitialRedDeadEnds.Num());
+		TArray<FCapConnectorProposal> BlackContactProposals;
+		int32 ExactBlackContactCount = 0;
+		for (const FCapRedDeadEnd& DeadEnd : InitialRedDeadEnds)
+		{
+			const FCapSegmentCandidate Contact = FindBestForwardSegmentCandidate(
+				SourceStrokes,
+				BlackIdx,
+				DeadEnd,
+				CapBlackContactDistancePx,
+				false,
+				true,
+				SyntheticConnectors);
+			if (!Contact.bValid)
 			{
 				continue;
 			}
-
-			int32 BestBlackStrokeId = INDEX_NONE;
-			int32 BestBlackSegment = INDEX_NONE;
-			double BestBlackT = 0.0;
-			double BestD2 = TNumericLimits<double>::Max();
-			FVector2D BestPoint = FVector2D::ZeroVector;
-			for (int32 BlackStrokeId : BlackIdx)
+			if (Contact.Distance <= CapGeometryEpsilon)
 			{
-				if (!SourceStrokes.IsValidIndex(BlackStrokeId))
+				bStageAResolved[DeadEnd.DeadEndId] = 1;
+				++ExactBlackContactCount;
+				continue;
+			}
+
+			FCapConnectorProposal Proposal;
+			Proposal.Kind = ECapConnectorKind::BlackContact;
+			Proposal.Color = EStrokeColor::Red;
+			Proposal.SourceDeadEndId = DeadEnd.DeadEndId;
+			Proposal.TargetStrokeId = Contact.TargetStrokeId;
+			Proposal.Start = DeadEnd.Pos;
+			Proposal.End = Contact.Point;
+			Proposal.Distance = Contact.Distance;
+			BlackContactProposals.Add(Proposal);
+		}
+		BlackContactProposals.Sort(ConnectorProposalLess);
+		int32 BlackContactConnectorCount = 0;
+		for (const FCapConnectorProposal& Proposal : BlackContactProposals)
+		{
+			if (!bStageAResolved.IsValidIndex(Proposal.SourceDeadEndId) ||
+				bStageAResolved[Proposal.SourceDeadEndId])
+			{
+				continue;
+			}
+			if (TryAppendConnectorProposal(Proposal, SourceStrokes, SyntheticConnectors, ConnectorKeys))
+			{
+				bStageAResolved[Proposal.SourceDeadEndId] = 1;
+				++BlackContactConnectorCount;
+			}
+		}
+
+		// Every remaining endpoint independently records its nearest viable black
+		// segment. That distance can veto an endpoint pair only when black is
+		// clearly closer by the configured bias.
+		TArray<FCapSegmentCandidate> BestBlackByDeadEnd;
+		BestBlackByDeadEnd.SetNum(InitialRedDeadEnds.Num());
+		for (const FCapRedDeadEnd& DeadEnd : InitialRedDeadEnds)
+		{
+			if (bStageAResolved[DeadEnd.DeadEndId])
+			{
+				continue;
+			}
+			BestBlackByDeadEnd[DeadEnd.DeadEndId] = FindBestForwardSegmentCandidate(
+				SourceStrokes,
+				BlackIdx,
+				DeadEnd,
+				ConnectorMaxDistance,
+				false,
+				false,
+				SyntheticConnectors);
+		}
+
+		TArray<FCapConnectorProposal> EndpointPairProposals;
+		for (int32 AId = 0; AId < InitialRedDeadEnds.Num(); ++AId)
+		{
+			if (bStageAResolved[AId])
+			{
+				continue;
+			}
+			const FCapRedDeadEnd& A = InitialRedDeadEnds[AId];
+			for (int32 BId = AId + 1; BId < InitialRedDeadEnds.Num(); ++BId)
+			{
+				if (bStageAResolved[BId])
 				{
 					continue;
 				}
-				const FStroke& BlackPoints = SourceStrokes[BlackStrokeId].Points;
-				for (int32 SegmentIndex = 0; SegmentIndex + 1 < BlackPoints.Num(); ++SegmentIndex)
+				const FCapRedDeadEnd& B = InitialRedDeadEnds[BId];
+				const FVector2D Delta = B.Pos - A.Pos;
+				const double Distance = Delta.Size();
+				if (Distance <= CapGeometryEpsilon || Distance > ConnectorMaxDistance)
 				{
-					double SegmentT = 0.0;
-					FVector2D CandidatePoint;
-					if (!ClosestPointOnSegmentInForwardHalfPlane(
-						Endpoint, DeadEnd.Forward,
-						BlackPoints[SegmentIndex], BlackPoints[SegmentIndex + 1],
-						SegmentT, CandidatePoint))
-					{
-						continue;
-					}
-					const double D2 = FVector2D::DistSquared(Endpoint, CandidatePoint);
-					if (D2 <= ConnectorTol2 && D2 < BestD2)
-					{
-						BestBlackStrokeId = BlackStrokeId;
-						BestBlackSegment = SegmentIndex;
-						BestBlackT = SegmentT;
-						BestD2 = D2;
-						BestPoint = CandidatePoint;
-					}
+					continue;
+				}
+				const bool bASeesB = FVector2D::DotProduct(Delta, A.Forward) >= -CapGeometryEpsilon;
+				const bool bBSeesA = FVector2D::DotProduct(-Delta, B.Forward) >= -CapGeometryEpsilon;
+				if (!bASeesB && !bBSeesA)
+				{
+					continue;
+				}
+				const FCapSegmentCandidate& ABlack = BestBlackByDeadEnd[AId];
+				const FCapSegmentCandidate& BBlack = BestBlackByDeadEnd[BId];
+				if ((ABlack.bValid && ABlack.Distance + CapBlackPreferenceBiasPx < Distance) ||
+					(BBlack.bValid && BBlack.Distance + CapBlackPreferenceBiasPx < Distance))
+				{
+					continue;
+				}
+				if (ConnectorCrossesRealGeometry(A.Pos, B.Pos, SourceStrokes) ||
+					ConnectorIntersectsAcceptedConnector(A.Pos, B.Pos, SyntheticConnectors))
+				{
+					continue;
+				}
+				FCapConnectorProposal Proposal;
+				Proposal.Kind = ECapConnectorKind::RedEndpointPair;
+				Proposal.Color = EStrokeColor::Red;
+				Proposal.SourceDeadEndId = AId;
+				Proposal.TargetDeadEndId = BId;
+				Proposal.Start = A.Pos;
+				Proposal.End = B.Pos;
+				Proposal.Distance = Distance;
+				EndpointPairProposals.Add(Proposal);
+			}
+		}
+		EndpointPairProposals.Sort(ConnectorProposalLess);
+		TArray<uint8> bEndpointOccupied = bStageAResolved;
+		int32 RedEndpointPairConnectorCount = 0;
+		for (const FCapConnectorProposal& Proposal : EndpointPairProposals)
+		{
+			if (bEndpointOccupied[Proposal.SourceDeadEndId] ||
+				bEndpointOccupied[Proposal.TargetDeadEndId])
+			{
+				continue;
+			}
+			if (TryAppendConnectorProposal(Proposal, SourceStrokes, SyntheticConnectors, ConnectorKeys))
+			{
+				bEndpointOccupied[Proposal.SourceDeadEndId] = 1;
+				bEndpointOccupied[Proposal.TargetDeadEndId] = 1;
+				++RedEndpointPairConnectorCount;
+			}
+		}
+
+		// Commit Stage A and use an exact mixed red/black graph to identify which
+		// original red dead ends still have only one incident edge.
+		TArray<FColoredStroke> StageAPlanarStrokes;
+		TArray<FCapPlanarStrokeMeta> StageAPlanarMeta;
+		int32 StageAFirstSyntheticStrokeId = INDEX_NONE;
+		BuildRepairPlanarGeometry(
+			SourceStrokes,
+			SyntheticConnectors,
+			StageAPlanarStrokes,
+			StageAPlanarMeta,
+			StageAFirstSyntheticStrokeId);
+
+		TArray<FCapRedDeadEnd> UnresolvedAfterStageA;
+		CollectUnresolvedInitialRedDeadEnds(
+			StageAPlanarStrokes,
+			StageAFirstSyntheticStrokeId,
+			InitialRedDeadEnds,
+			UnresolvedAfterStageA);
+
+		// Stage B. Red-segment and black-segment searches are independent and use
+		// the same Stage A snapshot. Synthetic red connectors participate in the
+		// temporary graph, but are never active red-segment targets.
+		TArray<FCapConnectorProposal> FallbackProposals;
+		for (const FCapRedDeadEnd& DeadEnd : UnresolvedAfterStageA)
+		{
+			const FCapSegmentCandidate RedCandidate = FindBestForwardSegmentCandidate(
+				SourceStrokes,
+				RedIdx,
+				DeadEnd,
+				ConnectorMaxDistance,
+				true,
+				false,
+				SyntheticConnectors);
+			const FCapSegmentCandidate BlackCandidate = FindBestForwardSegmentCandidate(
+				SourceStrokes,
+				BlackIdx,
+				DeadEnd,
+				ConnectorMaxDistance,
+				false,
+				false,
+				SyntheticConnectors);
+
+			const FCapSegmentCandidate* Selected = nullptr;
+			ECapConnectorKind Kind = ECapConnectorKind::RedSegmentFallback;
+			if (RedCandidate.bValid && BlackCandidate.bValid)
+			{
+				if (BlackCandidate.Distance + CapBlackPreferenceBiasPx < RedCandidate.Distance)
+				{
+					Selected = &BlackCandidate;
+					Kind = ECapConnectorKind::BlackSegmentFallback;
+				}
+				else
+				{
+					Selected = &RedCandidate;
 				}
 			}
-			if (BestBlackStrokeId == INDEX_NONE || BestD2 <= CapGeometryEpsilon * CapGeometryEpsilon)
+			else if (RedCandidate.bValid)
+			{
+				Selected = &RedCandidate;
+			}
+			else if (BlackCandidate.bValid)
+			{
+				Selected = &BlackCandidate;
+				Kind = ECapConnectorKind::BlackSegmentFallback;
+			}
+			if (!Selected)
 			{
 				continue;
 			}
 
-			AddStrokeSplit(
-				SplitsByStroke,
-				BestBlackStrokeId,
-				BestBlackSegment,
-				BestBlackT,
-				BestPoint);
-
-			FColoredStroke Connector;
-			Connector.Points.Add(Endpoint);
-			Connector.Points.Add(BestPoint);
-			Connector.Color = EStrokeColor::Red;
-			Connector.ConnectionPointCount = Connector.Points.Num();
-			SyntheticConnectors.Add(MoveTemp(Connector));
-			++RedToBlackConnectorCount;
+			FCapConnectorProposal Proposal;
+			Proposal.Kind = Kind;
+			Proposal.Color = EStrokeColor::Red;
+			Proposal.SourceDeadEndId = DeadEnd.DeadEndId;
+			Proposal.TargetStrokeId = Selected->TargetStrokeId;
+			Proposal.Start = DeadEnd.Pos;
+			Proposal.End = Selected->Point;
+			Proposal.Distance = Selected->Distance;
+			FallbackProposals.Add(Proposal);
 		}
 
-		TArray<FColoredStroke> PlanarSourceStrokes;
-		TArray<int32> PlanarSourceIds;
-		for (int32 StrokeId = 0; StrokeId < SourceStrokes.Num(); ++StrokeId)
+		FallbackProposals.Sort(ConnectorProposalLess);
+		int32 RedSegmentConnectorCount = 0;
+		int32 BlackSegmentConnectorCount = 0;
+		for (const FCapConnectorProposal& Proposal : FallbackProposals)
 		{
-			const int32 Before = PlanarSourceStrokes.Num();
-			AppendPlanarStrokeFragments(SourceStrokes[StrokeId], SplitsByStroke[StrokeId], PlanarSourceStrokes);
-			for (int32 i = Before; i < PlanarSourceStrokes.Num(); ++i)
+			if (!TryAppendConnectorProposal(Proposal, SourceStrokes, SyntheticConnectors, ConnectorKeys))
 			{
-				PlanarSourceIds.Add(StrokeId);
+				continue;
+			}
+			if (Proposal.Kind == ECapConnectorKind::BlackSegmentFallback)
+			{
+				++BlackSegmentConnectorCount;
+			}
+			else
+			{
+				++RedSegmentConnectorCount;
 			}
 		}
 
-		struct FEndpointNode
-		{
-			FVector2D Pos = FVector2D::ZeroVector;
-			int32 Degree = 0;
-		};
+		TArray<FColoredStroke> StageBPlanarStrokes;
+		TArray<FCapPlanarStrokeMeta> StageBPlanarMeta;
+		int32 StageBFirstSyntheticStrokeId = INDEX_NONE;
+		BuildRepairPlanarGeometry(
+			SourceStrokes,
+			SyntheticConnectors,
+			StageBPlanarStrokes,
+			StageBPlanarMeta,
+			StageBFirstSyntheticStrokeId);
+
+		// Preserve the existing black endpoint repair pass, but run it against the
+		// topology produced by both red-repair stages and commit it as one batch.
 		struct FEndpointRef
 		{
 			FVector2D Pos = FVector2D::ZeroVector;
@@ -4096,167 +4892,163 @@ namespace FromLZImageOps
 			int32 SourceStrokeId = INDEX_NONE;
 			int32 LocalStrokeId = INDEX_NONE;
 			int32 EndpointIndex = 0;
+			int32 NodeId = INDEX_NONE;
 			bool bSynthetic = false;
 		};
-		TArray<FEndpointNode> EndpointNodes;
+
+		TArray<int32> StageBEdgeIds;
+		for (int32 StrokeId = 0; StrokeId < StageBPlanarStrokes.Num(); ++StrokeId)
+		{
+			if (IsCapTopologyColor(StageBPlanarStrokes[StrokeId].Color))
+			{
+				StageBEdgeIds.Add(StrokeId);
+			}
+		}
+		CapOps::FGraph StageBGraph;
+		CapOps::BuildGraph(
+			StageBPlanarStrokes,
+			StageBEdgeIds,
+			static_cast<float>(CapGeometryEpsilon),
+			StageBFirstSyntheticStrokeId,
+			StageBGraph);
+		TArray<int32> StageBDegree;
+		StageBDegree.Init(0, StageBGraph.NumNodes);
+		for (int32 EdgeId = 0; EdgeId < StageBGraph.StrokeId.Num(); ++EdgeId)
+		{
+			if (StageBDegree.IsValidIndex(StageBGraph.NodeU[EdgeId])) { ++StageBDegree[StageBGraph.NodeU[EdgeId]]; }
+			if (StageBDegree.IsValidIndex(StageBGraph.NodeV[EdgeId])) { ++StageBDegree[StageBGraph.NodeV[EdgeId]]; }
+		}
+
 		TArray<FEndpointRef> EndpointRefs;
-		auto AddEndpointRef = [&](const FStroke& Points, EStrokeColor Color, int32 SourceStrokeId, int32 LocalStrokeId, int32 EndpointIndex, bool bSynthetic)
+		const double ExactTol2 = CapGeometryEpsilon * CapGeometryEpsilon;
+		for (int32 StrokeId = 0; StrokeId < StageBPlanarStrokes.Num(); ++StrokeId)
 		{
-			if (Points.Num() < 2)
+			const FColoredStroke& Stroke = StageBPlanarStrokes[StrokeId];
+			if (!IsCapTopologyColor(Stroke.Color) || Stroke.Points.Num() < 2)
 			{
-				return;
+				continue;
 			}
-			const FVector2D Pos = EndpointIndex == 0 ? Points[0] : Points.Last();
-			int32 NodeId = INDEX_NONE;
-			for (int32 CandidateNodeId = 0; CandidateNodeId < EndpointNodes.Num(); ++CandidateNodeId)
+			for (int32 EndpointIndex = 0; EndpointIndex < 2; ++EndpointIndex)
 			{
-				if (FVector2D::DistSquared(Pos, EndpointNodes[CandidateNodeId].Pos) <= CapGeometryEpsilon * CapGeometryEpsilon)
+				FEndpointRef Ref;
+				Ref.Pos = EndpointIndex == 0 ? Stroke.Points[0] : Stroke.Points.Last();
+				Ref.Color = Stroke.Color;
+				Ref.LocalStrokeId = StrokeId;
+				Ref.EndpointIndex = EndpointIndex;
+				if (StageBPlanarMeta.IsValidIndex(StrokeId))
 				{
-					NodeId = CandidateNodeId;
-					break;
+					Ref.SourceStrokeId = StageBPlanarMeta[StrokeId].SourceStrokeId;
+					Ref.bSynthetic = StageBPlanarMeta[StrokeId].bSynthetic;
 				}
+				for (int32 NodeId = 0; NodeId < StageBGraph.NodePos.Num(); ++NodeId)
+				{
+					if (FVector2D::DistSquared(Ref.Pos, StageBGraph.NodePos[NodeId]) <= ExactTol2)
+					{
+						Ref.NodeId = NodeId;
+						break;
+					}
+				}
+				EndpointRefs.Add(Ref);
 			}
-			if (NodeId == INDEX_NONE)
-			{
-				NodeId = EndpointNodes.AddDefaulted();
-				EndpointNodes[NodeId].Pos = Pos;
-			}
-			++EndpointNodes[NodeId].Degree;
-
-			FEndpointRef Ref;
-			Ref.Pos = Pos;
-			Ref.Color = Color;
-			Ref.SourceStrokeId = SourceStrokeId;
-			Ref.LocalStrokeId = LocalStrokeId;
-			Ref.EndpointIndex = EndpointIndex;
-			Ref.bSynthetic = bSynthetic;
-			EndpointRefs.Add(Ref);
-		};
-		for (int32 i = 0; i < PlanarSourceStrokes.Num(); ++i)
-		{
-			const FColoredStroke& S = PlanarSourceStrokes[i];
-			if (S.Color != EStrokeColor::Red && S.Color != EStrokeColor::Black)
-			{
-				continue;
-			}
-			AddEndpointRef(S.Points, S.Color, PlanarSourceIds.IsValidIndex(i) ? PlanarSourceIds[i] : INDEX_NONE, i, 0, false);
-			AddEndpointRef(S.Points, S.Color, PlanarSourceIds.IsValidIndex(i) ? PlanarSourceIds[i] : INDEX_NONE, i, 1, false);
-		}
-		const int32 FirstSyntheticBeforeBlackPass = SyntheticConnectors.Num();
-		for (int32 i = 0; i < FirstSyntheticBeforeBlackPass; ++i)
-		{
-			const FColoredStroke& S = SyntheticConnectors[i];
-			if (S.Color != EStrokeColor::Red && S.Color != EStrokeColor::Black)
-			{
-				continue;
-			}
-			AddEndpointRef(S.Points, S.Color, INDEX_NONE, i, 0, true);
-			AddEndpointRef(S.Points, S.Color, INDEX_NONE, i, 1, true);
 		}
 
+		TArray<FCapConnectorProposal> BlackEndpointProposals;
 		int32 BlackDeadEndCount = 0;
-		int32 BlackEndpointConnectorCount = 0;
-		TSet<FString> BlackConnectorKeys;
+		int32 BlackDeadEndId = 0;
+		const double ConnectorMaxDistance2 = ConnectorMaxDistance * ConnectorMaxDistance;
 		for (const FEndpointRef& DeadEnd : EndpointRefs)
 		{
-			if (DeadEnd.Color != EStrokeColor::Black || DeadEnd.bSynthetic || !PlanarSourceStrokes.IsValidIndex(DeadEnd.LocalStrokeId))
-			{
-				continue;
-			}
-
-			int32 NodeDegree = 0;
-			for (const FEndpointNode& Node : EndpointNodes)
-			{
-				if (FVector2D::DistSquared(DeadEnd.Pos, Node.Pos) <= CapGeometryEpsilon * CapGeometryEpsilon)
-				{
-					NodeDegree = Node.Degree;
-					break;
-				}
-			}
-			if (NodeDegree != 1)
+			if (DeadEnd.Color != EStrokeColor::Black ||
+				DeadEnd.bSynthetic ||
+				!StageBDegree.IsValidIndex(DeadEnd.NodeId) ||
+				StageBDegree[DeadEnd.NodeId] != 1 ||
+				!StageBPlanarStrokes.IsValidIndex(DeadEnd.LocalStrokeId))
 			{
 				continue;
 			}
 			++BlackDeadEndCount;
-
-			const FVector2D Forward = GetEndpointOutwardDirection(PlanarSourceStrokes[DeadEnd.LocalStrokeId].Points, DeadEnd.EndpointIndex);
+			const FVector2D Forward = GetEndpointOutwardDirection(
+				StageBPlanarStrokes[DeadEnd.LocalStrokeId].Points,
+				DeadEnd.EndpointIndex);
 			if (Forward.IsNearlyZero())
 			{
+				++BlackDeadEndId;
 				continue;
 			}
 
-			int32 BestEndpointIndex = INDEX_NONE;
+			int32 BestTargetRefId = INDEX_NONE;
 			double BestD2 = TNumericLimits<double>::Max();
-			for (int32 CandidateIndex = 0; CandidateIndex < EndpointRefs.Num(); ++CandidateIndex)
+			for (int32 CandidateRefId = 0; CandidateRefId < EndpointRefs.Num(); ++CandidateRefId)
 			{
-				const FEndpointRef& Candidate = EndpointRefs[CandidateIndex];
-				if (Candidate.Color != EStrokeColor::Red && Candidate.Color != EStrokeColor::Black)
-				{
-					continue;
-				}
-				if (!Candidate.bSynthetic && Candidate.SourceStrokeId == DeadEnd.SourceStrokeId)
+				const FEndpointRef& Candidate = EndpointRefs[CandidateRefId];
+				if (!IsCapTopologyColor(Candidate.Color) ||
+					(!Candidate.bSynthetic && Candidate.SourceStrokeId == DeadEnd.SourceStrokeId))
 				{
 					continue;
 				}
 				const FVector2D Delta = Candidate.Pos - DeadEnd.Pos;
 				const double D2 = Delta.SizeSquared();
-				if (D2 <= CapGeometryEpsilon * CapGeometryEpsilon || D2 > ConnectorTol2)
+				if (D2 <= ExactTol2 ||
+					D2 > ConnectorMaxDistance2 ||
+					FVector2D::DotProduct(Delta, Forward) < -CapGeometryEpsilon ||
+					ConnectorCrossesRealGeometry(DeadEnd.Pos, Candidate.Pos, SourceStrokes) ||
+					ConnectorIntersectsAcceptedConnector(DeadEnd.Pos, Candidate.Pos, SyntheticConnectors))
 				{
 					continue;
 				}
-				if (FVector2D::DotProduct(Delta, Forward) < -CapGeometryEpsilon)
-				{
-					continue;
-				}
-				if (D2 < BestD2)
+				if (D2 < BestD2 - CapGeometryEpsilon ||
+					(FMath::IsNearlyEqual(D2, BestD2, CapGeometryEpsilon) && CandidateRefId < BestTargetRefId))
 				{
 					BestD2 = D2;
-					BestEndpointIndex = CandidateIndex;
+					BestTargetRefId = CandidateRefId;
 				}
 			}
-			if (!EndpointRefs.IsValidIndex(BestEndpointIndex))
+			if (EndpointRefs.IsValidIndex(BestTargetRefId))
 			{
-				continue;
+				FCapConnectorProposal Proposal;
+				Proposal.Kind = ECapConnectorKind::BlackEndpointRepair;
+				Proposal.Color = EStrokeColor::Black;
+				Proposal.SourceDeadEndId = BlackDeadEndId;
+				Proposal.TargetDeadEndId = BestTargetRefId;
+				Proposal.Start = DeadEnd.Pos;
+				Proposal.End = EndpointRefs[BestTargetRefId].Pos;
+				Proposal.Distance = FMath::Sqrt(BestD2);
+				BlackEndpointProposals.Add(Proposal);
 			}
-
-			const FVector2D A = DeadEnd.Pos;
-			const FVector2D B = EndpointRefs[BestEndpointIndex].Pos;
-			const int32 Ax = FMath::RoundToInt(A.X);
-			const int32 Ay = FMath::RoundToInt(A.Y);
-			const int32 Bx = FMath::RoundToInt(B.X);
-			const int32 By = FMath::RoundToInt(B.Y);
-			const FString Key = (Ax < Bx || (Ax == Bx && Ay <= By))
-				? FString::Printf(TEXT("%d,%d-%d,%d"), Ax, Ay, Bx, By)
-				: FString::Printf(TEXT("%d,%d-%d,%d"), Bx, By, Ax, Ay);
-			if (BlackConnectorKeys.Contains(Key))
-			{
-				continue;
-			}
-			BlackConnectorKeys.Add(Key);
-
-			FColoredStroke Connector;
-			Connector.Points.Add(A);
-			Connector.Points.Add(B);
-			Connector.Color = EStrokeColor::Black;
-			Connector.ConnectionPointCount = Connector.Points.Num();
-			SyntheticConnectors.Add(MoveTemp(Connector));
-			++BlackEndpointConnectorCount;
+			++BlackDeadEndId;
 		}
 
-		OutStrokes.Reset();
-		OutStrokes = MoveTemp(PlanarSourceStrokes);
-		OutFirstSyntheticStrokeId = OutStrokes.Num();
-		OutStrokes.Append(MoveTemp(SyntheticConnectors));
+		BlackEndpointProposals.Sort(ConnectorProposalLess);
+		int32 BlackEndpointConnectorCount = 0;
+		for (const FCapConnectorProposal& Proposal : BlackEndpointProposals)
+		{
+			if (TryAppendConnectorProposal(Proposal, SourceStrokes, SyntheticConnectors, ConnectorKeys))
+			{
+				++BlackEndpointConnectorCount;
+			}
+		}
+
+		TArray<FCapPlanarStrokeMeta> FinalPlanarMeta;
+		BuildRepairPlanarGeometry(
+			SourceStrokes,
+			SyntheticConnectors,
+			OutStrokes,
+			FinalPlanarMeta,
+			OutFirstSyntheticStrokeId);
 		ComputeStrokeMetrics(OutStrokes);
 
 		UE_LOG(LogTemp, Log,
-			TEXT("Sketch2D Step 9 topology: %d red/black intersection(s), %d initial red dead-end(s), %d red dead-end(s) after red repair, %d black dead-end(s), %d red-red connector(s), %d red-black connector(s), %d black endpoint connector(s), %d planar stroke(s)"),
-			TrueIntersectionCount,
+			TEXT("Sketch2D Step 9 topology: %d real red/red intersection(s), %d real red/black intersection(s), %d initial red dead-end(s), %d exact black contact(s), %d black-contact connector(s), %d endpoint-pair connector(s), %d unresolved after Stage A, %d red-segment connector(s), %d black-segment connector(s), %d black dead-end(s), %d black endpoint connector(s), %d planar stroke fragment(s)"),
+			RealRedRedIntersectionCount,
+			RealRedBlackIntersectionCount,
 			InitialRedDeadEndCount,
-			RedDeadEndsAfterRedRepair.Num(),
+			ExactBlackContactCount,
+			BlackContactConnectorCount,
+			RedEndpointPairConnectorCount,
+			UnresolvedAfterStageA.Num(),
+			RedSegmentConnectorCount,
+			BlackSegmentConnectorCount,
 			BlackDeadEndCount,
-			RedToRedConnectorCount,
-			RedToBlackConnectorCount,
 			BlackEndpointConnectorCount,
 			OutStrokes.Num());
 	}

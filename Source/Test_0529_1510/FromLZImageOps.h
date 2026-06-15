@@ -33,22 +33,22 @@ namespace FromLZImageOps
 	// Input/Output foreground = 255.
 	void ZhangSuenThinning(const TArray<uint8>& In, int32 Width, int32 Height, TArray<uint8>& OutSkel, int32 MaxIter = 100);
 
-	// Step 3 skeleton gap repair (port of Python cleanup_skeleton_endpoints):
-	//   1. Connect mutual-nearest endpoint pairs whose gap <= GapTol and whose
-	//      outward endpoint directions both face the other endpoint within 60 degrees.
-	//      Unmatched endpoints may also connect to the closest skeleton segment in
-	//      the same outward +/-60-degree cone.
-	//      Remaining endpoints then use a directed pool fallback: source <=60 degrees,
-	//      target <=100 degrees, nearest target wins, and a successful pair consumes both.
-	//   2. Prune connections that only close a small loop (bbox area < SmallLoopBboxAreaThresh).
-	//   3. Trim dangling branches shorter than BranchPruneMaxPixels (<=0 -> auto = max(30, 3*GapTol)),
-	//      unless the branch samples as source red/black in SourceColorMap.
-	// Before the full-skeleton small-loop prune, a red/black protection pass treats
-	// each 03a connector as red on top of source red/black skeleton pixels. Connectors
-	// that participate in a red/black loop with bbox area >= SmallLoopBboxAreaThresh
-	// are kept even if the full-skeleton small-loop test would delete them.
-	// All masks are foreground = 255. OutConnected / OutSmallLoopPruned receive the
-	// intermediate stages for debug; pass them and ignore if not needed.
+	// Step 3 skeleton gap repair:
+	//   1. On the original full skeleton, estimate every endpoint's outward direction by
+	//      tracing about 5px inward along its incident edge. Connect strict mutual-nearest
+	//      endpoint pairs (60/60 degrees), then endpoint-to-segment targets (source 60),
+	//      then relaxed endpoint pairs (source 60, target 100). Connector color follows
+	//      the source endpoint's incident-edge color.
+	//   2. Extract a red/black graph from the first-pass result. Red degree-1 endpoints
+	//      run the same strict endpoint, segment/topology-node, and relaxed endpoint
+	//      direction rules against one fixed snapshot. These second-pass connectors are red.
+	//   3. Backfill all connectors into the full skeleton, preserve every green connector,
+	//      prune only connectors that close a small loop, then trim short dangling branches
+	//      by Euclidean path length. Connector pixels participate in branch geometry.
+	// All masks are foreground = 255. OutConnected is the first-pass full-skeleton
+	// result; OutReconnected includes the second red-dead-end reconnect; the remaining
+	// masks are the small-loop-pruned and final branch-cleaned stages. OutEffectiveColorMap
+	// contains the surviving synthetic connector colors for downstream stroke coloring.
 	void CleanupSkeletonEndpoints(
 		const TArray<uint8>& Skel, int32 Width, int32 Height,
 		float GapTol, int32 ConnectThickness,
@@ -56,7 +56,9 @@ namespace FromLZImageOps
 		const TArray<uint8>& SourceColorMap, int32 SourceColorSampleRadius,
 		const FString& RedBlackConnectorsDebugPngPath, const FString& RedBlackReconnectedDebugPngPath,
 		const FString& ConnectorPruneDebugJsonPath,
-		TArray<uint8>& OutConnected, TArray<uint8>& OutSmallLoopPruned, TArray<uint8>& OutCleaned);
+		TArray<uint8>& OutConnected, TArray<uint8>& OutReconnected,
+		TArray<uint8>& OutSmallLoopPruned, TArray<uint8>& OutCleaned,
+		TArray<uint8>& OutEffectiveColorMap);
 
 	// A traced stroke is an ordered polyline of pixel coordinates (x, y).
 	using FStroke = TArray<FVector2D>;
@@ -206,20 +208,23 @@ namespace FromLZImageOps
 	};
 
 	// Step 9: detect every red cap loop in one pipeline run and recover its extrusion.
-	// Real red/black polyline intersections are planarized into shared endpoints first.
-	// The planarized red strokes then form an exact-coordinate topology. Red degree-1
-	// nodes first search their outward 180-degree half-plane for red stroke/endpoint
-	// targets within ConnectorTol and add explicit red connectors. Remaining red
-	// dead ends then search black segments within ConnectorTol, splitting the black
-	// stroke at the projection and adding an explicit red connector. Degree-2
-	// loop/chain nodes, branches, and red interior vertices never initiate this search.
+	// Real red/red and red/black intersections are planarized first, then exact-coordinate red
+	// degree-1 nodes enter a two-stage repair. Stage A resolves black contact within
+	// 2px, then globally pairs compatible red dead ends within ConnectorTol; a black
+	// candidate vetoes a pair only when it is more than 2px closer. The Stage A
+	// connectors are planarized with the real geometry and an exact mixed red/black
+	// graph identifies unresolved original endpoints. Stage B independently searches
+	// real red-segment interiors and black segments in each source endpoint's forward
+	// half-plane; synthetic connectors participate in topology but are not red targets.
+	// Connector paths that hit unrelated real geometry or existing connectors first
+	// are rejected. A final connector-aware planarization precedes graph extraction.
 	// Components are red-driven: red-only loops are selected first, then local black
 	// closures, then fallback red/black traces. Before consuming red strokes, every
 	// candidate must have a valid local-green action and a source polygon that covers
 	// at least 70% of one captured face whose projected normal is within 30 degrees
 	// of the unoriented green side vector and whose plane can be intersected. Conflicting
-	// red-only loops prefer the larger cap area. Red-only loops below 1000 px^2 bbox
-	// area are rejected; local_black and fallback_trace reject loops below 1500 px^2.
+	// red-only loops prefer the larger cap area. All loop sources currently reject
+	// candidates below 500 px^2 bounding-box area.
 	// Black strokes never define the initial component split.
 	// Each selected loop writes its 09a/09b/09 debug into PressDir/Component_%%/. For each cap
 	// an Action.json is written to ActionPressDir/Component_%%/: local green stroke pixels are

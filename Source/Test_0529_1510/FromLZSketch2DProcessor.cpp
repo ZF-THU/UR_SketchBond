@@ -119,10 +119,10 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	const int32 ColorSampleRadius = 2;
 
 	// ---- Step 3: skeleton gap repair ---------------------------------------
-	// Connect mutual-nearest endpoints within --skeleton-gap-tol, prune connections
-	// that only close a small loop (--skeleton-small-loop-bbox-area-thresh), then
-	// trim short dangling branches unless they come from red/black source pixels.
-	TArray<uint8> SkelConnected, SkelSmallLoopPruned, SkelClean;
+	// Run full-skeleton connection, red/black graph reconnect, full-graph backfill,
+	// connector-aware small-loop pruning, and final short-branch cleanup.
+	TArray<uint8> SkelConnected, SkelReconnected, SkelSmallLoopPruned, SkelClean;
+	TArray<uint8> EffectiveColorMap;
 	FromLZImageOps::CleanupSkeletonEndpoints(
 		Skel, Width, Height,
 		/*GapTol*/ 20.0f,
@@ -134,8 +134,9 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 		PressDir / TEXT("03a_red_black_connectors.png"),
 		PressDir / TEXT("03a_red_black_reconnected.png"),
 		PressDir / TEXT("03b_connector_prune_debug.json"),
-		SkelConnected, SkelSmallLoopPruned, SkelClean);
+		SkelConnected, SkelReconnected, SkelSmallLoopPruned, SkelClean, EffectiveColorMap);
 	FromLZImageOps::SaveMaskPng(SkelConnected, Width, Height, PressDir / TEXT("03a_skeleton_connected.png"), /*bInvertForDisplay*/ true);
+	FromLZImageOps::SaveMaskPng(SkelReconnected, Width, Height, PressDir / TEXT("03d_skeleton_reconnected.png"), /*bInvertForDisplay*/ true);
 	FromLZImageOps::SaveMaskPng(SkelSmallLoopPruned, Width, Height, PressDir / TEXT("03b_skeleton_small_loop_pruned.png"), /*bInvertForDisplay*/ true);
 	FromLZImageOps::SaveMaskPng(SkelClean, Width, Height, PressDir / TEXT("03_skeleton_clean.png"), /*bInvertForDisplay*/ true);
 
@@ -153,7 +154,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	FromLZImageOps::SaveStrokesPng(Strokes, Width, Height, PressDir / TEXT("04_strokes.png"));
 
 	TArray<FromLZImageOps::FColoredStroke> ColoredStrokes;
-	FromLZImageOps::ColorizeAndSplitStrokes(Strokes, ColorMap, Width, Height, ColorSampleRadius, ColorMinRunArc, ColoredStrokes);
+	FromLZImageOps::ColorizeAndSplitStrokes(Strokes, EffectiveColorMap, Width, Height, ColorSampleRadius, ColorMinRunArc, ColoredStrokes);
 	FromLZImageOps::SaveColoredStrokesPng(ColoredStrokes, Width, Height, PressDir / TEXT("04_strokes_colored.png"));
 	FromLZImageOps::SaveColoredStrokesJson(ColoredStrokes, Width, Height, PressDir / TEXT("04_strokes.json"), EndpointTol);
 
@@ -220,8 +221,9 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	FromLZImageOps::SaveMaskPng(EnclosedMask, Width, Height, PressDir / TEXT("08_enclosed_mask.png"), /*bInvertForDisplay*/ true);
 
 	// ---- Step 9: per-component red cap-loops -> per-component side -> translate-copy --
-	// Red-driven cap loops planarize real red/black intersections, then connect only red
-	// topology nodes with degree 1 forward to black polyline segments within 20px.
+	// Real red/red and red/black intersections are planarized first. Exact red degree-1 endpoints
+	// then run black-contact + global endpoint pairing, followed by a temporary mixed
+	// graph and an independent real-red-segment/black-segment fallback pass within 20px.
 	TArray<FromLZImageOps::FCapExtrusionResult> Caps;
 	const int32 NumCaps = FromLZImageOps::RecoverCapExtrusionsPerComponent(
 		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 20.0f, Width, Height, PressDir, ActionPressDir, Caps);

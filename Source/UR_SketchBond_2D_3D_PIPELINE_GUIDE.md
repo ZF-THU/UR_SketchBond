@@ -512,6 +512,9 @@ Executed parameters:
 
 - endpoint gap tolerance: `20 pixels`;
 - connector thickness: `1`;
+- endpoint trend trace arc: approximately `5 pixels`;
+- strict source/target endpoint angle: at most `60 degrees`;
+- relaxed target endpoint angle: at most `100 degrees`;
 - small-loop bounding-box threshold: `500 px²`;
 - branch-prune max: automatic, `max(30, 3 * gapTol) = 60 pixels`;
 - color sample radius: `2`.
@@ -524,34 +527,148 @@ Skeleton neighborhood policy:
 - degree 1 is an endpoint;
 - crossing number at least 3 is a branch.
 
-Connector search:
+#### 15.4.1 Endpoint trend
 
-1. mutual-nearest endpoint pairs within tolerance;
-2. both endpoint outward directions must face the other within `60 degrees`;
-3. unmatched endpoints may connect to a nearby skeleton segment in the same
-   forward cone;
-4. a directed fallback allows source deviation `60 degrees` and target
-   deviation `100 degrees`;
-5. a successful fallback consumes both endpoints.
+All Step 3 endpoint angle tests use the same trend calculation:
 
-Every candidate connector is temporarily removed and an alternate shortest
-path is sought. A connector that only creates a loop below `500 px²` is
-removed. Red/black source geometry gets a protection pass: a connector that
-participates in a red/black loop at or above the threshold survives.
+1. start at the endpoint;
+2. follow its incident skeleton edge inward;
+3. at a choice, continue along the neighbor that maximizes the dot product
+   with the previous step direction;
+4. stop after about `5 pixels` of Euclidean arc, or earlier at an endpoint or
+   branch;
+5. calculate `normalize(endpoint - inwardTraceEnd)`.
 
-Dangling branches up to `60 pixels` are pruned unless at least half of the
-would-be-deleted samples classify as red or black.
+The traced incident-edge pixels are retained. Segment searches exclude
+segments touching this set, preventing an endpoint from reconnecting
+backward onto its own first approximately `5 pixels`.
+
+#### 15.4.2 First pass: full skeleton
+
+Input is exactly `02_skeleton.png`. Endpoints and trends are detected once
+from this fixed full-skeleton snapshot.
+
+Search order:
+
+1. `strict_endpoint_to_endpoint`
+   - distance at most `20 pixels`;
+   - source and target trends must each be within `60 degrees`;
+   - each endpoint records its nearest legal endpoint;
+   - the pair is accepted only when the relationship is mutual;
+   - acceptance consumes both endpoints.
+2. `strict_endpoint_to_segment`
+   - only unused endpoints initiate;
+   - the target is the nearest projection on an original skeleton segment;
+   - the clamped projection may coincide with a segment endpoint;
+   - source trend must be within `60 degrees`;
+   - the target has no direction test;
+   - nearest legal projection wins and consumes the source endpoint.
+3. `relaxed_endpoint_to_endpoint`
+   - only unused endpoints participate;
+   - source trend must be within `60 degrees`;
+   - target trend may deviate by at most `100 degrees`;
+   - nearest legal target in stable endpoint scan order wins;
+   - acceptance consumes both endpoints.
+
+Every connector is a one-pixel Bresenham line. `ConnectThickness` remains in
+the API but does not thicken the line.
+
+Connector color follows the source endpoint's approximately `5-pixel`
+incident edge, sampled against the original color map. It can therefore be
+black, red, green, or blue; unresolved color falls back to black.
+
+The result of this pass is `03a_skeleton_connected.png`.
+
+#### 15.4.3 Red/black extraction and second reconnect
+
+The red/black graph is extracted from the first-pass full result:
+
+- original skeleton pixels use sampled source color;
+- synthetic pixels use their first-pass connector color;
+- only red and black pixels enter the search graph;
+- green and blue connectors remain in the full graph but do not enter the
+  red/black search graph.
+
+`03a_red_black_connectors.png` is this pre-reconnect graph.
+
+Only red degree-1 endpoints initiate the second reconnect. Endpoint trends
+again use the approximately `5-pixel` incident-edge trace. All candidates use
+one fixed pre-reconnect red/black snapshot, so newly generated second-pass
+connectors cannot become targets in the same search.
+
+Search order:
+
+1. `red_reconnect_strict_endpoint_to_endpoint`
+   - distance at most `20 pixels`;
+   - source angle at most `60 degrees`;
+   - target angle at most `60 degrees`;
+   - all legal pairs are sorted by distance and accepted nearest-first;
+   - mutual-nearest is not required;
+   - acceptance consumes both endpoints.
+2. `red_reconnect_strict_endpoint_to_segment`
+   - only still-unused red endpoints initiate;
+   - target may be an existing branch/topology node or strict segment
+     interior;
+   - source angle at most `60 degrees`;
+   - target has no direction test;
+   - nearest node/interior projection wins and consumes the source.
+3. `red_reconnect_relaxed_endpoint_to_endpoint`
+   - only still-unused endpoints participate;
+   - source angle at most `60 degrees`;
+   - target angle at most `100 degrees`;
+   - all legal pairs are sorted by distance and accepted nearest-first;
+   - acceptance consumes both endpoints.
+
+All second-pass connectors are red. They are added to both the red/black graph
+and the full skeleton. The outputs are:
+
+```text
+03a_red_black_reconnected.png
+03d_skeleton_reconnected.png
+```
+
+#### 15.4.4 Connector pruning and final cleanup
+
+Small-loop pruning starts from `03d_skeleton_reconnected.png`.
+
+- every green connector is protected unconditionally;
+- a red/black connector is protected when its red/black alternate path forms
+  a bounding box of at least `500 px²`;
+- for every other connector, only pixels solely owned by that connector are
+  temporarily removed;
+- no full-graph alternate path means the connector is required and restored;
+- an alternate-path loop below `500 px²` deletes the connector;
+- a larger loop restores the connector;
+- connector ownership is counted, so deleting one connector does not erase a
+  pixel still owned by another connector.
+
+The result is `03b_skeleton_small_loop_pruned.png`.
+
+Final short-branch cleanup traces the surviving full graph, including all
+backfilled connector pixels and green connectors. Branch length is Euclidean
+polyline arc rather than point count. Branches up to `60 pixels` are removed
+unless at least half of the would-be-deleted samples classify as red or black
+in the effective source-plus-connector color map.
+
+The result is `03_skeleton_clean.png`. Step 4 receives a matching effective
+color map, so surviving synthetic pixels keep their connector color instead
+of being inferred from background.
 
 Outputs:
 
 ```text
 03a_red_black_connectors.png
 03a_red_black_reconnected.png
-03b_connector_prune_debug.json
 03a_skeleton_connected.png
+03d_skeleton_reconnected.png
 03b_skeleton_small_loop_pruned.png
 03_skeleton_clean.png
+03b_connector_prune_debug.json
 ```
+
+The JSON records connector stage, color, endpoints, gap length, source and
+target angles, target type, alternate-path results, protection state, and
+final keep/delete decision.
 
 ### 15.5 Step 4: graph tracing and color splitting
 
@@ -560,7 +677,8 @@ Outputs:
 - a second pass traces remaining edges, including pure cycles;
 - at choices, continuation maximizes direction dot product.
 
-Per-point labels are grouped into color runs. Unclassified connector runs are
+Per-point labels are grouped into color runs. Step 3 connector pixels already
+carry their source connector color. Any remaining unclassified runs are
 resolved from neighbors:
 
 - same/single neighbor color: use that color;
@@ -652,23 +770,161 @@ candidate loops exist. Blue is ignored from this point onward.
 
 ### 16.1 Planarization
 
-All real red/black segment intersections are found, including boundaries of
-collinear overlaps. Strokes are split at those intersection parameters.
+All real red/red and red/black segment intersections are found, including
+boundaries of collinear overlaps. Both strokes are split at those intersection
+parameters. Real black/black crossings are not converted into topology nodes.
 
-Endpoint direction is estimated over approximately `5 pixels` of arc.
+The initial red topology uses exact endpoint coordinates, with
+`CapGeometryEpsilon = 1e-6`; it does not use the later `5-pixel` graph snap.
+Only red nodes with red degree `1` become repair sources. Degree-2 chain/loop
+nodes, branches, and interior vertices never enter the dead-end pool.
 
-Synthetic repair sequence with `20-pixel` tolerance:
+Endpoint outward direction is measured from approximately `5 pixels` of arc.
+Every nonzero search vector must remain in the source endpoint's forward
+half-plane:
 
-1. red degree-1 endpoints search forward for a red segment/endpoint;
-2. remaining red degree-1 endpoints search forward for a black segment;
-3. connecting to an interior point splits the target stroke;
-4. black degree-1 endpoints may connect to nearby red/black endpoints;
-5. synthetic red and black connectors are appended to the planarized strokes.
+```text
+dot(target - endpoint, outward_direction) >= 0
+```
 
-Only red degree-1 topology nodes initiate red repair. Degree-2 nodes,
-branches, and interior vertices do not.
+There is no 60-degree cone. A direction almost perpendicular to the endpoint
+trend remains eligible as long as it is not behind the endpoint.
 
-After repair, graph endpoints are snapped into shared nodes within `5 pixels`.
+The repair constants are:
+
+```text
+black contact distance = 2 px
+maximum connector distance = ConnectorTol = 20 px
+black preference bias = 2 px
+```
+
+#### 16.1.1 Stage A: black contact
+
+Every initial red dead end first searches all real black segments:
+
+1. distance `<= 2 px`;
+2. an exact contact is accepted regardless of direction;
+3. a nonzero contact must satisfy the forward-half-plane test;
+4. the nearest viable black contact is retained.
+
+An exact contact requires no synthetic edge because initial red/black
+planarization already created a shared node. A nonzero contact creates a red
+synthetic connector from the red endpoint to the closest black point.
+
+Black-contact proposals are sorted by distance and stable endpoint IDs. A
+connector is rejected if, before reaching its intended endpoint, it intersects
+real red/black geometry, or if it intersects an already accepted connector
+anywhere except a shared endpoint.
+
+Accepted black contacts are removed from red endpoint pairing.
+
+#### 16.1.2 Stage A: red endpoint pairing
+
+All remaining red dead ends are compared globally. A pair is eligible when:
+
+1. endpoint distance is greater than zero and at most `20 px`;
+2. A sees B in A's forward half-plane, or B sees A in B's forward half-plane;
+3. the direct connector path is geometrically clear.
+
+The target endpoint does not need to face the source endpoint. Pairing the two
+ends of the same original red stroke is allowed.
+
+Each endpoint independently records its nearest viable ordinary black-segment
+candidate. A pair of distance `pairDistance` is vetoed when either endpoint
+satisfies:
+
+```text
+blackDistance + 2 px < pairDistance
+```
+
+Equality does not make black win.
+
+All surviving pair edges are sorted by:
+
+1. distance;
+2. source dead-end ID;
+3. target dead-end ID.
+
+The pass greedily accepts an edge only if neither endpoint has already been
+occupied. This makes the result deterministic and prioritizes the shortest
+local repairs, although it is not a maximum-cardinality matching algorithm.
+Both endpoints of an accepted pair are marked together.
+
+#### 16.1.3 Stage A commit and temporary graph
+
+Black-contact and endpoint-pair connectors are committed in one Stage A
+geometry set. Planarization is then repeated with these rules:
+
+- real red/red and red/black intersections are split;
+- every intersection involving a synthetic connector is split on both sides;
+- real black/black crossings remain unsplit;
+- real green/blue strokes do not participate in cap topology.
+
+Real fragments are emitted first and synthetic fragments afterward, preserving
+the `FirstSyntheticStrokeId` contract.
+
+An exact-coordinate mixed red/black graph is built from this geometry. Only
+the original red dead-end IDs are checked again; new synthetic fragment
+endpoints never become new repair sources. An original endpoint is unresolved
+only when its mixed-graph node still has total degree `1`. Thus an endpoint
+connected to black remains red-degree `1` but is correctly considered solved.
+The final `5-pixel` snap is deliberately not used here.
+
+#### 16.1.4 Stage B: independent segment search
+
+Every unresolved original endpoint searches two candidate classes from the
+same Stage A snapshot.
+
+Real red candidate:
+
+- distance at most `20 px`;
+- source forward-half-plane test;
+- excludes the endpoint's own original source stroke;
+- target must be in the strict interior of a real red stroke;
+- synthetic red connectors are not target geometry.
+
+Black candidate:
+
+- distance at most `20 px`;
+- source forward-half-plane test;
+- may target a real black endpoint or interior segment point.
+
+The two searches are independent. The endpoint's single result is:
+
+```text
+only red candidate       -> red
+only black candidate     -> black
+both candidates:
+    blackDistance + 2 px < redDistance -> black
+    otherwise                         -> red
+neither candidate        -> unresolved
+```
+
+Stage B proposals are sorted by distance and stable IDs. Multiple connectors
+may target the same real point, but duplicate connector edges are removed.
+A later proposal is rejected if its path intersects unrelated real geometry
+before its target, passes through an existing connector, or crosses an earlier
+accepted proposal. Rejected proposals do not trigger another candidate search.
+
+Synthetic red connectors participate in temporary/final topology,
+planarization, `red_only`, `local_black`, and `fallback_trace`; they are
+excluded only as active red-segment targets in Stage B.
+
+#### 16.1.5 Black endpoint repair and final planarization
+
+After Stage B is committed and planarized, real black endpoints whose exact
+mixed-graph degree is still `1` may connect forward to nearby red/black
+endpoints within `20 px`. These black proposals are also batched, distance
+sorted, deduplicated, and checked against real geometry and accepted
+connectors.
+
+The complete source geometry and all accepted red/black connectors are then
+planarized once more. Synthetic connector intersections become real graph
+nodes. There is no unbounded repair iteration: red repair has exactly Stage A
+and Stage B, followed by the black endpoint pass.
+
+Only after this process do graph endpoints snap into shared nodes within
+`5 pixels` for cap-loop extraction.
 
 Root diagnostic outputs:
 
