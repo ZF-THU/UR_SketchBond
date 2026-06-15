@@ -78,6 +78,8 @@ implementation code. Project-specific Boolean policy lives in
 | Input | Behavior |
 | --- | --- |
 | `Enter` | Start an orthographic scene capture. |
+| `1` | Capture with the unique actor tagged `FromLZCaptureCamera1`. |
+| `2` | Capture with the unique actor tagged `FromLZCaptureCamera2`. |
 | `Space` | If the board exists, save it and process; otherwise process the latest saved sketch. |
 | `B` | Restore a minimized sketch board. |
 | Left or Right `Shift` | Undo the newest active Step 11 press. |
@@ -152,6 +154,15 @@ Enter
   -> finalize projection diagnostics
   -> open the sketch board
 
+1 or 2
+  -> find exactly one actor with the corresponding capture-camera tag
+  -> require exactly one registered active camera component on that actor
+  -> save the original player view target
+  -> switch the rendered viewport to the tagged camera
+  -> run the same orthographic capture/output pipeline as Enter
+  -> restore the tagged camera projection and the original player view target
+  -> open the sketch board for that exact capture
+
 Proceed or Space
   -> save composite sketch image
   -> select latest sketch and latest main capture
@@ -205,6 +216,20 @@ projection actually rendered by the game viewport.
 
 The pending capture times out after `10 seconds`.
 
+`Enter` always resolves the `FromLZ` camera component on the controlled pawn.
+It does not search tagged scene cameras.
+
+`BeginCaptureFromTaggedCamera` is used by `1` and `2`. It:
+
+1. resolves exactly one actor with the requested Actor Tag;
+2. requires exactly one registered active camera component on that actor;
+3. switches the player view target to that actor;
+4. waits for the target camera pose to be observed in the rendered viewport;
+5. then enters the ordinary orthographic settle/capture state.
+
+Actor Tags, not actor names or editor labels, are the packaged-build contract.
+Missing or duplicate tags abort capture without falling back to `FromLZ`.
+
 ### 6.2 Settle and capture
 
 `NotifyViewportDrawn` counts rendered frames, captures the first orthographic
@@ -234,7 +259,10 @@ After outputs are generated:
 3. A restored-perspective rendered frame is recorded.
 4. Projection/transform debug JSON is finalized.
 
-Canceling a pending capture also restores the camera before dropping state.
+For tagged-camera capture, the original player view target is restored after
+the tagged camera projection has been restored and rendered. Canceling,
+timing out, or Tab-resetting a pending capture restores both the selected
+camera projection and the original view target before dropping state.
 
 ## 7. Capture Subject Filtering
 
@@ -408,6 +436,13 @@ then invokes sketch processing.
    `FromLZ_YYYYMMDD_HHMMSS.png`.
 4. Auxiliary face/debug/ID PNGs therefore cannot be selected.
 5. Ties in modification time are resolved by filename.
+
+Proceed from an open sketch board does not perform this latest-capture lookup.
+The board retains the exact main capture PNG used as its background and passes
+that path together with the saved sketch to `ProcessSketch`. The resulting
+`capture_ref.json` therefore remains bound to the same capture stem even if a
+newer capture appears while the board is open. Space without a board retains
+the latest-sketch/latest-capture behavior.
 
 If capture dimensions differ, the sketch is center-cropped or white-padded to
 the capture size. No scaling is performed.

@@ -50,6 +50,18 @@ bool UFromLZGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ invoked from viewport input. Key=%s"), *EventArgs.Key.ToString());
 			FFromLZCaptureUtils::BeginCaptureFromWorld(GetWorld(), Viewport);
 		}
+		else if (EventArgs.Key == EKeys::One)
+		{
+			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ tagged-camera capture invoked. Key=%s Tag=FromLZCaptureCamera1"), *EventArgs.Key.ToString());
+			FFromLZCaptureUtils::BeginCaptureFromTaggedCamera(GetWorld(), Viewport, TEXT("FromLZCaptureCamera1"));
+			return true;
+		}
+		else if (EventArgs.Key == EKeys::Two)
+		{
+			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ tagged-camera capture invoked. Key=%s Tag=FromLZCaptureCamera2"), *EventArgs.Key.ToString());
+			FFromLZCaptureUtils::BeginCaptureFromTaggedCamera(GetWorld(), Viewport, TEXT("FromLZCaptureCamera2"));
+			return true;
+		}
 		else if (EventArgs.Key == EKeys::LeftShift || EventArgs.Key == EKeys::RightShift)
 		{
 			UE_LOG(LogTemp, Log, TEXT("Step11 restore invoked from viewport input. Key=%s"), *EventArgs.Key.ToString());

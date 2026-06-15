@@ -207,6 +207,11 @@ namespace
 			return SaveRGBAToPng(CompositeRGBA, Width, Height, OutPath);
 		}
 
+		const FString& GetCapturePngPath() const
+		{
+			return CapturePngPath;
+		}
+
 	private:
 		bool DecodePngToRGBA(const FString& Path, TArray<uint8>& OutPixels, int32& OutWidth, int32& OutHeight)
 		{
@@ -642,8 +647,9 @@ bool FFromLZSketchBoard::SaveCurrentSketchAndProceed(UWorld* World)
 	}
 
 	UE_LOG(LogTemp, Log, TEXT("SketchBoard: saved sketch %s and proceeding."), *SketchPath);
+	const FString CapturePngPath = GSketchBoardState->GetCapturePngPath();
 	Close();
-	FFromLZSketchProcessor::ProcessLatestSketch(WorldToUse);
+	FFromLZSketchProcessor::ProcessSketch(WorldToUse, SketchPath, CapturePngPath);
 	return true;
 }
 

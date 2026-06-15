@@ -87,11 +87,6 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 {
 	const FString SketchDir = FPaths::ProjectSavedDir() / TEXT("FromSketch");
 	const FString CaptureDir = FPaths::ProjectSavedDir() / TEXT("FromLZCaptures");
-	const FString ProcessDir = FPaths::ProjectSavedDir() / TEXT("FromProcess");
-
-	IFileManager::Get().MakeDirectory(*ProcessDir, true);
-
-	// 1) Latest hand sketch (red/green/blue lines on white) from FromSketch.
 	const FString SketchPng = FindLatestPng(SketchDir);
 	if (SketchPng.IsEmpty())
 	{
@@ -99,6 +94,25 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 		return;
 	}
 
+	const FString CapturePng = FindLatestPng(CaptureDir, /*bRequireCaptureMainPng*/ true);
+	ProcessSketch(World, SketchPng, CapturePng);
+}
+
+void FFromLZSketchProcessor::ProcessSketch(UWorld* World, const FString& SketchPng, const FString& CapturePng)
+{
+	const FString CaptureDir = FPaths::ProjectSavedDir() / TEXT("FromLZCaptures");
+	const FString ProcessDir = FPaths::ProjectSavedDir() / TEXT("FromProcess");
+
+	IFileManager::Get().MakeDirectory(*ProcessDir, true);
+
+	if (SketchPng.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: sketch path is empty."));
+		return;
+	}
+
+	// 1) Hand sketch explicitly paired with the board's source capture, or the
+	// latest sketch when ProcessLatestSketch is used without an open board.
 	TArray<uint8> SketchPixels;
 	int32 SW = 0;
 	int32 SH = 0;
@@ -109,14 +123,34 @@ void FFromLZSketchProcessor::ProcessLatestSketch(UWorld* World)
 	}
 	UE_LOG(LogTemp, Log, TEXT("ProcessSketch: sketch=%s (%dx%d)"), *SketchPng, SW, SH);
 
-	// 2) Latest captured line-art (black lines on white) from FromLZCaptures.
-	const FString CapturePng = FindLatestPng(CaptureDir, /*bRequireCaptureMainPng*/ true);
+	// 2) Captured line-art explicitly paired with this sketch.
 	TArray<uint8> CapturePixels;
 	int32 CW = 0;
 	int32 CH = 0;
 	const bool bHasCapture = !CapturePng.IsEmpty() && DecodePngToRGBA(CapturePng, CapturePixels, CW, CH) && CW > 0 && CH > 0;
+	if (!CapturePng.IsEmpty() && !bHasCapture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: explicitly paired capture is unavailable or invalid: %s"), *CapturePng);
+		return;
+	}
 	if (bHasCapture)
 	{
+		const FString CaptureStem = FPaths::GetBaseFilename(CapturePng);
+		const FString CaptureDirectory = FPaths::GetPath(CapturePng);
+		const FString CaptureJson = CaptureDirectory / (CaptureStem + TEXT(".json"));
+		const FString FacesPng = CaptureDirectory / (CaptureStem + TEXT("_faces.png"));
+		const FString FacesJson = CaptureDirectory / (CaptureStem + TEXT("_faces.json"));
+		if (!IFileManager::Get().FileExists(*CaptureJson) ||
+			!IFileManager::Get().FileExists(*FacesPng) ||
+			!IFileManager::Get().FileExists(*FacesJson))
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("ProcessSketch: paired capture set is incomplete and will not be replaced by a newer capture: %s"),
+				*CaptureStem);
+			return;
+		}
 		UE_LOG(LogTemp, Log, TEXT("ProcessSketch: capture=%s (%dx%d)"), *CapturePng, CW, CH);
 	}
 	else

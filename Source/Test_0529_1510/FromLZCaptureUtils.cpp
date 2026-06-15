@@ -277,6 +277,14 @@ struct FScopedFromLZCameraProjectionOverride
 	bool bActive = false;
 };
 
+enum class EFromLZCapturePhase : uint8
+{
+	WaitingForTargetView,
+	WaitingForStableOrthographic,
+	WaitingForCaptureCameraRestore,
+	WaitingForOriginalViewTargetRestore
+};
+
 struct FPendingFromLZCapture
 {
 	struct FOutputPaths
@@ -294,26 +302,33 @@ struct FPendingFromLZCapture
 		FString ActorMaterialJsonPath;
 	};
 
+	TWeakObjectPtr<APlayerController> PlayerController;
 	TWeakObjectPtr<APawn> Pawn;
+	TWeakObjectPtr<AActor> CameraActor;
 	TWeakObjectPtr<UCameraComponent> Camera;
+	TWeakObjectPtr<AActor> OriginalViewTarget;
 	TWeakObjectPtr<UWorld> World;
 	TUniquePtr<FScopedFromLZCameraProjectionOverride> ProjectionOverride;
 	FOutputPaths OutputPaths;
+	FString CameraSource = TEXT("pawn_fromlz");
+	FName RequestedCameraTag = NAME_None;
+	EFromLZCapturePhase Phase = EFromLZCapturePhase::WaitingForStableOrthographic;
 	FFromLZViewDebugSnapshot PerspectiveBefore;
 	FFromLZViewDebugSnapshot OrthographicFirstRendered;
 	FFromLZViewDebugSnapshot OrthographicStable;
 	FFromLZViewDebugSnapshot PerspectiveRestored;
 	double OrthographicStartTimeSeconds = 0.0;
 	double StableFrameElapsedSeconds = 0.0;
-	double RestoreStartTimeSeconds = 0.0;
+	double PhaseStartTimeSeconds = 0.0;
 	int32 OrthographicFramesRendered = 0;
 	int32 RestoredPerspectiveFramesRendered = 0;
 	bool bOutputsGenerated = false;
 	bool bCaptureSucceeded = false;
 	bool bFirstOrthographicFrameRecorded = false;
 	bool bStableOrthographicFrameRendered = false;
-	bool bWaitingForRestoredPerspective = false;
 	bool bRestoredPerspectiveFrameRendered = false;
+	bool bOriginalViewTargetRestoredFrameRendered = false;
+	bool bViewTargetChanged = false;
 	bool bCompleting = false;
 };
 
@@ -1578,7 +1593,7 @@ static FFromLZViewDebugSnapshot CaptureViewDebugSnapshot(
 	Snapshot.PawnTransform = Pawn->GetActorTransform();
 	Snapshot.CameraComponentTransform = Camera->GetComponentTransform();
 	Snapshot.CameraProjection = MakeCameraProjectionSnapshot(Camera);
-	if (USpringArmComponent* CameraBoom = FFromLZCaptureUtils::FindCameraBoom(Pawn))
+	if (USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(Camera->GetAttachParent()))
 	{
 		Snapshot.bHasCameraBoom = true;
 		Snapshot.CameraBoomTransform = CameraBoom->GetComponentTransform();
@@ -1760,12 +1775,22 @@ static bool ActorHasVisibleCaptureMeshComponent(AActor* Actor)
 	return false;
 }
 
-static bool IsCaptureSubjectCandidate(AActor* Actor, const APawn* Pawn)
+static bool IsCaptureSubjectCandidate(AActor* Actor, const APawn* Pawn, const AActor* CameraActor)
 {
-	return Actor && Actor != Pawn && !Actor->IsHidden() && ActorHasVisibleCaptureMeshComponent(Actor);
+	return Actor &&
+		Actor != Pawn &&
+		Actor != CameraActor &&
+		!Actor->IsHidden() &&
+		ActorHasVisibleCaptureMeshComponent(Actor);
 }
 
-static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<AActor*>& OutActors, FString& OutMode)
+static void BuildCaptureSubjectActors(
+	UWorld* World,
+	const APawn* Pawn,
+	const AActor* CameraActor,
+	const UCameraComponent* Camera,
+	TArray<AActor*>& OutActors,
+	FString& OutMode)
 {
 	OutActors.Reset();
 	OutMode = TEXT("none");
@@ -1774,7 +1799,6 @@ static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<A
 		return;
 	}
 
-	const UCameraComponent* Camera = FFromLZCaptureUtils::FindFromLZCamera(Pawn);
 	const bool bHasCaptureCamera = IsValid(Camera);
 	const FVector CameraLocation = bHasCaptureCamera ? Camera->GetComponentLocation() : FVector::ZeroVector;
 
@@ -1790,7 +1814,7 @@ static void BuildCaptureSubjectActors(UWorld* World, const APawn* Pawn, TArray<A
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		AActor* Actor = *It;
-		if (!IsCaptureSubjectCandidate(Actor, Pawn))
+		if (!IsCaptureSubjectCandidate(Actor, Pawn, CameraActor))
 		{
 			continue;
 		}
@@ -2660,33 +2684,32 @@ static bool CaptureLineArtPng(
 	return bSaved;
 }
 
-static bool CompleteCaptureFromPawn(
-	const APawn* Pawn,
-	FViewport* Viewport,
-	const FScopedFromLZCameraProjectionOverride& ProjectionOverride,
-	const FFromLZViewDebugSnapshot& StableOrthographicView,
-	const FPendingFromLZCapture::FOutputPaths& OutputPaths,
-	int32 OrthographicFramesRendered,
-	double StableFrameElapsedSeconds)
+static bool CompleteCaptureFromTarget(
+	const FPendingFromLZCapture& Pending,
+	FViewport* Viewport)
 {
+	const APawn* Pawn = Pending.Pawn.Get();
+	UCameraComponent* CameraComponent = Pending.Camera.Get();
+	AActor* CameraActor = Pending.CameraActor.Get();
+	const FScopedFromLZCameraProjectionOverride* ProjectionOverride = Pending.ProjectionOverride.Get();
+	const FPendingFromLZCapture::FOutputPaths& OutputPaths = Pending.OutputPaths;
+
 	if (!Pawn)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: controlled pawn is null."));
 		return false;
 	}
 
-	UCameraComponent* CameraComponent = FFromLZCaptureUtils::FindFromLZCamera(Pawn);
-	USpringArmComponent* CameraBoom = FFromLZCaptureUtils::FindCameraBoom(Pawn);
-
 	if (!CameraComponent)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: FromLZ camera component was not found on pawn %s."), *Pawn->GetName());
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: selected camera component is unavailable."));
 		return false;
 	}
+	USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(CameraComponent->GetAttachParent());
 
-	if (!ProjectionOverride.bActive || CameraComponent->ProjectionMode != ECameraProjectionMode::Orthographic)
+	if (!ProjectionOverride || !ProjectionOverride->bActive || CameraComponent->ProjectionMode != ECameraProjectionMode::Orthographic)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: FromLZ camera is not in the pending orthographic capture state."));
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: selected camera is not in the pending orthographic capture state."));
 		return false;
 	}
 
@@ -2694,12 +2717,12 @@ static bool CompleteCaptureFromPawn(
 	if (!BuildCaptureViewFromOrthographicCamera(
 		Pawn,
 		CameraComponent,
-		ProjectionOverride.bUsedDefaultOrthoWidth,
+		ProjectionOverride->bUsedDefaultOrthoWidth,
 		Viewport,
-		StableOrthographicView,
+		Pending.OrthographicStable,
 		CaptureView))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not build the direct FromLZ orthographic capture view."));
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not build the selected orthographic capture view."));
 		return false;
 	}
 
@@ -2712,7 +2735,7 @@ static bool CompleteCaptureFromPawn(
 
 	TArray<AActor*> SubjectActors;
 	FString SubjectMode;
-	BuildCaptureSubjectActors(Pawn->GetWorld(), Pawn, SubjectActors, SubjectMode);
+	BuildCaptureSubjectActors(Pawn->GetWorld(), Pawn, CameraActor, CameraComponent, SubjectActors, SubjectMode);
 
 	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
 	RootObject->SetStringField(TEXT("capture_timestamp"), OutputPaths.Timestamp);
@@ -2725,21 +2748,26 @@ static bool CompleteCaptureFromPawn(
 	RootObject->SetStringField(TEXT("debug_transforms_json_path"), OutputPaths.DebugTransformsJsonPath);
 	RootObject->SetStringField(TEXT("actor_material_png_path"), OutputPaths.ActorMaterialPngPath);
 	RootObject->SetStringField(TEXT("actor_material_json_path"), OutputPaths.ActorMaterialJsonPath);
+	RootObject->SetStringField(TEXT("capture_camera_source"), Pending.CameraSource);
+	RootObject->SetStringField(TEXT("requested_camera_tag"), Pending.RequestedCameraTag.IsNone() ? FString() : Pending.RequestedCameraTag.ToString());
+	RootObject->SetStringField(TEXT("capture_camera_actor"), GetNameSafe(CameraActor));
+	RootObject->SetStringField(TEXT("capture_camera_component"), GetNameSafe(CameraComponent));
+	RootObject->SetBoolField(TEXT("view_target_was_changed"), Pending.bViewTargetChanged);
 	RootObject->SetObjectField(TEXT("pawn"), FFromLZCaptureUtils::SerializeObjectProperties(Pawn));
 	RootObject->SetObjectField(TEXT("pawn_transform"), FFromLZCaptureUtils::SerializeTransform(Pawn->GetActorTransform()));
 	RootObject->SetObjectField(TEXT("camera_component"), FFromLZCaptureUtils::SerializeObjectProperties(CameraComponent));
 	RootObject->SetObjectField(TEXT("camera_component_transform"), FFromLZCaptureUtils::SerializeTransform(CameraComponent->GetComponentTransform()));
 	RootObject->SetBoolField(TEXT("camera_projection_temporarily_overridden"), true);
 	RootObject->SetStringField(TEXT("camera_projection_restore_policy"), TEXT("restore_original_after_capture"));
-	RootObject->SetBoolField(TEXT("capture_ortho_width_used_default"), ProjectionOverride.bUsedDefaultOrthoWidth);
-	RootObject->SetNumberField(TEXT("orthographic_viewport_frames_rendered_before_capture"), OrthographicFramesRendered);
+	RootObject->SetBoolField(TEXT("capture_ortho_width_used_default"), ProjectionOverride->bUsedDefaultOrthoWidth);
+	RootObject->SetNumberField(TEXT("orthographic_viewport_frames_rendered_before_capture"), Pending.OrthographicFramesRendered);
 	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_required"), FromLZOrthographicSettleSeconds);
-	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_actual"), StableFrameElapsedSeconds);
+	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_actual"), Pending.StableFrameElapsedSeconds);
 	RootObject->SetBoolField(TEXT("debug_viewport_perspective_saved"), true);
 	RootObject->SetBoolField(TEXT("debug_viewport_orthographic_saved"), bOrthographicViewportSaved);
 	RootObject->SetStringField(TEXT("debug_viewport_perspective_capture_source"), TEXT("displayed_game_viewport_backbuffer_before_projection_override"));
 	RootObject->SetStringField(TEXT("debug_viewport_orthographic_capture_source"), TEXT("game_viewport_backbuffer_after_two_second_orthographic_settle"));
-	RootObject->SetObjectField(TEXT("original_camera_projection"), SerializeCameraProjectionSnapshot(ProjectionOverride.Original));
+	RootObject->SetObjectField(TEXT("original_camera_projection"), SerializeCameraProjectionSnapshot(ProjectionOverride->Original));
 	RootObject->SetObjectField(TEXT("capture_camera_projection"), SerializeCameraProjectionSnapshot(MakeCameraProjectionSnapshot(CameraComponent)));
 	RootObject->SetObjectField(TEXT("source_view_transform"), FFromLZCaptureUtils::SerializeTransform(CaptureView.SourceViewTransform));
 	RootObject->SetStringField(TEXT("source_view_transform_source"), CaptureView.SourceViewTransformSource);
@@ -2804,7 +2832,13 @@ static bool CompleteCaptureFromPawn(
 	CaptureFromLZCameraDebugPng(Pawn, CameraComponent, CaptureView, OutputPaths.DebugFromLZCameraPngPath);
 
 	const bool bLineArtSaved = CaptureLineArtPng(Pawn, CameraComponent, CaptureView, SubjectActors, SubjectMode, OutputPaths.PngPath, OutputPaths.DebugTransformsJsonPath);
-	if (bLineArtSaved)
+	const FString FacesBase = FPaths::Combine(FPaths::GetPath(OutputPaths.PngPath), FPaths::GetBaseFilename(OutputPaths.PngPath));
+	const bool bRequiredOutputsAvailable =
+		bLineArtSaved &&
+		IFileManager::Get().FileExists(*OutputPaths.JsonPath) &&
+		IFileManager::Get().FileExists(*(FacesBase + TEXT("_faces.png"))) &&
+		IFileManager::Get().FileExists(*(FacesBase + TEXT("_faces.json")));
+	if (bRequiredOutputsAvailable)
 	{
 		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ saved json to %s and line-art png to %s"), *OutputPaths.JsonPath, *OutputPaths.PngPath);
 		if (GEngine && GEngine->GameViewport)
@@ -2814,12 +2848,151 @@ static bool CompleteCaptureFromPawn(
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ saved json to %s but line-art png failed: %s"), *OutputPaths.JsonPath, *OutputPaths.PngPath);
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("CaptureFromLZ did not open the sketch board because required capture outputs are incomplete: json=%d line=%d faces_png=%d faces_json=%d"),
+			IFileManager::Get().FileExists(*OutputPaths.JsonPath) ? 1 : 0,
+			bLineArtSaved ? 1 : 0,
+			IFileManager::Get().FileExists(*(FacesBase + TEXT("_faces.png"))) ? 1 : 0,
+			IFileManager::Get().FileExists(*(FacesBase + TEXT("_faces.json"))) ? 1 : 0);
 	}
+	return bRequiredOutputsAvailable;
+}
+
+static AActor* GetPendingRestoreViewTarget(const FPendingFromLZCapture& Pending)
+{
+	if (AActor* OriginalViewTarget = Pending.OriginalViewTarget.Get())
+	{
+		return OriginalViewTarget;
+	}
+	return Pending.Pawn.Get();
+}
+
+static void RestorePendingCaptureState(FPendingFromLZCapture& Pending)
+{
+	if (Pending.ProjectionOverride)
+	{
+		Pending.ProjectionOverride->Restore();
+	}
+
+	if (Pending.bViewTargetChanged)
+	{
+		if (APlayerController* PlayerController = Pending.PlayerController.Get())
+		{
+			if (AActor* RestoreTarget = GetPendingRestoreViewTarget(Pending))
+			{
+				PlayerController->SetViewTarget(RestoreTarget);
+			}
+		}
+	}
+}
+
+static void ResetPendingCapture(const TCHAR* Reason)
+{
+	if (!GPendingFromLZCapture)
+	{
+		return;
+	}
+
+	RestorePendingCaptureState(*GPendingFromLZCapture);
+	UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: pending capture ended: %s"), Reason ? Reason : TEXT("unspecified"));
+	GPendingFromLZCapture.Reset();
+}
+
+static bool PreparePendingOrthographicCapture(FPendingFromLZCapture& Pending, FViewport* Viewport)
+{
+	APawn* Pawn = Pending.Pawn.Get();
+	UCameraComponent* Camera = Pending.Camera.Get();
+	if (!Pawn || !Camera || !Viewport)
+	{
+		return false;
+	}
+
+	Pending.PerspectiveBefore =
+		CaptureViewDebugSnapshot(TEXT("perspective_before_switch"), Pawn, Camera, Viewport);
+	if (!CaptureViewportDebugPng(Viewport, Pending.OutputPaths.DebugViewportPerspectivePngPath))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not save the selected camera viewport before switching projection."));
+		return false;
+	}
+
+	Pending.ProjectionOverride = MakeUnique<FScopedFromLZCameraProjectionOverride>(Camera);
+	if (!Pending.ProjectionOverride || !Pending.ProjectionOverride->bActive)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not switch the selected camera to orthographic."));
+		return false;
+	}
+
+	Pending.Phase = EFromLZCapturePhase::WaitingForStableOrthographic;
+	Pending.OrthographicStartTimeSeconds = FPlatformTime::Seconds();
+	Pending.PhaseStartTimeSeconds = Pending.OrthographicStartTimeSeconds;
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("CaptureFromLZ: selected camera %s source=%s switched to orthographic width %.3f; waiting at least %.1f seconds."),
+		*GetNameSafe(Camera),
+		*Pending.CameraSource,
+		Pending.ProjectionOverride->CaptureOrthoWidth,
+		FromLZOrthographicSettleSeconds);
 	return true;
 }
 
-bool FFromLZCaptureUtils::BeginCaptureFromWorld(const UWorld* World, FViewport* Viewport)
+static bool BeginResolvedCapture(
+	const UWorld* World,
+	FViewport* Viewport,
+	APlayerController* PlayerController,
+	APawn* Pawn,
+	AActor* CameraActor,
+	UCameraComponent* Camera,
+	const FString& CameraSource,
+	FName RequestedCameraTag,
+	bool bSwitchViewTarget)
+{
+	if (!World || !Viewport || !PlayerController || !Pawn || !CameraActor || !Camera)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: resolved capture target is incomplete."));
+		return false;
+	}
+
+	TUniquePtr<FPendingFromLZCapture> Pending = MakeUnique<FPendingFromLZCapture>();
+	Pending->PlayerController = PlayerController;
+	Pending->Pawn = Pawn;
+	Pending->CameraActor = CameraActor;
+	Pending->Camera = Camera;
+	Pending->OriginalViewTarget = PlayerController->GetViewTarget();
+	Pending->World = const_cast<UWorld*>(World);
+	Pending->OutputPaths = MakeCaptureOutputPaths();
+	Pending->CameraSource = CameraSource;
+	Pending->RequestedCameraTag = RequestedCameraTag;
+
+	if (bSwitchViewTarget)
+	{
+		Pending->bViewTargetChanged = PlayerController->GetViewTarget() != CameraActor;
+		PlayerController->SetViewTarget(CameraActor);
+		Pending->Phase = EFromLZCapturePhase::WaitingForTargetView;
+		Pending->PhaseStartTimeSeconds = FPlatformTime::Seconds();
+		GPendingFromLZCapture = MoveTemp(Pending);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("CaptureFromLZ: switched ViewTarget to tagged camera actor %s tag=%s; waiting for a rendered target-camera frame."),
+			*CameraActor->GetName(),
+			*RequestedCameraTag.ToString());
+		return true;
+	}
+
+	if (!PreparePendingOrthographicCapture(*Pending, Viewport))
+	{
+		RestorePendingCaptureState(*Pending);
+		return false;
+	}
+
+	GPendingFromLZCapture = MoveTemp(Pending);
+	return true;
+}
+
+static bool PrepareForNewCapture(const UWorld* World, FViewport* Viewport)
 {
 	if (!World || !Viewport)
 	{
@@ -2827,85 +3000,140 @@ bool FFromLZCaptureUtils::BeginCaptureFromWorld(const UWorld* World, FViewport* 
 		return false;
 	}
 
-	if (GPendingFromLZCapture)
+	if (!GPendingFromLZCapture)
 	{
-		if (GPendingFromLZCapture->World.Get() == World)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ ignored: an orthographic viewport capture is already pending."));
-			return false;
-		}
+		return true;
+	}
 
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: discarding stale pending capture from another world."));
-		GPendingFromLZCapture.Reset();
+	if (GPendingFromLZCapture->World.Get() == World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ ignored: an orthographic viewport capture is already pending."));
+		return false;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: discarding stale pending capture from another world."));
+	ResetPendingCapture(TEXT("stale pending capture from another world"));
+	return true;
+}
+
+bool FFromLZCaptureUtils::BeginCaptureFromWorld(const UWorld* World, FViewport* Viewport)
+{
+	if (!PrepareForNewCapture(World, Viewport))
+	{
+		return false;
 	}
 
 	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
 	{
-		if (APlayerController* PlayerController = It->Get())
+		APlayerController* PlayerController = It->Get();
+		APawn* Pawn = PlayerController ? PlayerController->GetPawn() : nullptr;
+		UCameraComponent* Camera = Pawn ? FindFromLZCamera(Pawn) : nullptr;
+		if (PlayerController && Pawn && Camera)
 		{
-			if (APawn* Pawn = PlayerController->GetPawn())
-			{
-				UCameraComponent* CameraComponent = FindFromLZCamera(Pawn);
-				if (!CameraComponent)
-				{
-					continue;
-				}
-
-				const FPendingFromLZCapture::FOutputPaths OutputPaths = MakeCaptureOutputPaths();
-				const FFromLZViewDebugSnapshot PerspectiveBefore =
-					CaptureViewDebugSnapshot(TEXT("perspective_before_switch"), Pawn, CameraComponent, Viewport);
-				if (!CaptureViewportDebugPng(Viewport, OutputPaths.DebugViewportPerspectivePngPath))
-				{
-					UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not save the current perspective viewport before switching projection."));
-					return false;
-				}
-
-				TUniquePtr<FPendingFromLZCapture> Pending = MakeUnique<FPendingFromLZCapture>();
-				Pending->Pawn = Pawn;
-				Pending->Camera = CameraComponent;
-				Pending->World = const_cast<UWorld*>(World);
-				Pending->OutputPaths = OutputPaths;
-				Pending->PerspectiveBefore = PerspectiveBefore;
-				Pending->ProjectionOverride = MakeUnique<FScopedFromLZCameraProjectionOverride>(CameraComponent);
-				if (!Pending->ProjectionOverride || !Pending->ProjectionOverride->bActive)
-				{
-					UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: could not switch FromLZ camera to orthographic."));
-					return false;
-				}
-				Pending->OrthographicStartTimeSeconds = FPlatformTime::Seconds();
-
-				UE_LOG(
-					LogTemp,
-					Log,
-					TEXT("CaptureFromLZ began for controller %s pawn %s: saved perspective viewport to %s, switched to orthographic width %.3f, and will wait at least %.1f seconds."),
-					*PlayerController->GetName(),
-					*Pawn->GetName(),
-					*OutputPaths.DebugViewportPerspectivePngPath,
-					Pending->ProjectionOverride->CaptureOrthoWidth,
-					FromLZOrthographicSettleSeconds);
-				GPendingFromLZCapture = MoveTemp(Pending);
-				return true;
-			}
+			return BeginResolvedCapture(
+				World,
+				Viewport,
+				PlayerController,
+				Pawn,
+				Pawn,
+				Camera,
+				TEXT("pawn_fromlz"),
+				NAME_None,
+				false);
 		}
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: no player controller with a capturable pawn was found."));
+	UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: no player controller whose pawn has a FromLZ camera was found."));
 	return false;
+}
+
+bool FFromLZCaptureUtils::BeginCaptureFromTaggedCamera(const UWorld* World, FViewport* Viewport, FName CameraActorTag)
+{
+	if (!PrepareForNewCapture(World, Viewport))
+	{
+		return false;
+	}
+	if (CameraActorTag.IsNone())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: tagged-camera capture requested with an empty tag."));
+		return false;
+	}
+
+	APlayerController* PlayerController = nullptr;
+	APawn* Pawn = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* Candidate = It->Get();
+		if (Candidate && Candidate->GetPawn())
+		{
+			PlayerController = Candidate;
+			Pawn = Candidate->GetPawn();
+			break;
+		}
+	}
+	if (!PlayerController || !Pawn)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: tagged-camera capture requires a player controller with a pawn."));
+		return false;
+	}
+
+	TArray<AActor*> TaggedActors;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* Actor = *It;
+		if (IsValid(Actor) && Actor->ActorHasTag(CameraActorTag))
+		{
+			TaggedActors.Add(Actor);
+		}
+	}
+	if (TaggedActors.Num() != 1)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("CaptureFromLZ failed: tag %s must resolve to exactly one actor, found %d."),
+			*CameraActorTag.ToString(),
+			TaggedActors.Num());
+		return false;
+	}
+
+	AActor* CameraActor = TaggedActors[0];
+	TArray<UCameraComponent*> CameraComponents;
+	CameraActor->GetComponents(CameraComponents);
+	TArray<UCameraComponent*> ActiveCameraComponents;
+	for (UCameraComponent* CameraComponent : CameraComponents)
+	{
+		if (IsValid(CameraComponent) && CameraComponent->IsRegistered() && CameraComponent->IsActive())
+		{
+			ActiveCameraComponents.Add(CameraComponent);
+		}
+	}
+	if (ActiveCameraComponents.Num() != 1)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("CaptureFromLZ failed: tagged actor %s must have exactly one registered active camera component, found %d."),
+			*CameraActor->GetName(),
+			ActiveCameraComponents.Num());
+		return false;
+	}
+
+	return BeginResolvedCapture(
+		World,
+		Viewport,
+		PlayerController,
+		Pawn,
+		CameraActor,
+		ActiveCameraComponents[0],
+		TEXT("tagged_actor"),
+		CameraActorTag,
+		true);
 }
 
 void FFromLZCaptureUtils::CancelPendingCapture()
 {
-	if (!GPendingFromLZCapture)
-	{
-		return;
-	}
-
-	if (GPendingFromLZCapture->ProjectionOverride)
-	{
-		GPendingFromLZCapture->ProjectionOverride->Restore();
-	}
-	GPendingFromLZCapture.Reset();
-	UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: pending capture canceled."));
+	ResetPendingCapture(TEXT("canceled"));
 }
 
 void FFromLZCaptureUtils::NotifyViewportDrawn(const UWorld* World, FViewport* Viewport)
@@ -2915,114 +3143,176 @@ void FFromLZCaptureUtils::NotifyViewportDrawn(const UWorld* World, FViewport* Vi
 		return;
 	}
 
-	if (GPendingFromLZCapture->bWaitingForRestoredPerspective)
+	FPendingFromLZCapture& Pending = *GPendingFromLZCapture;
+	if (!World || !Viewport || Pending.World.Get() != World ||
+		!Pending.PlayerController.IsValid() || !Pending.Pawn.IsValid() ||
+		!Pending.CameraActor.IsValid() || !Pending.Camera.IsValid())
 	{
-		if (!World || !Viewport || GPendingFromLZCapture->World.Get() != World ||
-			!GPendingFromLZCapture->Pawn.IsValid() || !GPendingFromLZCapture->Camera.IsValid())
+		ResetPendingCapture(TEXT("capture state became invalid during viewport rendering"));
+		return;
+	}
+
+	APlayerController* PlayerController = Pending.PlayerController.Get();
+	APawn* Pawn = Pending.Pawn.Get();
+	AActor* CameraActor = Pending.CameraActor.Get();
+	UCameraComponent* Camera = Pending.Camera.Get();
+	APlayerCameraManager* CameraManager = PlayerController->PlayerCameraManager;
+
+	if (Pending.Phase == EFromLZCapturePhase::WaitingForTargetView)
+	{
+		if (!CameraManager || PlayerController->GetViewTarget() != CameraActor)
 		{
-			UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: restored-perspective validation became invalid."));
-			GPendingFromLZCapture.Reset();
+			return;
+		}
+		const FTransform PlayerView(CameraManager->GetCameraRotation(), CameraManager->GetCameraLocation());
+		if (!AreViewPosesNearlyEqual(PlayerView, Camera->GetComponentTransform()) ||
+			CameraManager->GetCameraCacheView().ProjectionMode != Camera->ProjectionMode)
+		{
 			return;
 		}
 
-		APawn* Pawn = GPendingFromLZCapture->Pawn.Get();
-		UCameraComponent* Camera = GPendingFromLZCapture->Camera.Get();
-		APlayerController* PlayerController = GetPawnPlayerController(Pawn);
+		if (!PreparePendingOrthographicCapture(Pending, Viewport))
+		{
+			ResetPendingCapture(TEXT("failed to prepare tagged camera orthographic capture"));
+		}
+		return;
+	}
+
+	if (Pending.Phase == EFromLZCapturePhase::WaitingForCaptureCameraRestore)
+	{
 		const ECameraProjectionMode::Type OriginalProjection =
-			GPendingFromLZCapture->ProjectionOverride
-			? GPendingFromLZCapture->ProjectionOverride->Original.ProjectionMode
+			Pending.ProjectionOverride
+			? Pending.ProjectionOverride->Original.ProjectionMode
 			: ECameraProjectionMode::Perspective;
-		if (Camera->ProjectionMode != OriginalProjection ||
-			!PlayerController || !PlayerController->PlayerCameraManager ||
-			PlayerController->PlayerCameraManager->GetCameraCacheView().ProjectionMode != OriginalProjection)
+		if (!CameraManager ||
+			Camera->ProjectionMode != OriginalProjection ||
+			CameraManager->GetCameraCacheView().ProjectionMode != OriginalProjection)
 		{
 			return;
 		}
-
-		++GPendingFromLZCapture->RestoredPerspectiveFramesRendered;
-		GPendingFromLZCapture->PerspectiveRestored =
-			CaptureViewDebugSnapshot(TEXT("perspective_restored_rendered_frame"), Pawn, Camera, Viewport);
-		GPendingFromLZCapture->bRestoredPerspectiveFrameRendered = true;
-		UE_LOG(
-			LogTemp,
-			Log,
-			TEXT("CaptureFromLZ: restored %s viewport frame rendered; projection validation will finalize on the next viewport tick."),
-			*ProjectionModeToString(OriginalProjection));
-		return;
-	}
-
-	if (GPendingFromLZCapture->bCompleting)
-	{
-		return;
-	}
-
-	if (GPendingFromLZCapture->bStableOrthographicFrameRendered)
-	{
-		return;
-	}
-
-	if (!World || !Viewport || GPendingFromLZCapture->World.Get() != World ||
-		!GPendingFromLZCapture->Pawn.IsValid() || !GPendingFromLZCapture->Camera.IsValid())
-	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: pending capture became invalid before the orthographic viewport frame was rendered; restoring camera."));
-		GPendingFromLZCapture.Reset();
-		return;
-	}
-
-	APawn* Pawn = GPendingFromLZCapture->Pawn.Get();
-	if (GPendingFromLZCapture->Camera->ProjectionMode != ECameraProjectionMode::Orthographic)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: FromLZ camera left orthographic mode before viewport rendering; restoring camera."));
-		GPendingFromLZCapture.Reset();
-		return;
-	}
-
-	APlayerController* PlayerController = GetPawnPlayerController(Pawn);
-	if (PlayerController && PlayerController->PlayerCameraManager)
-	{
-		const FMinimalViewInfo& CachedView = PlayerController->PlayerCameraManager->GetCameraCacheView();
-		if (CachedView.ProjectionMode != ECameraProjectionMode::Orthographic)
+		if (Pending.CameraSource == TEXT("tagged_actor"))
 		{
-			if (GPendingFromLZCapture->OrthographicFramesRendered == 0)
+			const FTransform PlayerView(CameraManager->GetCameraRotation(), CameraManager->GetCameraLocation());
+			if (PlayerController->GetViewTarget() != CameraActor ||
+				!AreViewPosesNearlyEqual(PlayerView, Camera->GetComponentTransform()))
 			{
-				UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: viewport draw still used a non-orthographic PlayerCameraManager view; waiting for another frame."));
+				return;
 			}
+		}
+
+		++Pending.RestoredPerspectiveFramesRendered;
+		Pending.PerspectiveRestored =
+			CaptureViewDebugSnapshot(TEXT("perspective_restored_rendered_frame"), Pawn, Camera, Viewport);
+		Pending.bRestoredPerspectiveFrameRendered = true;
+
+		if (Pending.bViewTargetChanged)
+		{
+			if (AActor* RestoreTarget = GetPendingRestoreViewTarget(Pending))
+			{
+				PlayerController->SetViewTarget(RestoreTarget);
+				Pending.Phase = EFromLZCapturePhase::WaitingForOriginalViewTargetRestore;
+				Pending.PhaseStartTimeSeconds = FPlatformTime::Seconds();
+				UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: selected camera projection restored; waiting for the original ViewTarget to render."));
+			}
+		}
+		return;
+	}
+
+	if (Pending.Phase == EFromLZCapturePhase::WaitingForOriginalViewTargetRestore)
+	{
+		AActor* RestoreTarget = GetPendingRestoreViewTarget(Pending);
+		if (CameraManager && RestoreTarget && PlayerController->GetViewTarget() == RestoreTarget)
+		{
+			Pending.bOriginalViewTargetRestoredFrameRendered = true;
+		}
+		return;
+	}
+
+	if (Pending.bCompleting || Pending.bStableOrthographicFrameRendered)
+	{
+		return;
+	}
+	if (!Pending.ProjectionOverride || !Pending.ProjectionOverride->bActive ||
+		Camera->ProjectionMode != ECameraProjectionMode::Orthographic)
+	{
+		ResetPendingCapture(TEXT("selected camera left the pending orthographic state"));
+		return;
+	}
+	if (!CameraManager || CameraManager->GetCameraCacheView().ProjectionMode != ECameraProjectionMode::Orthographic)
+	{
+		return;
+	}
+	if (Pending.CameraSource == TEXT("tagged_actor"))
+	{
+		const FTransform PlayerView(CameraManager->GetCameraRotation(), CameraManager->GetCameraLocation());
+		if (PlayerController->GetViewTarget() != CameraActor ||
+			!AreViewPosesNearlyEqual(PlayerView, Camera->GetComponentTransform()))
+		{
 			return;
 		}
 	}
 
-	if (!GPendingFromLZCapture->bFirstOrthographicFrameRecorded)
+	if (!Pending.bFirstOrthographicFrameRecorded)
 	{
-		GPendingFromLZCapture->OrthographicFirstRendered =
-			CaptureViewDebugSnapshot(TEXT("orthographic_first_rendered_frame"), Pawn, GPendingFromLZCapture->Camera.Get(), Viewport);
-		GPendingFromLZCapture->bFirstOrthographicFrameRecorded = true;
+		Pending.OrthographicFirstRendered =
+			CaptureViewDebugSnapshot(TEXT("orthographic_first_rendered_frame"), Pawn, Camera, Viewport);
+		Pending.bFirstOrthographicFrameRecorded = true;
 	}
 
-	++GPendingFromLZCapture->OrthographicFramesRendered;
-	const double ElapsedSeconds = FPlatformTime::Seconds() - GPendingFromLZCapture->OrthographicStartTimeSeconds;
+	++Pending.OrthographicFramesRendered;
+	const double ElapsedSeconds = FPlatformTime::Seconds() - Pending.OrthographicStartTimeSeconds;
 	if (ElapsedSeconds < FromLZOrthographicSettleSeconds)
 	{
-		if (GPendingFromLZCapture->OrthographicFramesRendered == 1)
-		{
-			UE_LOG(
-				LogTemp,
-				Log,
-				TEXT("CaptureFromLZ: first orthographic viewport frame rendered; continuing to render until the %.1f-second settle interval is complete."),
-				FromLZOrthographicSettleSeconds);
-		}
 		return;
 	}
 
-	GPendingFromLZCapture->StableFrameElapsedSeconds = ElapsedSeconds;
-	GPendingFromLZCapture->OrthographicStable =
-		CaptureViewDebugSnapshot(TEXT("orthographic_stable_after_wait"), Pawn, GPendingFromLZCapture->Camera.Get(), Viewport);
-	GPendingFromLZCapture->bStableOrthographicFrameRendered = true;
+	Pending.StableFrameElapsedSeconds = ElapsedSeconds;
+	Pending.OrthographicStable =
+		CaptureViewDebugSnapshot(TEXT("orthographic_stable_after_wait"), Pawn, Camera, Viewport);
+	Pending.bStableOrthographicFrameRendered = true;
 	UE_LOG(
 		LogTemp,
 		Log,
-		TEXT("CaptureFromLZ: stable orthographic viewport frame rendered after %.3f seconds (%d orthographic frame(s)); capture will complete on the next viewport tick."),
+		TEXT("CaptureFromLZ: stable orthographic viewport frame rendered after %.3f seconds (%d frame(s)); capture will complete on the next viewport tick."),
 		ElapsedSeconds,
-		GPendingFromLZCapture->OrthographicFramesRendered);
+		Pending.OrthographicFramesRendered);
+}
+
+static void FinalizeCompletedPendingCapture()
+{
+	if (!GPendingFromLZCapture)
+	{
+		return;
+	}
+
+	const bool bCaptured = GPendingFromLZCapture->bCaptureSucceeded;
+	const bool bDebugSaved = FinalizeProjectionDebugFiles(*GPendingFromLZCapture);
+	const double StableSeconds = GPendingFromLZCapture->StableFrameElapsedSeconds;
+	const int32 FrameCount = GPendingFromLZCapture->OrthographicFramesRendered;
+	const FString CameraSource = GPendingFromLZCapture->CameraSource;
+	ResetPendingCapture(TEXT("completed"));
+	if (bCaptured && bDebugSaved)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("CaptureFromLZ: capture complete source=%s success=1 debug=1 settle=%.3f frames=%d."),
+			*CameraSource,
+			StableSeconds,
+			FrameCount);
+	}
+	else
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("CaptureFromLZ: capture complete source=%s success=%d debug=%d settle=%.3f frames=%d."),
+			*CameraSource,
+			bCaptured ? 1 : 0,
+			bDebugSaved ? 1 : 0,
+			StableSeconds,
+			FrameCount);
+	}
 }
 
 void FFromLZCaptureUtils::CompletePendingCapture(const UWorld* World, FViewport* Viewport)
@@ -3031,124 +3321,90 @@ void FFromLZCaptureUtils::CompletePendingCapture(const UWorld* World, FViewport*
 	{
 		return;
 	}
-
 	if (!World || !Viewport || GPendingFromLZCapture->World.Get() != World)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: pending capture world or viewport became invalid; restoring camera."));
-		GPendingFromLZCapture.Reset();
+		ResetPendingCapture(TEXT("world or viewport became invalid"));
 		return;
 	}
 
-	APawn* Pawn = GPendingFromLZCapture->Pawn.Get();
-	UCameraComponent* CameraComponent = GPendingFromLZCapture->Camera.Get();
-	FScopedFromLZCameraProjectionOverride* ProjectionOverride = GPendingFromLZCapture->ProjectionOverride.Get();
-	if (!Pawn || !CameraComponent || !ProjectionOverride)
+	FPendingFromLZCapture& Pending = *GPendingFromLZCapture;
+	if (!Pending.PlayerController.IsValid() || !Pending.Pawn.IsValid() ||
+		!Pending.CameraActor.IsValid() || !Pending.Camera.IsValid())
 	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: pending pawn/camera state became invalid; restoring camera."));
-		GPendingFromLZCapture.Reset();
+		ResetPendingCapture(TEXT("resolved player or camera target became invalid"));
 		return;
 	}
 
-	if (GPendingFromLZCapture->bWaitingForRestoredPerspective)
+	const double PhaseElapsedSeconds = FPlatformTime::Seconds() - Pending.PhaseStartTimeSeconds;
+	if (Pending.Phase == EFromLZCapturePhase::WaitingForTargetView)
 	{
-		if (GPendingFromLZCapture->bRestoredPerspectiveFrameRendered)
+		if (PhaseElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
 		{
-			const bool bCaptured = GPendingFromLZCapture->bCaptureSucceeded;
-			const double StableFrameElapsedSeconds = GPendingFromLZCapture->StableFrameElapsedSeconds;
-			const int32 OrthographicFramesRendered = GPendingFromLZCapture->OrthographicFramesRendered;
-			const FString RestoredProjectionMode = ProjectionModeToString(ProjectionOverride->Original.ProjectionMode);
-			const bool bDebugSaved = FinalizeProjectionDebugFiles(*GPendingFromLZCapture);
-			GPendingFromLZCapture.Reset();
-
-			if (bCaptured && bDebugSaved)
-			{
-				UE_LOG(
-					LogTemp,
-					Log,
-					TEXT("CaptureFromLZ: cross-frame capture completed after %.3f seconds and %d orthographic viewport frame(s); restored camera projection to %s; projection debug saved."),
-					StableFrameElapsedSeconds,
-					OrthographicFramesRendered,
-					*RestoredProjectionMode);
-			}
-			else
-			{
-				UE_LOG(
-					LogTemp,
-					Warning,
-					TEXT("CaptureFromLZ: cross-frame capture or projection debug failed after %.3f seconds and %d orthographic viewport frame(s); restored camera projection to %s."),
-					StableFrameElapsedSeconds,
-					OrthographicFramesRendered,
-					*RestoredProjectionMode);
-			}
-			return;
-		}
-
-		const double RestoreElapsedSeconds = FPlatformTime::Seconds() - GPendingFromLZCapture->RestoreStartTimeSeconds;
-		if (RestoreElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
-		{
-			GPendingFromLZCapture->PerspectiveRestored =
-				CaptureViewDebugSnapshot(TEXT("perspective_restore_timeout"), Pawn, CameraComponent, Viewport);
-			FinalizeProjectionDebugFiles(*GPendingFromLZCapture);
-			UE_LOG(
-				LogTemp,
-				Warning,
-				TEXT("CaptureFromLZ: timed out after %.3f seconds waiting for a rendered restored-perspective frame."),
-				RestoreElapsedSeconds);
-			GPendingFromLZCapture.Reset();
+			ResetPendingCapture(TEXT("timed out waiting for tagged camera ViewTarget"));
 		}
 		return;
 	}
 
-	if (GPendingFromLZCapture->bCompleting)
+	if (Pending.Phase == EFromLZCapturePhase::WaitingForCaptureCameraRestore)
 	{
-		return;
-	}
-
-	if (!ProjectionOverride->bActive)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: orthographic projection override ended before capture completion."));
-		GPendingFromLZCapture.Reset();
-		return;
-	}
-
-	if (!GPendingFromLZCapture->bStableOrthographicFrameRendered)
-	{
-		const double ElapsedSeconds = FPlatformTime::Seconds() - GPendingFromLZCapture->OrthographicStartTimeSeconds;
-		if (ElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
+		if (Pending.bRestoredPerspectiveFrameRendered && !Pending.bViewTargetChanged)
 		{
-			UE_LOG(
-				LogTemp,
-				Warning,
-				TEXT("CaptureFromLZ: timed out after %.3f seconds without a settled orthographic viewport frame; restoring camera."),
-				ElapsedSeconds);
-			GPendingFromLZCapture.Reset();
+			FinalizeCompletedPendingCapture();
+		}
+		else if (PhaseElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
+		{
+			Pending.PerspectiveRestored =
+				CaptureViewDebugSnapshot(TEXT("perspective_restore_timeout"), Pending.Pawn.Get(), Pending.Camera.Get(), Viewport);
+			FinalizeProjectionDebugFiles(Pending);
+			ResetPendingCapture(TEXT("timed out waiting for selected camera projection restore"));
 		}
 		return;
 	}
 
-	GPendingFromLZCapture->bCompleting = true;
-	const int32 OrthographicFramesRendered = GPendingFromLZCapture->OrthographicFramesRendered;
-	const double StableFrameElapsedSeconds = GPendingFromLZCapture->StableFrameElapsedSeconds;
-	const bool bCaptured = CompleteCaptureFromPawn(
-		Pawn,
-		Viewport,
-		*ProjectionOverride,
-		GPendingFromLZCapture->OrthographicStable,
-		GPendingFromLZCapture->OutputPaths,
-		OrthographicFramesRendered,
-		StableFrameElapsedSeconds);
+	if (Pending.Phase == EFromLZCapturePhase::WaitingForOriginalViewTargetRestore)
+	{
+		if (Pending.bOriginalViewTargetRestoredFrameRendered)
+		{
+			FinalizeCompletedPendingCapture();
+		}
+		else if (PhaseElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
+		{
+			FinalizeProjectionDebugFiles(Pending);
+			ResetPendingCapture(TEXT("timed out waiting for original ViewTarget restore"));
+		}
+		return;
+	}
 
-	GPendingFromLZCapture->bOutputsGenerated = true;
-	GPendingFromLZCapture->bCaptureSucceeded = bCaptured;
-	ProjectionOverride->Restore();
-	GPendingFromLZCapture->bCompleting = false;
-	GPendingFromLZCapture->bWaitingForRestoredPerspective = true;
-	GPendingFromLZCapture->RestoreStartTimeSeconds = FPlatformTime::Seconds();
+	if (Pending.bCompleting)
+	{
+		return;
+	}
+	if (!Pending.ProjectionOverride || !Pending.ProjectionOverride->bActive)
+	{
+		ResetPendingCapture(TEXT("orthographic projection override ended before capture completion"));
+		return;
+	}
+	if (!Pending.bStableOrthographicFrameRendered)
+	{
+		if (PhaseElapsedSeconds >= FromLZMaxPendingCaptureSeconds)
+		{
+			ResetPendingCapture(TEXT("timed out waiting for a stable orthographic viewport frame"));
+		}
+		return;
+	}
+
+	Pending.bCompleting = true;
+	Pending.bCaptureSucceeded = CompleteCaptureFromTarget(Pending, Viewport);
+	Pending.bOutputsGenerated = true;
+	Pending.ProjectionOverride->Restore();
+	Pending.bCompleting = false;
+	Pending.Phase = EFromLZCapturePhase::WaitingForCaptureCameraRestore;
+	Pending.PhaseStartTimeSeconds = FPlatformTime::Seconds();
 	UE_LOG(
 		LogTemp,
 		Log,
-		TEXT("CaptureFromLZ: output generation finished; restored camera component to %s and waiting for a rendered viewport frame to validate the full cycle."),
-		*ProjectionModeToString(ProjectionOverride->Original.ProjectionMode));
+		TEXT("CaptureFromLZ: output generation finished; restored selected camera projection to %s."),
+		*ProjectionModeToString(Pending.ProjectionOverride->Original.ProjectionMode));
 }
 
 UCameraComponent* FFromLZCaptureUtils::FindFromLZCamera(const APawn* Pawn)

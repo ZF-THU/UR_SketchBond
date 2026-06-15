@@ -8,6 +8,7 @@ class FFromLZSketchProcessor
 {
 public:
 	static void ProcessLatestSketch(UWorld* World);
+	static void ProcessSketch(UWorld* World, const FString& SketchPng, const FString& CapturePng);
 
 private:
 	static FString FindLatestPng(const FString& Directory, bool bRequireCaptureMainPng = false);
