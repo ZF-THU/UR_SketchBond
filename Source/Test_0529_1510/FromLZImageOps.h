@@ -218,10 +218,15 @@ namespace FromLZImageOps
 	// half-plane; synthetic connectors participate in topology but are not red targets.
 	// Connector paths that hit unrelated real geometry or existing connectors first
 	// are rejected. A final connector-aware planarization precedes graph extraction.
+	// Cycle anchors must be real red strokes with at least 20px arc length. Synthetic
+	// red connectors may participate in paths but cannot anchor a search. Each anchor
+	// retains one shortest-edge valid cycle, or at most two when multiple valid cycles
+	// tie at that minimum edge count; ties prefer longer real-red arc, shorter black
+	// arc, then smaller polygon area.
 	// Components are red-driven: red-only loops are selected first, then local black
 	// closures, then fallback red/black traces. Before consuming red strokes, every
 	// candidate must have a valid local-green action and a source polygon that covers
-	// at least 70% of one captured face whose projected normal is within 30 degrees
+	// at least 25% of one captured face whose projected normal is within 30 degrees
 	// of the unoriented green side vector and whose plane can be intersected. Conflicting
 	// red-only loops prefer the larger cap area. All loop sources currently reject
 	// candidates below 500 px^2 bounding-box area.

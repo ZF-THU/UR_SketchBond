@@ -125,7 +125,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	TArray<uint8> EffectiveColorMap;
 	FromLZImageOps::CleanupSkeletonEndpoints(
 		Skel, Width, Height,
-		/*GapTol*/ 20.0f,
+		/*GapTol*/ 10.0f,
 		/*ConnectThickness*/ 1,
 		/*SmallLoopBboxAreaThresh*/ 500.0f,
 		/*BranchPruneMaxPixels*/ 0.0f, // 0 -> auto = max(30, 3*GapTol)

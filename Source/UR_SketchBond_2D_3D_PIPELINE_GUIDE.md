@@ -942,11 +942,33 @@ Three passes generate cycles:
    priority 1;
 3. all red and black as `fallback_trace`, priority 2.
 
-For each non-black graph edge:
+Only a real, non-synthetic red stroke with arc length at least `20 pixels` may
+act as a cycle anchor. Synthetic red connectors may still participate in the
+alternate path.
+
+For each eligible anchor:
 
 1. remove that edge;
-2. BFS for another path between its endpoints;
-3. combine the alternate path and removed edge into a cycle.
+2. begin at the minimum alternate-path graph-edge count between its endpoints;
+3. enumerate all simple alternate paths at that exact edge count;
+4. combine each alternate path and the removed anchor into a cycle;
+5. if no path at that depth produces a valid candidate for the current pass,
+   advance one edge depth and repeat;
+6. stop after the first depth containing at least one valid candidate.
+
+Longer paths are not retained merely to fill a second slot. If there is only
+one valid cycle at the first valid edge depth, the anchor produces one
+candidate. If multiple valid cycles tie at that depth, the anchor retains at
+most two distinct stroke-set cycles, ordered by:
+
+1. fewer cycle graph edges;
+2. greater total non-synthetic real-red arc length;
+3. shorter total black arc length;
+4. smaller absolute polygon area;
+5. lexical stroke-set key for deterministic final tie breaking.
+
+For `local_black`, only cycles that actually contain black boundary strokes
+count toward the two retained candidates.
 
 A valid cycle:
 
@@ -1050,7 +1072,7 @@ Source polygon semantics:
 - attach: `cap_polygon_translated`.
 
 The candidate is mapped from Step 9 image size to the captured face image and
-rasterized. A face survives only when its ID color occupies at least `85%` of
+rasterized. A face survives only when its ID color occupies at least `25%` of
 the entire source polygon mask.
 
 For each surviving face:
@@ -1071,30 +1093,58 @@ Per-candidate validation artifacts are under:
 CandidateFaceValidation/Candidate_###_<source>/
 ```
 
-### 18.1 Final candidate ordering
+### 18.1 Final candidate validation and classification
 
-Candidates are sorted by:
-
-1. lower source priority;
-2. shorter total borrowed black arc length;
-3. for two red-only candidates, larger polygon area;
-4. more real red strokes;
-5. fewer graph edges;
-6. lower anchor stroke ID;
-7. lexical stroke-set key.
-
-The synthetic maximum length is diagnostic and is not in the current sorting
-comparator.
-
-Before selection a candidate must pass:
+Before selection every candidate must pass:
 
 - valid local green attach/excavate action;
 - minimum bounding-box area;
 - interior-red check;
 - valid face prevalidation.
 
-Each real red stroke may belong to only one selected candidate. Conflicting
-later candidates are rejected.
+Semantic classification uses the actual selected boundary:
+
+- no black boundary strokes: authoritative red-only;
+- one or more black boundary strokes: mixed.
+
+`CandidateSource` remains diagnostic. For example, a pure-red fallback
+candidate is still classified as authoritative red-only.
+Every valid authoritative red-only loop is selected. Its real red strokes are
+locked for ownership. Red-only loops are expected not to share real red
+strokes; if this invariant is violated, all valid red-only loops remain
+selected and a warning is recorded.
+
+Valid mixed candidates enter the pool only when none of their real red strokes
+are locked by an authoritative red-only loop.
+
+### 18.2 Mixed candidate global selection
+
+Valid `local_black` and `fallback_trace` candidates enter one pool. Two mixed
+candidates conflict only when they share a real red stroke. Polygon overlap,
+containment, or intersection does not create a conflict.
+
+Selection first builds a deterministic greedy feasible solution, then runs
+branch-and-bound with a single `5 second` wall-clock budget for the whole mixed
+pool.
+
+The combination objective is lexicographic:
+
+1. maximize unique covered real-red arc length;
+2. minimize total borrowed-black arc length;
+3. minimize total graph-edge count;
+4. maximize unique covered real-red stroke count;
+5. minimize selected candidate count;
+6. maximize selected `local_black` candidate count;
+7. use the sorted candidate-key sequence for deterministic tie breaking.
+
+If search finishes within the budget, the mixed result is the exact global
+optimum. If it times out, the best combination found so far is retained and
+the root `selection` object records `mixed_timed_out: true` and
+`mixed_optimality_proven: false`. Selected mixed candidates use
+`selection_phase: "mixed_best_found_timeout"`; unselected mixed candidates use
+`selection_phase: "mixed_not_selected"` with a timeout-specific `reason`.
+Authoritative red-only output is never discarded because mixed search timed
+out.
 
 Root output: `09_loop_candidates.json`.
 
@@ -1178,7 +1228,7 @@ For each component Step 10:
 4. loads cap image dimensions;
 5. scales cap coordinates and side vectors to face-image space;
 6. rasterizes the source polygon;
-7. repeats the same `85%`, `30-degree`, `10-degree`, nearest-camera selection;
+7. repeats the same `25%`, `30-degree`, `10-degree`, nearest-camera selection;
 8. requires the selected face ID to exactly equal Step 9's
    `preselected_face_id`.
 
@@ -1788,7 +1838,7 @@ Use this order:
 8. `09_loop_candidates.json`
    - Check green, interior-red, face, conflict, and priority rejection.
 9. `CandidateFaceValidation`
-   - Check `85%` mask coverage and normal/green angle.
+   - Check `25%` mask coverage and normal/green angle.
 10. `09_cap_extrusion.json` and `Action.json`
     - Check source/copy semantics and ordered runs.
 11. `10_face_reconstruction.json`
@@ -1812,20 +1862,25 @@ closure, or Boolean-manifold failure.
 4. Step 8 does not drive Step 9.
 5. Step 9 requires valid green action and valid 3D face before selecting a
    cap.
-6. Face coverage is `85%` of the whole source polygon mask.
+6. Face coverage is `25%` of the whole source polygon mask.
 7. Step 10 must reproduce Step 9's selected face ID.
-8. Real red strokes are single-owner across selected caps.
-9. Ordered boundary connectors preserve topology but are excluded from
+8. Every valid no-black loop is authoritative red-only and is selected before
+   mixed optimization.
+9. Real red strokes locked by authoritative red-only loops cannot be reused by
+   mixed candidates.
+10. Mixed selection globally optimizes non-conflicting candidates for up to
+    five seconds; timeout retains the best combination found.
+11. Ordered boundary connectors preserve topology but are excluded from
    regularized geometry.
-10. World regularization is octilinear, not only orthogonal.
-11. Pure-red phase may rotate; black-containing phase is world locked.
-12. Boundary distance is diagnostic only in the current regularizer.
-13. A regularization failure restores the original cap and continues.
-14. Source/copy order reverses between attach and excavate.
-15. Current-press excavation runs before current-press attachment spawn.
-16. Generated solids and cutters must be closed for Manifold.
-17. Session generation prevents post-reset worker results from spawning.
-18. Startup preserves sketches; full Tab reset archives and clears them.
+12. World regularization is octilinear, not only orthogonal.
+13. Pure-red phase may rotate; black-containing phase is world locked.
+14. Boundary distance is diagnostic only in the current regularizer.
+15. A regularization failure restores the original cap and continues.
+16. Source/copy order reverses between attach and excavate.
+17. Current-press excavation runs before current-press attachment spawn.
+18. Generated solids and cutters must be closed for Manifold.
+19. Session generation prevents post-reset worker results from spawning.
+20. Startup preserves sketches; full Tab reset archives and clears them.
 
 ## 39. Known Code/Comment Drift
 
@@ -1836,8 +1891,8 @@ Developers should not copy these stale descriptions without checking calls:
   and small-component removal.
 - some comments describe older cap-area thresholds; active Step 9 constants
   are `500 px²` for both red-only and borrowed loops.
-- older documentation described a `5%` face overlap; active code requires
-  `85%`.
+- older documentation describes different face-overlap thresholds; active code
+  requires `25%`.
 - older documentation treated black endpoints as immutable; current
   octilinear code permits support snapping within `10 pixels`.
 - older documentation described upper area and boundary-distance rejection;

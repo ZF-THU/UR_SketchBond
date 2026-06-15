@@ -32,7 +32,7 @@ struct FFromLZCandidateFaceEvaluation
 class FFromLZFaceReconstructor
 {
 public:
-	static constexpr double CandidateFaceMinOverlapRatio = 0.85;
+	static constexpr double CandidateFaceMinOverlapRatio = 0.25;
 	static constexpr double CandidateFaceMaxNormalSideAngleDegrees = 30.0;
 	static constexpr double CandidateFacePreferredNormalSideAngleDegrees = 10.0;
 

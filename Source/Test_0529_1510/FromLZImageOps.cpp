@@ -4,6 +4,7 @@
 #include "Algo/Reverse.h"
 #include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"
+#include "HAL/PlatformTime.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Misc/FileHelper.h"
@@ -3760,6 +3761,9 @@ namespace FromLZImageOps
 	static constexpr double CapBlackPreferenceBiasPx = 2.0;
 	static constexpr double CapRedOnlyLoopMinBboxArea = 500.0;
 	static constexpr double CapBorrowedLoopMinBboxArea = 500.0;
+	static constexpr double CapCycleAnchorMinRealRedLengthPx = 20.0;
+	static constexpr int32 CapCycleCandidatesPerAnchor = 2;
+	static constexpr double CapMixedSelectionTimeBudgetSeconds = 5.0;
 	static constexpr double CapInteriorRedMaxLineLengthPx = 20.0;
 
 	struct FCapStrokeSplit
@@ -5080,6 +5084,33 @@ namespace FromLZImageOps
 		TArray<int32> SyntheticStrokeIds;
 		FCapExtrusionResult Result;
 		bool bSelected = false;
+		FString SelectionClass;
+		FString SelectionPhase;
+	};
+
+	struct FMixedSelectionScore
+	{
+		double CoveredRedArcLength = 0.0;
+		double BorrowedBlackArcLength = 0.0;
+		int32 GraphEdgeCount = 0;
+		int32 CoveredRedStrokeCount = 0;
+		int32 CandidateCount = 0;
+		int32 LocalBlackCandidateCount = 0;
+		FString StableKey;
+	};
+
+	struct FLoopSelectionDiagnostics
+	{
+		double TimeBudgetSeconds = CapMixedSelectionTimeBudgetSeconds;
+		double ElapsedSeconds = 0.0;
+		int64 VisitedStateCount = 0;
+		int32 EligibleRedOnlyCount = 0;
+		int32 EligibleMixedCount = 0;
+		int32 MixedBlockedByRedOnlyCount = 0;
+		int32 RedOnlySharedStrokeWarningCount = 0;
+		bool bTimedOut = false;
+		bool bOptimalityProven = true;
+		FMixedSelectionScore BestMixedScore;
 	};
 
 	static void SortUniqueInts(TArray<int32>& Values)
@@ -5265,6 +5296,193 @@ namespace FromLZImageOps
 		Candidates.Add(Candidate);
 	}
 
+	static double CandidateRealRedArcLength(
+		const FLoopCandidate& Candidate,
+		const TArray<FColoredStroke>& Strokes)
+	{
+		double TotalLength = 0.0;
+		for (int32 StrokeId : Candidate.RealRedStrokeIds)
+		{
+			if (Strokes.IsValidIndex(StrokeId))
+			{
+				TotalLength += StrokeArcLength(Strokes[StrokeId]);
+			}
+		}
+		return TotalLength;
+	}
+
+	static bool CandidateGenerationLess(
+		const FLoopCandidate& A,
+		const FLoopCandidate& B,
+		const TArray<FColoredStroke>& Strokes)
+	{
+		if (A.EdgeCount != B.EdgeCount)
+		{
+			return A.EdgeCount < B.EdgeCount;
+		}
+		const double ARealRedLength = CandidateRealRedArcLength(A, Strokes);
+		const double BRealRedLength = CandidateRealRedArcLength(B, Strokes);
+		if (!FMath::IsNearlyEqual(ARealRedLength, BRealRedLength, 1e-6))
+		{
+			return ARealRedLength > BRealRedLength;
+		}
+		if (!FMath::IsNearlyEqual(A.BlackTotalLength, B.BlackTotalLength, 1e-6))
+		{
+			return A.BlackTotalLength < B.BlackTotalLength;
+		}
+		if (!FMath::IsNearlyEqual(A.LoopArea, B.LoopArea, 1e-6))
+		{
+			return A.LoopArea < B.LoopArea;
+		}
+		return FCString::Strcmp(*A.Key, *B.Key) < 0;
+	}
+
+	static void CollectTopCycleCandidatesForAnchor(
+		const TArray<FColoredStroke>& Strokes,
+		const CapOps::FGraph& G,
+		const TArray<TArray<int32>>& Adjacency,
+		int32 AnchorEdge,
+		const TCHAR* Source,
+		int32 Priority,
+		bool bRequireBlack,
+		TArray<FLoopCandidate>& OutCandidates)
+	{
+		using namespace CapOps;
+		OutCandidates.Reset();
+
+		const int32 StartNode = G.NodeU[AnchorEdge];
+		const int32 TargetNode = G.NodeV[AnchorEdge];
+
+		TArray<int32> MinHopsToTarget;
+		MinHopsToTarget.Init(MAX_int32, G.NumNodes);
+		TArray<int32> Queue;
+		Queue.Add(TargetNode);
+		MinHopsToTarget[TargetNode] = 0;
+		for (int32 Head = 0; Head < Queue.Num(); ++Head)
+		{
+			const int32 CurrentNode = Queue[Head];
+			for (int32 EdgeIndex : Adjacency[CurrentNode])
+			{
+				if (EdgeIndex == AnchorEdge)
+				{
+					continue;
+				}
+				const int32 OtherNode =
+					G.NodeU[EdgeIndex] == CurrentNode ? G.NodeV[EdgeIndex] :
+					(G.NodeV[EdgeIndex] == CurrentNode ? G.NodeU[EdgeIndex] : INDEX_NONE);
+				if (OtherNode == INDEX_NONE || MinHopsToTarget[OtherNode] != MAX_int32)
+				{
+					continue;
+				}
+				MinHopsToTarget[OtherNode] = MinHopsToTarget[CurrentNode] + 1;
+				Queue.Add(OtherNode);
+			}
+		}
+
+		if (!MinHopsToTarget.IsValidIndex(StartNode) || MinHopsToTarget[StartNode] == MAX_int32)
+		{
+			return;
+		}
+
+		TSet<FString> SeenAnchorKeys;
+		TArray<uint8> VisitedNodes;
+		VisitedNodes.Init(0, G.NumNodes);
+		VisitedNodes[StartNode] = 1;
+		TArray<int32> PathEdges;
+
+		const int32 ShortestPathEdgeCount = MinHopsToTarget[StartNode];
+		const int32 MaxSimplePathEdgeCount = FMath::Max(0, G.NumNodes - 1);
+		for (int32 PathEdgeLimit = ShortestPathEdgeCount;
+			PathEdgeLimit <= MaxSimplePathEdgeCount;
+			++PathEdgeLimit)
+		{
+			TFunction<void(int32, int32)> EnumeratePathsAtDepth = [&](int32 CurrentNode, int32 RemainingEdges)
+			{
+				if (RemainingEdges == 0)
+				{
+					if (CurrentNode != TargetNode)
+					{
+						return;
+					}
+					TArray<int32> Cycle = PathEdges;
+					Cycle.Add(AnchorEdge);
+					FLoopCandidate Candidate;
+					if (!MakeLoopCandidateFromCycle(
+						Strokes,
+						G,
+						Cycle,
+						Source,
+						Priority,
+						G.StrokeId[AnchorEdge],
+						Candidate))
+					{
+						return;
+					}
+					if (bRequireBlack && Candidate.BlackStrokeIds.Num() == 0)
+					{
+						return;
+					}
+					if (!SeenAnchorKeys.Contains(Candidate.Key))
+					{
+						SeenAnchorKeys.Add(Candidate.Key);
+						OutCandidates.Add(MoveTemp(Candidate));
+					}
+					return;
+				}
+
+				if (CurrentNode == TargetNode ||
+					!MinHopsToTarget.IsValidIndex(CurrentNode) ||
+					MinHopsToTarget[CurrentNode] > RemainingEdges)
+				{
+					return;
+				}
+
+				for (int32 EdgeIndex : Adjacency[CurrentNode])
+				{
+					if (EdgeIndex == AnchorEdge)
+					{
+						continue;
+					}
+					const int32 OtherNode =
+						G.NodeU[EdgeIndex] == CurrentNode ? G.NodeV[EdgeIndex] :
+						(G.NodeV[EdgeIndex] == CurrentNode ? G.NodeU[EdgeIndex] : INDEX_NONE);
+					if (OtherNode == INDEX_NONE ||
+						VisitedNodes[OtherNode] ||
+						!MinHopsToTarget.IsValidIndex(OtherNode) ||
+						MinHopsToTarget[OtherNode] > RemainingEdges - 1)
+					{
+						continue;
+					}
+					if (OtherNode == TargetNode && RemainingEdges != 1)
+					{
+						continue;
+					}
+
+					VisitedNodes[OtherNode] = 1;
+					PathEdges.Add(EdgeIndex);
+					EnumeratePathsAtDepth(OtherNode, RemainingEdges - 1);
+					PathEdges.Pop();
+					VisitedNodes[OtherNode] = 0;
+				}
+			};
+
+			EnumeratePathsAtDepth(StartNode, PathEdgeLimit);
+			if (OutCandidates.Num() > 0)
+			{
+				break;
+			}
+		}
+
+		OutCandidates.Sort([&Strokes](const FLoopCandidate& A, const FLoopCandidate& B)
+		{
+			return CandidateGenerationLess(A, B, Strokes);
+		});
+		if (OutCandidates.Num() > CapCycleCandidatesPerAnchor)
+		{
+			OutCandidates.SetNum(CapCycleCandidatesPerAnchor);
+		}
+	}
+
 	static void CollectCycleCandidatesFromGraph(
 		const TArray<FColoredStroke>& Strokes,
 		const CapOps::FGraph& G,
@@ -5275,11 +5493,26 @@ namespace FromLZImageOps
 		TSet<FString>& SeenKeys)
 	{
 		using namespace CapOps;
-		TArray<uint8> EdgeUsable;
-		EdgeUsable.Init(1, G.StrokeId.Num());
+		TArray<TArray<int32>> Adjacency;
+		Adjacency.SetNum(G.NumNodes);
+		for (int32 EdgeIndex = 0; EdgeIndex < G.StrokeId.Num(); ++EdgeIndex)
+		{
+			if (G.NodeU.IsValidIndex(EdgeIndex))
+			{
+				Adjacency[G.NodeU[EdgeIndex]].Add(EdgeIndex);
+			}
+			if (G.NodeV.IsValidIndex(EdgeIndex) && G.NodeV[EdgeIndex] != G.NodeU[EdgeIndex])
+			{
+				Adjacency[G.NodeV[EdgeIndex]].Add(EdgeIndex);
+			}
+		}
+
 		for (int32 e = 0; e < G.StrokeId.Num(); ++e)
 		{
-			if (G.bBlack[e])
+			if (G.bBlack[e] ||
+				(G.bSynthetic.IsValidIndex(e) && G.bSynthetic[e]) ||
+				!Strokes.IsValidIndex(G.StrokeId[e]) ||
+				StrokeArcLength(Strokes[G.StrokeId[e]]) < CapCycleAnchorMinRealRedLengthPx)
 			{
 				continue;
 			}
@@ -5288,24 +5521,20 @@ namespace FromLZImageOps
 				continue;
 			}
 
-			TArray<int32> Path;
-			if (!BfsPath(G, G.NodeU[e], G.NodeV[e], /*ExcludeEdge*/ e, EdgeUsable, Path))
+			TArray<FLoopCandidate> AnchorCandidates;
+			CollectTopCycleCandidatesForAnchor(
+				Strokes,
+				G,
+				Adjacency,
+				e,
+				Source,
+				Priority,
+				bRequireBlack,
+				AnchorCandidates);
+			for (const FLoopCandidate& Candidate : AnchorCandidates)
 			{
-				continue;
+				AddUniqueCandidate(Candidates, SeenKeys, Candidate);
 			}
-			TArray<int32> Cycle = Path;
-			Cycle.Add(e);
-
-			FLoopCandidate Candidate;
-			if (!MakeLoopCandidateFromCycle(Strokes, G, Cycle, Source, Priority, G.StrokeId[e], Candidate))
-			{
-				continue;
-			}
-			if (bRequireBlack && Candidate.BlackStrokeIds.Num() == 0)
-			{
-				continue;
-			}
-			AddUniqueCandidate(Candidates, SeenKeys, Candidate);
 		}
 	}
 
@@ -5413,111 +5642,287 @@ namespace FromLZImageOps
 		}
 	}
 
-	static bool IsRedOnlyLoopCandidate(const FLoopCandidate& Candidate)
+	static bool CandidatePassesSelectionValidation(const FLoopCandidate& Candidate, FString& OutReason)
 	{
-		return Candidate.Source == TEXT("red_only");
+		if (!Candidate.bHasValidLocalGreenAction)
+		{
+			OutReason = Candidate.GreenPrefilterReason.IsEmpty()
+				? TEXT("candidate has no valid local green action")
+				: Candidate.GreenPrefilterReason;
+			return false;
+		}
+		const bool bActuallyRedOnly = Candidate.BlackStrokeIds.Num() == 0;
+		const double MinBboxArea = bActuallyRedOnly ? CapRedOnlyLoopMinBboxArea : CapBorrowedLoopMinBboxArea;
+		if (Candidate.LoopBboxArea < MinBboxArea)
+		{
+			OutReason = bActuallyRedOnly
+				? FString::Printf(TEXT("red-only loop bbox area %.3f below %.3f"), Candidate.LoopBboxArea, MinBboxArea)
+				: FString::Printf(TEXT("loop bbox area %.3f below %.3f"), Candidate.LoopBboxArea, MinBboxArea);
+			return false;
+		}
+		if (Candidate.bRejectedByInteriorRed)
+		{
+			OutReason = Candidate.InteriorRedRejectReason.IsEmpty()
+				? TEXT("candidate rejected: interior red line exceeds threshold")
+				: Candidate.InteriorRedRejectReason;
+			return false;
+		}
+		if (!Candidate.bHasValidFaceEvaluation)
+		{
+			OutReason = Candidate.FaceEvaluationReason.IsEmpty()
+				? TEXT("candidate has no valid base face")
+				: Candidate.FaceEvaluationReason;
+			return false;
+		}
+		OutReason = TEXT("passed_all_candidate_validations");
+		return true;
 	}
 
-	static bool IsBorrowedLoopCandidate(const FLoopCandidate& Candidate)
+	static bool IsBetterMixedScore(const FMixedSelectionScore& A, const FMixedSelectionScore& B)
 	{
-		return Candidate.Source == TEXT("local_black") || Candidate.Source == TEXT("fallback_trace");
+		if (!FMath::IsNearlyEqual(A.CoveredRedArcLength, B.CoveredRedArcLength, 1e-6))
+		{
+			return A.CoveredRedArcLength > B.CoveredRedArcLength;
+		}
+		if (!FMath::IsNearlyEqual(A.BorrowedBlackArcLength, B.BorrowedBlackArcLength, 1e-6))
+		{
+			return A.BorrowedBlackArcLength < B.BorrowedBlackArcLength;
+		}
+		if (A.GraphEdgeCount != B.GraphEdgeCount) { return A.GraphEdgeCount < B.GraphEdgeCount; }
+		if (A.CoveredRedStrokeCount != B.CoveredRedStrokeCount) { return A.CoveredRedStrokeCount > B.CoveredRedStrokeCount; }
+		if (A.CandidateCount != B.CandidateCount) { return A.CandidateCount < B.CandidateCount; }
+		if (A.LocalBlackCandidateCount != B.LocalBlackCandidateCount) { return A.LocalBlackCandidateCount > B.LocalBlackCandidateCount; }
+		return FCString::Strcmp(*A.StableKey, *B.StableKey) < 0;
 	}
 
-	static void SelectLoopCandidates(TArray<FLoopCandidate>& Candidates, TArray<int32>& OutSelectedIndices)
+	static FMixedSelectionScore ScoreMixedSelection(
+		const TArray<FLoopCandidate>& Candidates,
+		const TArray<FColoredStroke>& Strokes,
+		const TArray<int32>& SelectedIndices)
+	{
+		FMixedSelectionScore Score;
+		TSet<int32> CoveredRedStrokeIds;
+		TArray<FString> Keys;
+		for (int32 CandidateIndex : SelectedIndices)
+		{
+			const FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			Score.BorrowedBlackArcLength += Candidate.BlackTotalLength;
+			Score.GraphEdgeCount += Candidate.EdgeCount;
+			Score.CandidateCount++;
+			Score.LocalBlackCandidateCount += Candidate.Source == TEXT("local_black") ? 1 : 0;
+			Keys.Add(Candidate.Key);
+			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+			{
+				if (!CoveredRedStrokeIds.Contains(RedStrokeId))
+				{
+					CoveredRedStrokeIds.Add(RedStrokeId);
+					if (Strokes.IsValidIndex(RedStrokeId))
+					{
+						Score.CoveredRedArcLength += StrokeArcLength(Strokes[RedStrokeId]);
+					}
+				}
+			}
+		}
+		Score.CoveredRedStrokeCount = CoveredRedStrokeIds.Num();
+		Keys.Sort();
+		Score.StableKey = FString::Join(Keys, TEXT("|"));
+		return Score;
+	}
+
+	static bool CandidateConflictsWithRedSet(const FLoopCandidate& Candidate, const TSet<int32>& RedStrokeIds)
+	{
+		for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+		{
+			if (RedStrokeIds.Contains(RedStrokeId))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static void SelectLoopCandidates(
+		TArray<FLoopCandidate>& Candidates,
+		const TArray<FColoredStroke>& Strokes,
+		TArray<int32>& OutSelectedIndices,
+		FLoopSelectionDiagnostics& OutDiagnostics)
 	{
 		OutSelectedIndices.Reset();
-		TArray<int32> Order;
-		Order.Reserve(Candidates.Num());
-		for (int32 i = 0; i < Candidates.Num(); ++i)
+		OutDiagnostics = FLoopSelectionDiagnostics();
+		TSet<int32> LockedRedStrokeIds;
+		TMap<int32, int32> RedOnlyStrokeOwner;
+		TArray<int32> MixedPool;
+
+		for (int32 CandidateIndex = 0; CandidateIndex < Candidates.Num(); ++CandidateIndex)
 		{
-			Order.Add(i);
-			Candidates[i].bSelected = false;
-			Candidates[i].RejectReason.Reset();
+			FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			Candidate.bSelected = false;
+			Candidate.RejectReason.Reset();
+			Candidate.SelectionClass = Candidate.BlackStrokeIds.Num() == 0 ? TEXT("authoritative_red_only") : TEXT("mixed");
+			Candidate.SelectionPhase = TEXT("validation");
+
+			FString ValidationReason;
+			if (!CandidatePassesSelectionValidation(Candidate, ValidationReason))
+			{
+				Candidate.RejectReason = ValidationReason;
+				continue;
+			}
+
+			if (Candidate.BlackStrokeIds.Num() == 0)
+			{
+				++OutDiagnostics.EligibleRedOnlyCount;
+				Candidate.bSelected = true;
+				Candidate.SelectionPhase = TEXT("red_only_locked");
+				Candidate.RejectReason = TEXT("selected_authoritative_red_only");
+				OutSelectedIndices.Add(CandidateIndex);
+				for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+				{
+					if (const int32* ExistingOwner = RedOnlyStrokeOwner.Find(RedStrokeId))
+					{
+						++OutDiagnostics.RedOnlySharedStrokeWarningCount;
+						UE_LOG(LogTemp, Warning,
+							TEXT("Step9 selection: authoritative red-only candidates %d and %d unexpectedly share red stroke %d; both remain selected."),
+							*ExistingOwner, CandidateIndex, RedStrokeId);
+					}
+					else
+					{
+						RedOnlyStrokeOwner.Add(RedStrokeId, CandidateIndex);
+					}
+					LockedRedStrokeIds.Add(RedStrokeId);
+				}
+			}
+			else
+			{
+				++OutDiagnostics.EligibleMixedCount;
+				Candidate.SelectionPhase = TEXT("mixed_pool");
+				MixedPool.Add(CandidateIndex);
+			}
 		}
 
-		Order.Sort([&Candidates](int32 AIndex, int32 BIndex)
+		TArray<int32> SearchPool;
+		for (int32 CandidateIndex : MixedPool)
+		{
+			FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			if (CandidateConflictsWithRedSet(Candidate, LockedRedStrokeIds))
+			{
+				++OutDiagnostics.MixedBlockedByRedOnlyCount;
+				Candidate.SelectionPhase = TEXT("blocked_by_red_only");
+				Candidate.RejectReason = TEXT("mixed candidate uses red stroke locked by authoritative red-only loop");
+				continue;
+			}
+			SearchPool.Add(CandidateIndex);
+		}
+
+		SearchPool.Sort([&Candidates, &Strokes](int32 AIndex, int32 BIndex)
 		{
 			const FLoopCandidate& A = Candidates[AIndex];
 			const FLoopCandidate& B = Candidates[BIndex];
-			const bool bARedOnly = IsRedOnlyLoopCandidate(A);
-			const bool bBRedOnly = IsRedOnlyLoopCandidate(B);
-			if (A.Priority != B.Priority) { return A.Priority < B.Priority; }
-			if (!FMath::IsNearlyEqual(A.BlackTotalLength, B.BlackTotalLength, 1e-6))
-			{
-				return A.BlackTotalLength < B.BlackTotalLength;
-			}
-			if (bARedOnly && bBRedOnly)
-			{
-				if (FMath::Abs(A.LoopArea - B.LoopArea) > 1.0) { return A.LoopArea > B.LoopArea; }
-			}
-			if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
+			double ARedLength = 0.0;
+			double BRedLength = 0.0;
+			for (int32 Id : A.RealRedStrokeIds) { if (Strokes.IsValidIndex(Id)) { ARedLength += StrokeArcLength(Strokes[Id]); } }
+			for (int32 Id : B.RealRedStrokeIds) { if (Strokes.IsValidIndex(Id)) { BRedLength += StrokeArcLength(Strokes[Id]); } }
+			if (!FMath::IsNearlyEqual(ARedLength, BRedLength, 1e-6)) { return ARedLength > BRedLength; }
+			if (!FMath::IsNearlyEqual(A.BlackTotalLength, B.BlackTotalLength, 1e-6)) { return A.BlackTotalLength < B.BlackTotalLength; }
 			if (A.EdgeCount != B.EdgeCount) { return A.EdgeCount < B.EdgeCount; }
-			if (A.AnchorStrokeId != B.AnchorStrokeId) { return A.AnchorStrokeId < B.AnchorStrokeId; }
+			if (A.RealRedStrokeIds.Num() != B.RealRedStrokeIds.Num()) { return A.RealRedStrokeIds.Num() > B.RealRedStrokeIds.Num(); }
+			if (A.Source != B.Source) { return A.Source == TEXT("local_black"); }
 			return FCString::Strcmp(*A.Key, *B.Key) < 0;
 		});
 
-		TMap<int32, int32> ConsumedRedStrokeOwner;
-		for (int32 CandidateIndex : Order)
+		TArray<int32> BestMixed;
+		TSet<int32> GreedyUsedRed;
+		for (int32 CandidateIndex : SearchPool)
+		{
+			if (!CandidateConflictsWithRedSet(Candidates[CandidateIndex], GreedyUsedRed))
+			{
+				BestMixed.Add(CandidateIndex);
+				for (int32 RedStrokeId : Candidates[CandidateIndex].RealRedStrokeIds) { GreedyUsedRed.Add(RedStrokeId); }
+			}
+		}
+		FMixedSelectionScore BestScore = ScoreMixedSelection(Candidates, Strokes, BestMixed);
+
+		TArray<double> RemainingRedUpperBound;
+		RemainingRedUpperBound.SetNumZeroed(SearchPool.Num() + 1);
+		for (int32 Position = SearchPool.Num() - 1; Position >= 0; --Position)
+		{
+			double CandidateRedLength = 0.0;
+			for (int32 RedStrokeId : Candidates[SearchPool[Position]].RealRedStrokeIds)
+			{
+				if (Strokes.IsValidIndex(RedStrokeId)) { CandidateRedLength += StrokeArcLength(Strokes[RedStrokeId]); }
+			}
+			RemainingRedUpperBound[Position] = RemainingRedUpperBound[Position + 1] + CandidateRedLength;
+		}
+
+		const double SearchStartSeconds = FPlatformTime::Seconds();
+		TArray<int32> CurrentMixed;
+		TSet<int32> CurrentUsedRed;
+		TFunction<void(int32, double)> Search = [&](int32 Position, double CurrentCoveredLength)
+		{
+			if (OutDiagnostics.bTimedOut) { return; }
+			++OutDiagnostics.VisitedStateCount;
+			if (FPlatformTime::Seconds() - SearchStartSeconds >= CapMixedSelectionTimeBudgetSeconds)
+			{
+				OutDiagnostics.bTimedOut = true;
+				OutDiagnostics.bOptimalityProven = false;
+				return;
+			}
+			if (Position >= SearchPool.Num())
+			{
+				const FMixedSelectionScore Score = ScoreMixedSelection(Candidates, Strokes, CurrentMixed);
+				if (IsBetterMixedScore(Score, BestScore))
+				{
+					BestScore = Score;
+					BestMixed = CurrentMixed;
+				}
+				return;
+			}
+			if (CurrentCoveredLength + RemainingRedUpperBound[Position] + 1e-6 < BestScore.CoveredRedArcLength)
+			{
+				return;
+			}
+
+			const int32 CandidateIndex = SearchPool[Position];
+			const FLoopCandidate& Candidate = Candidates[CandidateIndex];
+			if (!CandidateConflictsWithRedSet(Candidate, CurrentUsedRed))
+			{
+				double AddedLength = 0.0;
+				for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
+				{
+					CurrentUsedRed.Add(RedStrokeId);
+					if (Strokes.IsValidIndex(RedStrokeId)) { AddedLength += StrokeArcLength(Strokes[RedStrokeId]); }
+				}
+				CurrentMixed.Add(CandidateIndex);
+				Search(Position + 1, CurrentCoveredLength + AddedLength);
+				CurrentMixed.Pop();
+				for (int32 RedStrokeId : Candidate.RealRedStrokeIds) { CurrentUsedRed.Remove(RedStrokeId); }
+			}
+			Search(Position + 1, CurrentCoveredLength);
+		};
+		Search(0, 0.0);
+
+		OutDiagnostics.ElapsedSeconds = FPlatformTime::Seconds() - SearchStartSeconds;
+		OutDiagnostics.BestMixedScore = BestScore;
+		TSet<int32> BestMixedSet;
+		for (int32 CandidateIndex : BestMixed)
+		{
+			BestMixedSet.Add(CandidateIndex);
+		}
+		for (int32 CandidateIndex : SearchPool)
 		{
 			FLoopCandidate& Candidate = Candidates[CandidateIndex];
-			if (!Candidate.bHasValidLocalGreenAction)
+			if (BestMixedSet.Contains(CandidateIndex))
 			{
-				Candidate.RejectReason = Candidate.GreenPrefilterReason.IsEmpty()
-					? TEXT("candidate has no valid local green action")
-					: Candidate.GreenPrefilterReason;
-				continue;
+				Candidate.bSelected = true;
+				Candidate.SelectionPhase = OutDiagnostics.bTimedOut ? TEXT("mixed_best_found_timeout") : TEXT("mixed_exact_optimum");
+				Candidate.RejectReason = OutDiagnostics.bTimedOut ? TEXT("selected_best_found_before_timeout") : TEXT("selected_exact_mixed_optimum");
+				OutSelectedIndices.Add(CandidateIndex);
 			}
-			if (IsRedOnlyLoopCandidate(Candidate) && Candidate.LoopBboxArea < CapRedOnlyLoopMinBboxArea)
+			else
 			{
-				Candidate.RejectReason = FString::Printf(
-					TEXT("red-only loop bbox area %.3f below %.3f"),
-					Candidate.LoopBboxArea,
-					CapRedOnlyLoopMinBboxArea);
-				continue;
-			}
-			if (IsBorrowedLoopCandidate(Candidate) && Candidate.LoopBboxArea < CapBorrowedLoopMinBboxArea)
-			{
-				Candidate.RejectReason = FString::Printf(TEXT("loop bbox area %.3f below %.3f"), Candidate.LoopBboxArea, CapBorrowedLoopMinBboxArea);
-				continue;
-			}
-			if (Candidate.bRejectedByInteriorRed)
-			{
-				Candidate.RejectReason = Candidate.InteriorRedRejectReason.IsEmpty()
-					? TEXT("candidate rejected: interior red line exceeds threshold")
-					: Candidate.InteriorRedRejectReason;
-				continue;
-			}
-			if (!Candidate.bHasValidFaceEvaluation)
-			{
-				Candidate.RejectReason = Candidate.FaceEvaluationReason.IsEmpty()
-					? TEXT("candidate has no valid base face")
-					: Candidate.FaceEvaluationReason;
-				continue;
-			}
-
-			int32 ConflictingRed = -1;
-			int32 ConflictingOwner = -1;
-			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
-			{
-				if (const int32* Owner = ConsumedRedStrokeOwner.Find(RedStrokeId))
-				{
-					ConflictingRed = RedStrokeId;
-					ConflictingOwner = *Owner;
-					break;
-				}
-			}
-			if (ConflictingRed >= 0)
-			{
-				Candidate.RejectReason = FString::Printf(TEXT("red stroke %d already selected by candidate %d"), ConflictingRed, ConflictingOwner);
-				continue;
-			}
-
-			Candidate.bSelected = true;
-			Candidate.RejectReason = TEXT("selected");
-			OutSelectedIndices.Add(CandidateIndex);
-			for (int32 RedStrokeId : Candidate.RealRedStrokeIds)
-			{
-				ConsumedRedStrokeOwner.Add(RedStrokeId, CandidateIndex);
+				Candidate.SelectionPhase = TEXT("mixed_not_selected");
+				Candidate.RejectReason = OutDiagnostics.bTimedOut
+					? TEXT("not in best mixed combination found before timeout")
+					: TEXT("not in exact optimal mixed combination");
 			}
 		}
 	}
@@ -5539,7 +5944,10 @@ namespace FromLZImageOps
 		Json += bTrailingComma ? TEXT("],\n") : TEXT("]\n");
 	}
 
-	static bool SaveLoopCandidatesJson(const TArray<FLoopCandidate>& Candidates, const FString& Path)
+	static bool SaveLoopCandidatesJson(
+		const TArray<FLoopCandidate>& Candidates,
+		const FLoopSelectionDiagnostics& Diagnostics,
+		const FString& Path)
 	{
 		FString Json;
 		Json += TEXT("{\n");
@@ -5553,6 +5961,25 @@ namespace FromLZImageOps
 			}
 		}
 		Json += FString::Printf(TEXT("  \"selected_count\": %d,\n"), SelectedCount);
+		Json += TEXT("  \"selection\": {\n");
+		Json += TEXT("    \"red_only_policy\": \"select_all_valid_and_lock_real_red_strokes\",\n");
+		Json += TEXT("    \"mixed_conflict_policy\": \"shared_real_red_stroke_only\",\n");
+		Json += FString::Printf(TEXT("    \"mixed_time_budget_seconds\": %.3f,\n"), Diagnostics.TimeBudgetSeconds);
+		Json += FString::Printf(TEXT("    \"mixed_elapsed_seconds\": %.6f,\n"), Diagnostics.ElapsedSeconds);
+		Json += FString::Printf(TEXT("    \"mixed_visited_state_count\": %lld,\n"), Diagnostics.VisitedStateCount);
+		Json += FString::Printf(TEXT("    \"mixed_timed_out\": %s,\n"), Diagnostics.bTimedOut ? TEXT("true") : TEXT("false"));
+		Json += FString::Printf(TEXT("    \"mixed_optimality_proven\": %s,\n"), Diagnostics.bOptimalityProven ? TEXT("true") : TEXT("false"));
+		Json += FString::Printf(TEXT("    \"eligible_red_only_count\": %d,\n"), Diagnostics.EligibleRedOnlyCount);
+		Json += FString::Printf(TEXT("    \"eligible_mixed_count\": %d,\n"), Diagnostics.EligibleMixedCount);
+		Json += FString::Printf(TEXT("    \"mixed_blocked_by_red_only_count\": %d,\n"), Diagnostics.MixedBlockedByRedOnlyCount);
+		Json += FString::Printf(TEXT("    \"red_only_shared_stroke_warning_count\": %d,\n"), Diagnostics.RedOnlySharedStrokeWarningCount);
+		Json += FString::Printf(TEXT("    \"best_mixed_covered_red_arc_length\": %.6f,\n"), Diagnostics.BestMixedScore.CoveredRedArcLength);
+		Json += FString::Printf(TEXT("    \"best_mixed_borrowed_black_arc_length\": %.6f,\n"), Diagnostics.BestMixedScore.BorrowedBlackArcLength);
+		Json += FString::Printf(TEXT("    \"best_mixed_graph_edge_count\": %d,\n"), Diagnostics.BestMixedScore.GraphEdgeCount);
+		Json += FString::Printf(TEXT("    \"best_mixed_covered_red_stroke_count\": %d,\n"), Diagnostics.BestMixedScore.CoveredRedStrokeCount);
+		Json += FString::Printf(TEXT("    \"best_mixed_candidate_count\": %d,\n"), Diagnostics.BestMixedScore.CandidateCount);
+		Json += FString::Printf(TEXT("    \"best_mixed_local_black_candidate_count\": %d\n"), Diagnostics.BestMixedScore.LocalBlackCandidateCount);
+		Json += TEXT("  },\n");
 		Json += TEXT("  \"candidates\": [\n");
 		for (int32 i = 0; i < Candidates.Num(); ++i)
 		{
@@ -5564,6 +5991,8 @@ namespace FromLZImageOps
 			Json += FString::Printf(TEXT("    \"anchor_stroke_id\": %d,\n"), C.AnchorStrokeId);
 			Json += FString::Printf(TEXT("    \"selected\": %s,\n"), C.bSelected ? TEXT("true") : TEXT("false"));
 			Json += FString::Printf(TEXT("    \"reason\": \"%s\",\n"), *JsonEscaped(C.RejectReason));
+			Json += FString::Printf(TEXT("    \"selection_class\": \"%s\",\n"), *JsonEscaped(C.SelectionClass));
+			Json += FString::Printf(TEXT("    \"selection_phase\": \"%s\",\n"), *JsonEscaped(C.SelectionPhase));
 			Json += FString::Printf(TEXT("    \"edge_count\": %d,\n"), C.EdgeCount);
 			Json += FString::Printf(TEXT("    \"loop_area\": %.3f,\n"), C.LoopArea);
 			Json += FString::Printf(TEXT("    \"loop_bbox_area\": %.3f,\n"), C.LoopBboxArea);
@@ -6500,7 +6929,8 @@ namespace FromLZImageOps
 		const double SelTol2 = double(BlackSelectTol) * double(BlackSelectTol);
 
 		TArray<FLoopCandidate> Candidates;
-		CollectRedFirstLoopCandidates(TraceStrokes, RedIdx, BlackIdx, CapLoopGraphNodeSnapTol, FirstSyntheticStrokeId, Candidates);
+		CollectRedFirstLoopCandidates(
+			TraceStrokes, RedIdx, BlackIdx, CapLoopGraphNodeSnapTol, FirstSyntheticStrokeId, Candidates);
 		for (FLoopCandidate& Candidate : Candidates)
 		{
 			PrefilterLoopCandidateByLocalGreen(
@@ -6577,8 +7007,9 @@ namespace FromLZImageOps
 		}
 
 		TArray<int32> SelectedCandidateIndices;
-		SelectLoopCandidates(Candidates, SelectedCandidateIndices);
-		SaveLoopCandidatesJson(Candidates, PressDir / TEXT("09_loop_candidates.json"));
+		FLoopSelectionDiagnostics SelectionDiagnostics;
+		SelectLoopCandidates(Candidates, TraceStrokes, SelectedCandidateIndices, SelectionDiagnostics);
+		SaveLoopCandidatesJson(Candidates, SelectionDiagnostics, PressDir / TEXT("09_loop_candidates.json"));
 
 		if (SelectedCandidateIndices.Num() == 0)
 		{
