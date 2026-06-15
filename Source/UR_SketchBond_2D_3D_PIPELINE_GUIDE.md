@@ -46,8 +46,8 @@ Read custom source in this order:
 3. `FromLZGameViewportClient.*`
    - Runtime keyboard entry points and capture ticking.
 4. `FromLZCaptureUtils.*`
-   - Orthographic viewport state machine, line-art capture, face segmentation,
-     and actor/material ID rasterization.
+   - Offscreen orthographic camera capture, line-art capture, face
+     segmentation, and actor/material ID rasterization.
 5. `FromLZSketchBoard.*`
    - Slate drawing board, save/proceed, minimize, close, and undo controls.
 6. `FromLZSketchProcessor.*`
@@ -144,23 +144,19 @@ The module registers:
 
 ```text
 Enter
-  -> save perspective viewport reference
-  -> temporarily switch the real camera to orthographic
-  -> wait for rendered orthographic frames and at least 2 seconds
-  -> use the stable viewport projection matrix for SceneCapture2D
+  -> resolve the controlled pawn's FromLZ camera
+  -> snapshot its transform, AspectRatio, and OrthoWidth
+  -> fit the camera aspect ratio inside the current game viewport size
+  -> build one offscreen orthographic projection matrix
   -> capture line art, planar faces, and actor/material IDs
-  -> restore the original camera projection
-  -> wait until a restored-perspective frame is rendered
   -> finalize projection diagnostics
   -> open the sketch board
 
 1 or 2
   -> find exactly one actor with the corresponding capture-camera tag
   -> require exactly one registered active camera component on that actor
-  -> save the original player view target
-  -> switch the rendered viewport to the tagged camera
-  -> run the same orthographic capture/output pipeline as Enter
-  -> restore the tagged camera projection and the original player view target
+  -> snapshot that camera's transform, AspectRatio, and OrthoWidth
+  -> run the same offscreen orthographic capture/output pipeline as Enter
   -> open the sketch board for that exact capture
 
 Proceed or Space
@@ -189,32 +185,25 @@ Tab
   -> reload current level
 ```
 
-## 6. Orthographic Capture State Machine
+## 6. Offscreen Orthographic Capture
 
-Capture is deliberately asynchronous because reconstruction requires the
-projection actually rendered by the game viewport.
+Enter, `1`, and `2` share one capture implementation. The selected source
+camera and displayed player view remain unchanged. Capture is queued and
+completed on the next viewport tick, but it does not wait for a rendered
+orthographic viewport frame.
 
 ### 6.1 Begin
 
 `BeginCaptureFromWorld`:
 
 1. Rejects null world/viewport.
-2. Rejects a second pending capture in the same world.
+2. Rejects a second pending capture.
 3. Finds a player controller whose pawn has a `FromLZ` camera.
 4. Creates timestamped output paths under `Saved/FromLZCaptures`.
-5. Saves the currently displayed perspective backbuffer.
-6. Records a detailed perspective view snapshot.
-7. Stores the original camera projection properties.
-8. Temporarily changes the real camera to orthographic:
-   - width: current valid `OrthoWidth`, otherwise `1536`;
-   - near plane: `0`;
-   - far plane: `2097152`;
-   - auto plane calculation: off;
-   - auto plane shift: `0`;
-   - ortho plane updates: off;
-   - camera-height-as-target: off.
-
-The pending capture times out after `10 seconds`.
+5. Saves the unchanged displayed viewport backbuffer as a reference image.
+6. Snapshots the selected camera component transform and projection fields.
+7. Builds an immutable orthographic capture description without changing the
+   camera component or player view target.
 
 `Enter` always resolves the `FromLZ` camera component on the controlled pawn.
 It does not search tagged scene cameras.
@@ -223,22 +212,41 @@ It does not search tagged scene cameras.
 
 1. resolves exactly one actor with the requested Actor Tag;
 2. requires exactly one registered active camera component on that actor;
-3. switches the player view target to that actor;
-4. waits for the target camera pose to be observed in the rendered viewport;
-5. then enters the ordinary orthographic settle/capture state.
+3. snapshots that camera directly;
+4. enters the same offscreen capture path as Enter.
 
 Actor Tags, not actor names or editor labels, are the packaged-build contract.
 Missing or duplicate tags abort capture without falling back to `FromLZ`.
 
-### 6.2 Settle and capture
+### 6.2 Dimensions and projection
 
-`NotifyViewportDrawn` counts rendered frames, captures the first orthographic
-snapshot, and records the stable orthographic snapshot after the view has been
-orthographic for at least `2 seconds`.
+The current game viewport supplies only the maximum pixel bounds. The selected
+camera supplies the framing parameters:
 
-`CompletePendingCapture` performs the expensive capture only after a stable
-orthographic frame has been reported. The stable viewport's exact projection
-matrix is copied into `SceneCapture2D.CustomProjectionMatrix`.
+- transform: selected camera component transform;
+- aspect ratio: selected camera `AspectRatio`;
+- orthographic width: selected camera `OrthoWidth`, or `1536` only when it is
+  invalid;
+- near plane: `0`;
+- far plane: `2097152`.
+
+Capture dimensions are the largest integer-sized rectangle derived from the
+camera aspect ratio that fits inside the current viewport. For example, a
+`4:3` camera in a `1920x1080` viewport captures at `1440x1080`. The image is
+not stretched, letterboxed, or padded.
+
+The code constructs a local `FMinimalViewInfo`, forces only that local
+description to orthographic, and calls
+`FMinimalViewInfo::CalculateProjectionMatrix`. That exact matrix and immutable
+camera transform are reused by:
+
+- final-color and debug SceneCapture2D passes;
+- depth/normal line-art capture;
+- planar-face segmentation and 2D-to-world unprojection;
+- actor/component/material ID rasterization;
+- capture JSON consumed by Steps 9 and 10.
+
+`SceneCapture2D.CustomProjectionMatrix` receives this shared matrix.
 
 The matrix is considered usable when:
 
@@ -249,20 +257,16 @@ The matrix is considered usable when:
 There is no Step 10 fallback from a missing matrix to an `OrthoWidth`
 approximation.
 
-### 6.3 Restore and finalization
+### 6.3 Viewport and camera invariants
 
-After outputs are generated:
+The capture path never calls `SetViewTarget`, never changes the source camera
+projection mode or dimensions, and has no orthographic settle delay. The
+player therefore keeps the same displayed view before, during, and after
+Enter/`1`/`2`.
 
-1. The scoped override restores every original camera projection property.
-2. The state machine waits for the restored projection to be observed in both
-   the camera component and player camera manager.
-3. A restored-perspective rendered frame is recorded.
-4. Projection/transform debug JSON is finalized.
-
-For tagged-camera capture, the original player view target is restored after
-the tagged camera projection has been restored and rendered. Canceling,
-timing out, or Tab-resetting a pending capture restores both the selected
-camera projection and the original view target before dropping state.
+`NotifyViewportDrawn` remains as a compatibility entry point but performs no
+capture-state work. Cancel or Tab reset simply drops a pending immutable
+capture request; no camera or view-target restoration is required.
 
 ## 7. Capture Subject Filtering
 
@@ -311,9 +315,13 @@ FromLZ_<timestamp>_debug_depth_lap.png
 FromLZ_<timestamp>_debug_normal_grad.png
 ```
 
-The main JSON includes camera transforms, original/capture projection
-properties, viewport size, exact matrix, subject mode, focus/reference
-metadata, and debug paths.
+The main JSON includes the selected camera transform, original/capture
+projection properties, maximum viewport size, fitted capture dimensions,
+camera aspect ratio, exact matrix, subject mode, and debug paths.
+
+`_debug_viewport_perspective.png` is the unchanged displayed game viewport.
+The legacy-named `_debug_viewport_orthographic.png` is an offscreen render from
+the selected camera; it is not a screenshot of a switched player viewport.
 
 ## 9. Line-Art Generation
 
@@ -1859,7 +1867,7 @@ Use this order:
 1. `capture_ref.json`
    - Verify exact source pairing.
 2. capture JSON and `_debug_transforms.json`
-   - Verify stable/restored projection and exact matrix.
+   - Verify selected-camera snapshot, fitted dimensions, and exact matrix.
 3. main capture, depth, normal, face, and actor/material images
    - Separate line-art/segmentation/ID failures.
 4. `01` through `07`
