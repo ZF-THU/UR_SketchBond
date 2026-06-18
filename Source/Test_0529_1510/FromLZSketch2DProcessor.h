@@ -4,14 +4,15 @@
 
 class UWorld;
 
-// Migrated 2D sketch-analysis pipeline (steps 1-8 of the Python extrusion script),
-// reimplemented in pure C++ with no third-party dependencies.
+// Migrated sketch pipeline: Steps 1-9 analyze the composite image in C++, then
+// Step 10/11 are dispatched to the face reconstructor for runtime geometry.
 //
-// Triggered after the Space-key composite (wContextSketch_raw.png) is produced.
-// All debug artifacts are written under <ProjectSaved>/2DDebug/.
+// Triggered after a board Proceed/Space composite (wContextSketch_raw.png) is
+// produced. Debug artifacts are written under <ProjectSaved>/2DDebug/ and
+// Action.json files under <ProjectSaved>/FromAction/.
 //
-// Implemented incrementally:
-//   [x] Step 1 preprocess (non-white binarize + close/dilate + remove small comps)
+// Active steps:
+//   [x] Step 1 preprocess (non-white binarize + remove small comps; no morphology)
 //   [x] Step 2 skeletonize (Zhang-Suen + remove small skeleton comps)
 //   [x] Step 3 skeleton gap repair (connect endpoints + small-loop / dangling prune)
 //   [x] Step 4 stroke tracing (crossing-number nodes + 8-connected polylines)
@@ -22,11 +23,9 @@ class UWorld;
 //   [x] Step 8 enclosed-region mask (endpoint-nearest-connect + flood)
 //   [x] Step 9 per-component red cap-loops -> per-component longest-green side -> translate-copy
 //       Each run writes to Saved/2DDebug/Press_##/, with one Component_%% subfolder per cap.
+//   [x] Step 10/11 dispatch (face validation, solid rebuild, runtime spawn/Boolean)
 //   Each stroke step emits a per-stroke palette PNG, a class-color PNG, and a JSON
 //   (id / color / kind / metrics / endpoints / neighbors / points).
-//   [ ] Step 6 post-split merge
-//   [ ] Step 7 stroke metrics
-//   [ ] Step 8 enclosed-region mask
 // Records which FromLZCaptures / FromSketch source files a Space press consumed.
 // Paths are relative to the project's Saved/ folder (e.g. "FromLZCaptures/FromLZ_xx.png").
 struct FSketchSourceInfo
@@ -45,13 +44,12 @@ struct FSketchSourceInfo
 class FFromLZSketch2DProcessor
 {
 public:
-	// Copies the RGBA buffer and runs the pipeline on a background thread so the
-	// game thread never blocks on the (potentially heavy) thinning pass.
+	// Moves the RGBA buffer into the bounded background scheduler so the game
+	// thread never blocks on the heavy 2D/3D processing path.
 	static void ProcessCompositeAsync(TArray<uint8> RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, UWorld* World);
 
 	// Synchronous entry point (runs on the calling thread). Returns true on success.
 	static bool ProcessComposite(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, TWeakObjectPtr<UWorld> World);
 
-private:
 	static bool ProcessCompositeWithGeneration(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, int32 SessionGeneration, TWeakObjectPtr<UWorld> World);
 };

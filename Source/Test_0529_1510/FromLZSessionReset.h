@@ -18,6 +18,19 @@ public:
 	static void NotifyCompositeTaskStarted();
 	static void NotifyCompositeTaskFinished();
 
+	class FScopedCompositeTaskCounter
+	{
+	public:
+		FScopedCompositeTaskCounter();
+		~FScopedCompositeTaskCounter();
+
+		FScopedCompositeTaskCounter(const FScopedCompositeTaskCounter&) = delete;
+		FScopedCompositeTaskCounter& operator=(const FScopedCompositeTaskCounter&) = delete;
+
+	private:
+		bool bActive = true;
+	};
+
 private:
 	static void FinalizePendingReset(UWorld* World);
 };

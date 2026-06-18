@@ -1,5 +1,6 @@
 #include "FromLZGameViewportClient.h"
 
+#include "FromLZCameraPreview.h"
 #include "FromLZCaptureUtils.h"
 #include "FromLZFaceReconstructor.h"
 #include "FromLZSketchBoard.h"
@@ -20,6 +21,12 @@ void UFromLZGameViewportClient::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 	FFromLZSessionReset::Tick(GetWorld());
+	if (FFromLZSessionReset::IsResetPending())
+	{
+		FFromLZCameraPreview::Shutdown();
+		return;
+	}
+	FFromLZCameraPreview::Tick(GetWorld(), this, Viewport);
 	FFromLZCaptureUtils::CompletePendingCapture(GetWorld(), Viewport);
 }
 
@@ -82,4 +89,10 @@ bool UFromLZGameViewportClient::InputKey(const FInputKeyEventArgs& EventArgs)
 	}
 
 	return Super::InputKey(EventArgs);
+}
+
+void UFromLZGameViewportClient::BeginDestroy()
+{
+	FFromLZCameraPreview::Shutdown();
+	Super::BeginDestroy();
 }

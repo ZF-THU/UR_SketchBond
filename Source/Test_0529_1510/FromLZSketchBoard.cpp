@@ -542,9 +542,12 @@ namespace
 
 		if (bVisible)
 		{
-			GSketchBoardPlayerController = PlayerController;
-			bHadPreviousCursor = true;
-			bPreviousCursorVisible = PlayerController->bShowMouseCursor;
+			if (!GSketchBoardPlayerController.IsValid())
+			{
+				GSketchBoardPlayerController = PlayerController;
+				bHadPreviousCursor = true;
+				bPreviousCursorVisible = PlayerController->bShowMouseCursor;
+			}
 			PlayerController->bShowMouseCursor = true;
 			FInputModeGameAndUI InputMode;
 			InputMode.SetHideCursorDuringCapture(false);
@@ -556,6 +559,7 @@ namespace
 			GSketchBoardPlayerController->SetInputMode(FInputModeGameOnly());
 			GSketchBoardPlayerController.Reset();
 			bHadPreviousCursor = false;
+			bPreviousCursorVisible = false;
 		}
 	}
 
@@ -607,8 +611,11 @@ void FFromLZSketchBoard::ShowForCapture(UWorld* World, UGameViewportClient* View
 		return;
 	}
 
-	RemoveBoardWidget();
-	GSketchBoardState.Reset();
+	if (GSketchBoardState.IsValid() || GSketchBoardWidget.IsValid() || bSketchBoardMinimized)
+	{
+		Close();
+	}
+
 	GSketchBoardWorld = World;
 	GSketchBoardViewportClient = ViewportClient;
 	bSketchBoardMinimized = false;

@@ -42,6 +42,8 @@
 static constexpr double FromLZDefaultOrthoWidth = 1536.0;
 static constexpr float FromLZCaptureOrthoNearPlane = 0.0f;
 static constexpr float FromLZCaptureOrthoFarPlane = 2097152.0f;
+static const FName FromLZCaptureSubjectTag(TEXT("FromLZCaptureSubject"));
+static const FName FromLZCapturePlaneTag(TEXT("FromLZCapturePlane"));
 
 struct FFromLZCaptureView
 {
@@ -209,8 +211,14 @@ struct FPendingFromLZCapture
 	FFromLZCameraProjectionSnapshot SourceCameraProjection;
 	FString CameraSource = TEXT("pawn_fromlz_offscreen");
 	FName RequestedCameraTag = NAME_None;
+	TArray<TWeakObjectPtr<AActor>> SubjectActors;
+	FString SubjectMode;
+	FVector SubjectBoundsCenter = FVector::ZeroVector;
+	double SubjectFocusDepth = 0.0;
+	bool bUsedSubjectBoundsCenterOrthoWidth = false;
 	bool bSourceOrthoWidthUsedDefault = false;
 	bool bViewportReferenceSaved = false;
+	FFromLZCaptureCompletionCallback CompletionCallback;
 };
 
 static TUniquePtr<FPendingFromLZCapture> GPendingFromLZCapture;
@@ -234,8 +242,66 @@ static FPendingFromLZCapture::FOutputPaths MakeCaptureOutputPaths()
 	return Paths;
 }
 
+static void AddExistingCaptureFile(const FString& FilePath, TArray<FString>& OutputFiles)
+{
+	if (!FilePath.IsEmpty() && IFileManager::Get().FileExists(*FilePath))
+	{
+		OutputFiles.AddUnique(FilePath);
+	}
+}
+
+static FFromLZCaptureResult MakeCaptureResult(
+	const FPendingFromLZCapture::FOutputPaths& Paths,
+	bool bSuccess,
+	const FString& Message)
+{
+	FFromLZCaptureResult Result;
+	Result.bSuccess = bSuccess;
+	Result.Message = Message;
+	Result.CaptureDirectory = Paths.CaptureDirectory;
+	Result.MainPngPath = Paths.PngPath;
+	Result.MainJsonPath = Paths.JsonPath;
+
+	const FString BasePath = Paths.CaptureDirectory / Paths.BaseFilename;
+	AddExistingCaptureFile(Paths.PngPath, Result.OutputFiles);
+	AddExistingCaptureFile(Paths.JsonPath, Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_faces.png"), Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_faces.json"), Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_faces_debug.png"), Result.OutputFiles);
+	AddExistingCaptureFile(Paths.ActorMaterialPngPath, Result.OutputFiles);
+	AddExistingCaptureFile(Paths.ActorMaterialJsonPath, Result.OutputFiles);
+	AddExistingCaptureFile(Paths.DebugViewportPerspectivePngPath, Result.OutputFiles);
+	AddExistingCaptureFile(Paths.DebugViewportOrthographicPngPath, Result.OutputFiles);
+	AddExistingCaptureFile(Paths.DebugFromLZCameraPngPath, Result.OutputFiles);
+	AddExistingCaptureFile(Paths.DebugTransformsJsonPath, Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_debug_depth.png"), Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_debug_normal.png"), Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_debug_depth_lap.png"), Result.OutputFiles);
+	AddExistingCaptureFile(BasePath + TEXT("_debug_normal_grad.png"), Result.OutputFiles);
+
+	return Result;
+}
+
+static FFromLZCaptureResult MakeCaptureFailureResult(const FString& Message)
+{
+	FFromLZCaptureResult Result;
+	Result.bSuccess = false;
+	Result.Message = Message;
+	return Result;
+}
+
+static void DispatchCaptureCompletion(
+	FFromLZCaptureCompletionCallback& CompletionCallback,
+	const FFromLZCaptureResult& Result)
+{
+	if (CompletionCallback)
+	{
+		CompletionCallback(Result);
+	}
+}
+
 // ===================================================================
-// Normal-based planar face segmentation (Enter-key capture).
+// Normal-based planar face segmentation for every offscreen capture path.
 // Groups foreground pixels whose world normals are continuous and whose depth
 // is continuous into planar faces, extracts each face's corner key points, and
 // unprojects them to 3D world coordinates using the captured camera parameters.
@@ -1360,9 +1426,14 @@ static bool BuildOffscreenOrthographicCaptureView(
 	const APawn* Pawn,
 	UCameraComponent* Camera,
 	FViewport* Viewport,
+	const TArray<AActor*>& FramingActors,
+	bool bAllowSubjectBoundsCenterOrthoWidth,
 	FFromLZCaptureView& OutView,
 	FFromLZCameraProjectionSnapshot& OutSourceProjection,
-	bool& bOutUsedDefaultOrthoWidth)
+	bool& bOutUsedDefaultOrthoWidth,
+	bool& bOutUsedSubjectBoundsCenterOrthoWidth,
+	FVector& OutSubjectBoundsCenter,
+	double& OutSubjectFocusDepth)
 {
 	if (!Pawn || !Camera || !Viewport)
 	{
@@ -1402,9 +1473,28 @@ static bool BuildOffscreenOrthographicCaptureView(
 	const double SourceOrthoWidth = static_cast<double>(ViewInfo.OrthoWidth);
 	bOutUsedDefaultOrthoWidth =
 		!FMath::IsFinite(SourceOrthoWidth) || SourceOrthoWidth <= 1e-6;
+	bOutUsedSubjectBoundsCenterOrthoWidth = false;
+	OutSubjectBoundsCenter = FVector::ZeroVector;
+	OutSubjectFocusDepth = 0.0;
+	double SubjectBoundsOrthoWidth = 0.0;
+	if (bAllowSubjectBoundsCenterOrthoWidth &&
+		FFromLZCaptureUtils::CalculateSubjectBoundsCenterOrthoWidth(
+		Camera,
+		FramingActors,
+		SubjectBoundsOrthoWidth,
+		OutSubjectBoundsCenter,
+		OutSubjectFocusDepth))
+	{
+		ViewInfo.OrthoWidth = static_cast<float>(SubjectBoundsOrthoWidth);
+		bOutUsedDefaultOrthoWidth = false;
+		bOutUsedSubjectBoundsCenterOrthoWidth = true;
+	}
 	ViewInfo.ProjectionMode = ECameraProjectionMode::Orthographic;
-	ViewInfo.OrthoWidth = static_cast<float>(
-		bOutUsedDefaultOrthoWidth ? FromLZDefaultOrthoWidth : SourceOrthoWidth);
+	if (!bOutUsedSubjectBoundsCenterOrthoWidth)
+	{
+		ViewInfo.OrthoWidth = static_cast<float>(
+			bOutUsedDefaultOrthoWidth ? FromLZDefaultOrthoWidth : SourceOrthoWidth);
+	}
 	ViewInfo.OrthoNearClipPlane = FromLZCaptureOrthoNearPlane;
 	ViewInfo.OrthoFarClipPlane = FromLZCaptureOrthoFarPlane;
 	ViewInfo.bAutoCalculateOrthoPlanes = false;
@@ -1426,7 +1516,9 @@ static bool BuildOffscreenOrthographicCaptureView(
 	OutView.FramingMode = TEXT("camera_aspect_ratio_max_inscribed_offscreen");
 	OutView.OrthoWidthMode = bOutUsedDefaultOrthoWidth
 		? TEXT("default_ortho_width_fallback")
-		: TEXT("selected_camera_ortho_width");
+		: (bOutUsedSubjectBoundsCenterOrthoWidth
+			? TEXT("subject_bounds_center_from_perspective_fov")
+			: TEXT("selected_camera_ortho_width"));
 	OutView.MaxViewportSize = MaxSize;
 	OutView.ViewportSize = CaptureSize;
 	OutView.ViewportAspectRatio = double(CaptureSize.X) / double(CaptureSize.Y);
@@ -1524,32 +1616,19 @@ static bool ConfigureSceneCaptureFromCaptureView(
 	return true;
 }
 
-static bool ActorNameOrLabelStartsWith(const AActor* Actor, const FString& Prefix)
+static bool ActorHasTag(const AActor* Actor, FName Tag)
 {
-	if (!Actor)
-	{
-		return false;
-	}
-
-	bool bMatch = Actor->GetName().StartsWith(Prefix, ESearchCase::CaseSensitive);
-#if WITH_EDITOR
-	bMatch = bMatch || Actor->GetActorLabel().StartsWith(Prefix, ESearchCase::CaseSensitive);
-#endif
-	return bMatch;
+	return Actor && Actor->ActorHasTag(Tag);
 }
 
-static bool ActorNameOrLabelContains(const AActor* Actor, const FString& Text)
+static bool ActorIsTaggedBaseCaptureSubject(const AActor* Actor)
 {
-	if (!Actor)
-	{
-		return false;
-	}
+	return ActorHasTag(Actor, FromLZCaptureSubjectTag);
+}
 
-	bool bMatch = Actor->GetName().Contains(Text, ESearchCase::CaseSensitive);
-#if WITH_EDITOR
-	bMatch = bMatch || Actor->GetActorLabel().Contains(Text, ESearchCase::CaseSensitive);
-#endif
-	return bMatch;
+static bool ActorIsTaggedCapturePlane(const AActor* Actor)
+{
+	return ActorHasTag(Actor, FromLZCapturePlaneTag);
 }
 
 static bool ActorHasVisibleCaptureMeshComponent(AActor* Actor)
@@ -1619,15 +1698,13 @@ static void BuildCaptureSubjectActors(
 		FMath::IsFinite(CameraLocation.Y) &&
 		FMath::IsFinite(CameraLocation.Z);
 
-	int32 CubeSubjectCount = 0;
-	int32 PlaneSubjectCount = 0;
 	int32 Step11RuntimeSubjectCount = 0;
 	int32 BboxAtOrBelowCameraKeptCount = 0;
 	int32 BboxAboveOutsideXYKeptCount = 0;
 	int32 BboxAboveInsideXYExcludedCount = 0;
 	int32 BboxCameraUnavailableKeptCount = 0;
-	const FString CubeSubjectPrefix(TEXT("Cube"));
-	const FString PlaneSubjectToken(TEXT("Plane"));
+	int32 BaseSubjectCount = 0;
+	int32 CapturePlaneCount = 0;
 	for (TActorIterator<AActor> It(World); It; ++It)
 	{
 		AActor* Actor = *It;
@@ -1637,10 +1714,10 @@ static void BuildCaptureSubjectActors(
 		}
 
 		const bool bStep11RuntimeActor = FFromLZFaceReconstructor::IsStep11RuntimeActor(Actor);
-		const bool bCubeSubject = !bStep11RuntimeActor && ActorNameOrLabelStartsWith(Actor, CubeSubjectPrefix);
-		const bool bPlaneSubject = !bStep11RuntimeActor && ActorNameOrLabelContains(Actor, PlaneSubjectToken);
+		const bool bBaseSubject = !bStep11RuntimeActor && ActorIsTaggedBaseCaptureSubject(Actor);
+		const bool bCapturePlane = !bStep11RuntimeActor && ActorIsTaggedCapturePlane(Actor);
 		const bool bActiveStep11RuntimeSubject = FFromLZFaceReconstructor::IsStep11RuntimeActorActiveForCapture(Actor);
-		if (bCubeSubject || bPlaneSubject || bActiveStep11RuntimeSubject)
+		if (bBaseSubject || bCapturePlane || bActiveStep11RuntimeSubject)
 		{
 			if (bHasCaptureCamera)
 			{
@@ -1677,13 +1754,13 @@ static void BuildCaptureSubjectActors(
 			}
 
 			OutActors.Add(Actor);
-			if (bCubeSubject)
+			if (bBaseSubject)
 			{
-				++CubeSubjectCount;
+				++BaseSubjectCount;
 			}
-			if (bPlaneSubject)
+			if (bCapturePlane)
 			{
-				++PlaneSubjectCount;
+				++CapturePlaneCount;
 			}
 			if (bActiveStep11RuntimeSubject)
 			{
@@ -1695,9 +1772,9 @@ static void BuildCaptureSubjectActors(
 	if (OutActors.Num() > 0)
 	{
 		OutMode = FString::Printf(
-			TEXT("base_scene_or_active_step11_runtime(cube=%d,plane=%d,step11=%d,bbox_at_or_below_kept=%d,bbox_above_outside_xy_kept=%d,bbox_above_inside_xy_excluded=%d,bbox_camera_unavailable_kept=%d)"),
-			CubeSubjectCount,
-			PlaneSubjectCount,
+			TEXT("tagged_scene_or_active_step11_runtime(subject=%d,plane=%d,step11=%d,bbox_at_or_below_kept=%d,bbox_above_outside_xy_kept=%d,bbox_above_inside_xy_excluded=%d,bbox_camera_unavailable_kept=%d)"),
+			BaseSubjectCount,
+			CapturePlaneCount,
 			Step11RuntimeSubjectCount,
 			BboxAtOrBelowCameraKeptCount,
 			BboxAboveOutsideXYKeptCount,
@@ -1723,6 +1800,27 @@ static void ApplyCaptureSubjectActors(USceneCaptureComponent2D* SceneCapture, co
 	}
 
 	SceneCapture->PrimitiveRenderMode = ESceneCapturePrimitiveRenderMode::PRM_UseShowOnlyList;
+}
+
+static void BuildOrthoFramingActorsFromSubjects(const TArray<AActor*>& SubjectActors, TArray<AActor*>& OutFramingActors)
+{
+	OutFramingActors.Reset();
+	for (AActor* Actor : SubjectActors)
+	{
+		if (!IsValid(Actor))
+		{
+			continue;
+		}
+
+		const bool bActiveStep11RuntimeSubject = FFromLZFaceReconstructor::IsStep11RuntimeActorActiveForCapture(Actor);
+		const bool bPlaneSubject =
+			!bActiveStep11RuntimeSubject &&
+			ActorIsTaggedCapturePlane(Actor);
+		if (!bPlaneSubject)
+		{
+			OutFramingActors.Add(Actor);
+		}
+	}
 }
 
 static bool CaptureViewportDebugPng(FViewport* Viewport, const FString& OutputPath)
@@ -2455,14 +2553,15 @@ static bool CompleteCaptureFromTarget(
 	}
 
 	TArray<AActor*> SubjectActors;
-	FString SubjectMode;
-	BuildCaptureSubjectActors(
-		Pawn->GetWorld(),
-		Pawn,
-		CameraActor,
-		CaptureView.Transform.GetLocation(),
-		SubjectActors,
-		SubjectMode);
+	SubjectActors.Reserve(Pending.SubjectActors.Num());
+	for (const TWeakObjectPtr<AActor>& SubjectActor : Pending.SubjectActors)
+	{
+		if (SubjectActor.IsValid())
+		{
+			SubjectActors.Add(SubjectActor.Get());
+		}
+	}
+	const FString SubjectMode = Pending.SubjectMode;
 
 	TSharedRef<FJsonObject> RootObject = MakeShared<FJsonObject>();
 	RootObject->SetStringField(TEXT("capture_timestamp"), OutputPaths.Timestamp);
@@ -2488,6 +2587,9 @@ static bool CompleteCaptureFromTarget(
 	RootObject->SetBoolField(TEXT("camera_projection_temporarily_overridden"), false);
 	RootObject->SetStringField(TEXT("camera_projection_restore_policy"), TEXT("source_camera_not_modified"));
 	RootObject->SetBoolField(TEXT("capture_ortho_width_used_default"), Pending.bSourceOrthoWidthUsedDefault);
+	RootObject->SetBoolField(TEXT("capture_ortho_width_from_subject_bounds_center"), Pending.bUsedSubjectBoundsCenterOrthoWidth);
+	RootObject->SetNumberField(TEXT("subject_bounds_focus_depth"), Pending.SubjectFocusDepth);
+	AddVectorFields(RootObject, TEXT("subject_bounds_center"), Pending.SubjectBoundsCenter);
 	RootObject->SetNumberField(TEXT("orthographic_viewport_frames_rendered_before_capture"), 0);
 	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_required"), 0.0);
 	RootObject->SetNumberField(TEXT("orthographic_settle_seconds_actual"), 0.0);
@@ -2547,6 +2649,9 @@ static bool CompleteCaptureFromTarget(
 	ViewObject->SetObjectField(TEXT("projection_matrix"), SerializeMatrix(CaptureView.ProjectionMatrix));
 	ViewObject->SetNumberField(TEXT("default_ortho_width"), FromLZDefaultOrthoWidth);
 	ViewObject->SetStringField(TEXT("ortho_width_mode"), CaptureView.OrthoWidthMode);
+	ViewObject->SetBoolField(TEXT("ortho_width_from_subject_bounds_center"), Pending.bUsedSubjectBoundsCenterOrthoWidth);
+	ViewObject->SetNumberField(TEXT("subject_bounds_focus_depth"), Pending.SubjectFocusDepth);
+	AddVectorFields(ViewObject, TEXT("subject_bounds_center"), Pending.SubjectBoundsCenter);
 	ViewObject->SetStringField(TEXT("focus_source"), CaptureView.FocusSource);
 	ViewObject->SetNumberField(TEXT("focus_depth"), CaptureView.FocusDepth);
 	ViewObject->SetNumberField(TEXT("ortho_backoff"), CaptureView.OrthoBackoff);
@@ -2607,12 +2712,16 @@ static void ResetPendingOffscreenCapture(const TCHAR* Reason)
 	{
 		return;
 	}
+	const FString ReasonString = Reason ? FString(Reason) : FString(TEXT("Unspecified capture reset."));
+	FFromLZCaptureCompletionCallback CompletionCallback = MoveTemp(GPendingFromLZCapture->CompletionCallback);
+	FFromLZCaptureResult Result = MakeCaptureResult(GPendingFromLZCapture->OutputPaths, false, ReasonString);
 	UE_LOG(
 		LogTemp,
 		Log,
 		TEXT("CaptureFromLZ: pending offscreen capture ended: %s"),
 		Reason ? Reason : TEXT("unspecified"));
 	GPendingFromLZCapture.Reset();
+	DispatchCaptureCompletion(CompletionCallback, Result);
 }
 
 static bool PrepareForNewOffscreenCapture(const UWorld* World, FViewport* Viewport)
@@ -2637,11 +2746,14 @@ static bool BeginResolvedOffscreenCapture(
 	AActor* CameraActor,
 	UCameraComponent* Camera,
 	const FString& CameraSource,
-	FName RequestedCameraTag)
+	FName RequestedCameraTag,
+	bool bAllowSubjectBoundsCenterOrthoWidth,
+	FFromLZCaptureCompletionCallback CompletionCallback = nullptr)
 {
 	if (!World || !Viewport || !Pawn || !CameraActor || !Camera)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: resolved offscreen capture target is incomplete."));
+		DispatchCaptureCompletion(CompletionCallback, MakeCaptureFailureResult(TEXT("Resolved offscreen capture target is incomplete.")));
 		return false;
 	}
 
@@ -2653,15 +2765,40 @@ static bool BeginResolvedOffscreenCapture(
 	Pending->OutputPaths = MakeCaptureOutputPaths();
 	Pending->CameraSource = CameraSource;
 	Pending->RequestedCameraTag = RequestedCameraTag;
+	Pending->CompletionCallback = MoveTemp(CompletionCallback);
+
+	TArray<AActor*> SubjectActors;
+	BuildCaptureSubjectActors(
+		const_cast<UWorld*>(World),
+		Pawn,
+		CameraActor,
+		Camera->GetComponentLocation(),
+		SubjectActors,
+		Pending->SubjectMode);
+	Pending->SubjectActors.Reserve(SubjectActors.Num());
+	for (AActor* SubjectActor : SubjectActors)
+	{
+		Pending->SubjectActors.Add(SubjectActor);
+	}
+	TArray<AActor*> FramingActors;
+	BuildOrthoFramingActorsFromSubjects(SubjectActors, FramingActors);
 
 	if (!BuildOffscreenOrthographicCaptureView(
 		Pawn,
 		Camera,
 		Viewport,
+		FramingActors,
+		bAllowSubjectBoundsCenterOrthoWidth,
 		Pending->CaptureView,
 		Pending->SourceCameraProjection,
-		Pending->bSourceOrthoWidthUsedDefault))
+		Pending->bSourceOrthoWidthUsedDefault,
+		Pending->bUsedSubjectBoundsCenterOrthoWidth,
+		Pending->SubjectBoundsCenter,
+		Pending->SubjectFocusDepth))
 	{
+		DispatchCaptureCompletion(
+			Pending->CompletionCallback,
+			MakeCaptureResult(Pending->OutputPaths, false, TEXT("Failed to build the offscreen orthographic capture view.")));
 		return false;
 	}
 
@@ -2707,7 +2844,8 @@ bool FFromLZCaptureUtils::BeginCaptureFromWorld(const UWorld* World, FViewport* 
 				Pawn,
 				Camera,
 				TEXT("pawn_fromlz_offscreen"),
-				NAME_None);
+				NAME_None,
+				/*bAllowSubjectBoundsCenterOrthoWidth*/ true);
 		}
 	}
 
@@ -2792,7 +2930,77 @@ bool FFromLZCaptureUtils::BeginCaptureFromTaggedCamera(const UWorld* World, FVie
 		CameraActor,
 		ActiveCameraComponents[0],
 		TEXT("tagged_actor_offscreen"),
-		CameraActorTag);
+		CameraActorTag,
+		/*bAllowSubjectBoundsCenterOrthoWidth*/ false);
+}
+
+bool FFromLZCaptureUtils::BeginCaptureFromCameraComponent(
+	const UWorld* World,
+	FViewport* Viewport,
+	UCameraComponent* CameraComponent,
+	FFromLZCaptureCompletionCallback CompletionCallback)
+{
+	if (!PrepareForNewOffscreenCapture(World, Viewport))
+	{
+		DispatchCaptureCompletion(
+			CompletionCallback,
+			MakeCaptureFailureResult(TEXT("World/viewport is invalid, or another offscreen capture is already pending.")));
+		return false;
+	}
+	if (!IsValid(CameraComponent))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: blueprint camera component is null or invalid."));
+		DispatchCaptureCompletion(CompletionCallback, MakeCaptureFailureResult(TEXT("Camera component is null or invalid.")));
+		return false;
+	}
+	if (CameraComponent->GetWorld() != World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: blueprint camera component belongs to a different world."));
+		DispatchCaptureCompletion(CompletionCallback, MakeCaptureFailureResult(TEXT("Camera component belongs to a different world.")));
+		return false;
+	}
+	if (!CameraComponent->IsRegistered() || !CameraComponent->IsActive())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: blueprint camera component must be registered and active."));
+		DispatchCaptureCompletion(CompletionCallback, MakeCaptureFailureResult(TEXT("Camera component must be registered and active.")));
+		return false;
+	}
+
+	AActor* CameraActor = CameraComponent->GetOwner();
+	if (!IsValid(CameraActor))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: blueprint camera component has no valid owning actor."));
+		DispatchCaptureCompletion(CompletionCallback, MakeCaptureFailureResult(TEXT("Camera component has no valid owning actor.")));
+		return false;
+	}
+
+	APawn* Pawn = nullptr;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PlayerController = It->Get();
+		if (PlayerController && PlayerController->GetPawn())
+		{
+			Pawn = PlayerController->GetPawn();
+			break;
+		}
+	}
+	if (!Pawn)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: blueprint camera capture requires a player pawn."));
+		DispatchCaptureCompletion(CompletionCallback, MakeCaptureFailureResult(TEXT("Blueprint camera capture requires a player pawn.")));
+		return false;
+	}
+
+	return BeginResolvedOffscreenCapture(
+		World,
+		Viewport,
+		Pawn,
+		CameraActor,
+		CameraComponent,
+		TEXT("blueprint_camera_offscreen"),
+		NAME_None,
+		/*bAllowSubjectBoundsCenterOrthoWidth*/ false,
+		MoveTemp(CompletionCallback));
 }
 
 void FFromLZCaptureUtils::CancelPendingCapture()
@@ -2823,6 +3031,7 @@ void FFromLZCaptureUtils::CompletePendingCapture(const UWorld* World, FViewport*
 	TUniquePtr<FPendingFromLZCapture> Pending = MoveTemp(GPendingFromLZCapture);
 	const bool bCaptured = CompleteCaptureFromTarget(*Pending);
 	const bool bDebugSaved = FinalizeProjectionDebugFiles(*Pending);
+	const bool bSuccess = bCaptured && bDebugSaved;
 	if (bCaptured && bDebugSaved)
 	{
 		UE_LOG(
@@ -2845,6 +3054,15 @@ void FFromLZCaptureUtils::CompletePendingCapture(const UWorld* World, FViewport*
 			Pending->CaptureView.ViewportSize.X,
 			Pending->CaptureView.ViewportSize.Y);
 	}
+	FFromLZCaptureCompletionCallback CompletionCallback = MoveTemp(Pending->CompletionCallback);
+	DispatchCaptureCompletion(
+		CompletionCallback,
+		MakeCaptureResult(
+			Pending->OutputPaths,
+			bSuccess,
+			bSuccess
+				? FString(TEXT("Capture completed and output files are on disk."))
+				: FString::Printf(TEXT("Capture finished with incomplete outputs. capture=%d debug=%d"), bCaptured ? 1 : 0, bDebugSaved ? 1 : 0)));
 }
 
 UCameraComponent* FFromLZCaptureUtils::FindFromLZCamera(const APawn* Pawn)
@@ -2887,6 +3105,88 @@ USpringArmComponent* FFromLZCaptureUtils::FindCameraBoom(const APawn* Pawn)
 	}
 
 	return nullptr;
+}
+
+void FFromLZCaptureUtils::BuildCaptureSubjectActors(
+	UWorld* World,
+	const APawn* Pawn,
+	const AActor* CameraActor,
+	const FVector& CameraLocation,
+	TArray<AActor*>& OutActors,
+	FString& OutMode)
+{
+	::BuildCaptureSubjectActors(World, Pawn, CameraActor, CameraLocation, OutActors, OutMode);
+}
+
+void FFromLZCaptureUtils::BuildOrthoFramingActors(const TArray<AActor*>& SubjectActors, TArray<AActor*>& OutFramingActors)
+{
+	::BuildOrthoFramingActorsFromSubjects(SubjectActors, OutFramingActors);
+}
+
+void FFromLZCaptureUtils::ApplyCaptureSubjectActors(USceneCaptureComponent2D* SceneCapture, const TArray<AActor*>& SubjectActors)
+{
+	::ApplyCaptureSubjectActors(SceneCapture, SubjectActors);
+}
+
+bool FFromLZCaptureUtils::CalculateSubjectBoundsCenterOrthoWidth(
+	const UCameraComponent* Camera,
+	const TArray<AActor*>& SubjectActors,
+	double& OutOrthoWidth,
+	FVector& OutBoundsCenter,
+	double& OutFocusDepth)
+{
+	if (!Camera)
+	{
+		return false;
+	}
+
+	bool bHasBounds = false;
+	FBox CombinedBounds(EForceInit::ForceInit);
+	for (const AActor* Actor : SubjectActors)
+	{
+		if (!IsValid(Actor))
+		{
+			continue;
+		}
+
+		FVector Origin;
+		FVector Extent;
+		Actor->GetActorBounds(false, Origin, Extent);
+		if (!Origin.ContainsNaN() && !Extent.ContainsNaN() && Extent.GetMax() > 0.0)
+		{
+			CombinedBounds += FBox::BuildAABB(Origin, Extent);
+			bHasBounds = true;
+		}
+	}
+
+	if (!bHasBounds || !CombinedBounds.IsValid)
+	{
+		return false;
+	}
+
+	const FTransform CameraTransform = Camera->GetComponentTransform();
+	const FVector CameraLocation = CameraTransform.GetLocation();
+	const FVector CameraForward = CameraTransform.GetUnitAxis(EAxis::X).GetSafeNormal();
+	if (CameraLocation.ContainsNaN() || CameraForward.IsNearlyZero())
+	{
+		return false;
+	}
+
+	const double FovDegrees = static_cast<double>(Camera->FieldOfView);
+	if (!FMath::IsFinite(FovDegrees) || FovDegrees <= 1e-3 || FovDegrees >= 179.0)
+	{
+		return false;
+	}
+
+	OutBoundsCenter = CombinedBounds.GetCenter();
+	OutFocusDepth = FVector::DotProduct(OutBoundsCenter - CameraLocation, CameraForward);
+	if (!FMath::IsFinite(OutFocusDepth) || OutFocusDepth <= 1e-3)
+	{
+		return false;
+	}
+
+	OutOrthoWidth = 2.0 * OutFocusDepth * FMath::Tan(FMath::DegreesToRadians(FovDegrees * 0.5));
+	return FMath::IsFinite(OutOrthoWidth) && OutOrthoWidth > 1e-3;
 }
 
 TSharedRef<FJsonObject> FFromLZCaptureUtils::SerializeObjectProperties(const UObject* Object)

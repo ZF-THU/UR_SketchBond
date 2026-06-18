@@ -44,32 +44,73 @@ Read custom source in this order:
 2. `FromLZGameMode.*`, `FromLZCameraPawn.*`, `DefaultInput.ini`
    - Pawn creation and camera navigation.
 3. `FromLZGameViewportClient.*`
-   - Runtime keyboard entry points and capture ticking.
-4. `FromLZCaptureUtils.*`
+   - Runtime keyboard entry points, per-frame reset/capture ticking, and
+     per-frame preview ticking.
+4. `FromLZCameraPreview.*`
+   - Bottom-right live orthographic preview from the player pawn's `FromLZ`
+     camera.
+5. `FromLZCaptureUtils.*`
    - Offscreen orthographic camera capture, line-art capture, face
      segmentation, and actor/material ID rasterization.
-5. `FromLZSketchBoard.*`
+6. `FromLZSketchBoard.*`
    - Slate drawing board, save/proceed, minimize, close, and undo controls.
-6. `FromLZSketchProcessor.*`
+7. `FromLZSketchProcessor.*`
    - Latest-file selection, sketch/capture alignment, compositing, and channel
      exports.
-7. `FromLZSketch2DProcessor.*`
-   - Per-press orchestration, async execution, and Steps 1 through 10 dispatch.
-8. `FromLZImageOps.*`
+8. `FromLZSketch2DProcessor.*`
+   - Per-press orchestration, bounded async scheduling, and Steps 1 through 10
+     dispatch.
+9. `FromLZProcessingLimits.*`
+   - Runtime CVars that cap composite workers and heavy parallel loops.
+10. `FromLZImageOps.*`
    - Skeleton graph processing, color splitting, Step 9 cap/action recovery,
      and Step 9 output serialization.
-9. `FromLZFaceReconstructor.*`
+11. `FromLZFaceReconstructor.*`
    - Step 9 face prevalidation, Step 10 face/solid reconstruction, world
      octilinear regularization, spawning, Step 11 Booleans, material recovery,
      undo, and OBJ/debug export.
-10. `FromLZManifoldBoolean.*`
+12. `FromLZManifoldBoolean.*`
     - DynamicMesh/Manifold conversion and Boolean difference.
-11. `FromLZSessionReset.*`, `FromLZPressNaming.*`
+13. `FromLZSessionReset.*`, `FromLZPressNaming.*`
     - Session generations, Tab reset, archive behavior, and press numbering.
 
 The vendored `ThirdParty/Manifold/manifold` tree is upstream Manifold3D
 implementation code. Project-specific Boolean policy lives in
 `FromLZManifoldBoolean.cpp` and `FromLZFaceReconstructor.cpp`.
+
+## 2.1 Code Location Index
+
+Use this index when a question asks for the exact implementation site.
+
+| Area | Primary code location |
+| --- | --- |
+| Module startup cleanup and Tab preprocessor registration | `Source/Test_0529_1510/Test_0529_1510.cpp` |
+| Default pawn/game mode | `FromLZGameMode.cpp`, `FromLZCameraPawn.cpp` |
+| Viewport input dispatch | `FromLZGameViewportClient.cpp:39` |
+| Per-frame reset, preview, pending capture completion | `FromLZGameViewportClient.cpp:20` |
+| Live preview lifecycle | `FromLZCameraPreview.cpp:287`, `FromLZCameraPreview.cpp:387` |
+| Preview projection and size constants | `FromLZCameraPreview.cpp:19`, `FromLZCameraPreview.cpp:22`, `FromLZCameraPreview.cpp:121` |
+| Capture entry points | `FromLZCaptureUtils.cpp:2757`, `FromLZCaptureUtils.cpp:2787` |
+| Capture-view projection construction | `FromLZCaptureUtils.cpp:1336`, `FromLZCaptureUtils.cpp:1366`, `FromLZCaptureUtils.cpp:1453` |
+| Capture subject filtering/show-only list | `FromLZCaptureUtils.cpp:1622`, `FromLZCaptureUtils.cpp:1727`, `FromLZCaptureUtils.cpp:2962` |
+| Subject-bounds-derived OrthoWidth | `FromLZCaptureUtils.cpp:2983` |
+| Planar face segmentation | `FromLZCaptureUtils.cpp:482` |
+| Line-art capture | `FromLZCaptureUtils.cpp:2104` |
+| Actor/material ID buffer | `FromLZCaptureUtils.cpp:2460` plus helpers above it in the same file |
+| Sketch board widget and commands | `FromLZSketchBoard.cpp:462`, `FromLZSketchBoard.cpp:603`, `FromLZSketchBoard.cpp:635` |
+| Sketch/capture pairing and compositing | `FromLZSketchProcessor.cpp:86`, `FromLZSketchProcessor.cpp:101` |
+| Composite worker scheduler | `FromLZSketch2DProcessor.cpp:17`, `FromLZSketch2DProcessor.cpp:119`, `FromLZSketch2DProcessor.cpp:177` |
+| 2D pipeline orchestration | `FromLZSketch2DProcessor.cpp:197` |
+| Pipeline concurrency CVars | `FromLZProcessingLimits.cpp:9`, `FromLZProcessingLimits.cpp:24` |
+| Step 9 cap/action selection | `FromLZImageOps.cpp`, especially the `09_*` output writers and `LimitedParallelFor` call at `FromLZImageOps.cpp:7024` |
+| Step 10/11 reconstruction dispatch | `FromLZFaceReconstructor.cpp:11435` |
+| Step 9 face candidate validation public entry | `FromLZFaceReconstructor.cpp:11344` |
+| Step 10 per-component parallel reconstruction | `FromLZFaceReconstructor.cpp:11552` |
+| Runtime actor capture eligibility | `FromLZFaceReconstructor.cpp:11602`, `FromLZFaceReconstructor.cpp:11607` |
+| Undo/reset runtime cleanup | `FromLZFaceReconstructor.cpp:11625`, `FromLZFaceReconstructor.cpp:11647` |
+| Manifold Boolean difference | `FromLZManifoldBoolean.cpp:247` |
+| Press numbering | `FromLZPressNaming.cpp:6`, `FromLZPressNaming.cpp:24` |
+| Session reset state machine | `FromLZSessionReset.cpp:173`, `FromLZSessionReset.cpp:202`, `FromLZSessionReset.cpp:217`, `FromLZSessionReset.cpp:290` |
 
 ## 3. Runtime Controls
 
@@ -90,9 +131,14 @@ While reset is pending, viewport input is consumed and ignored.
 The viewport client also:
 
 - calls `FFromLZSessionReset::Tick` each frame;
+- shuts down the live preview and returns immediately while reset is pending;
+- otherwise calls `FFromLZCameraPreview::Tick` each frame;
 - calls `FFromLZCaptureUtils::CompletePendingCapture` each frame;
 - reports every rendered viewport frame through
   `FFromLZCaptureUtils::NotifyViewportDrawn`.
+
+`BeginDestroy` shuts down the live preview before delegating to the base
+viewport-client destruction path.
 
 ### 3.1 Camera pawn
 
@@ -140,12 +186,50 @@ The module registers:
 - a global Slate Tab-key input preprocessor;
 - a post-map-load callback that clears reset state.
 
+## 4.1 Runtime Preview
+
+`FFromLZCameraPreview::Tick` is called from
+`UFromLZGameViewportClient::Tick` after reset ticking and before pending
+capture completion.
+
+The preview:
+
+- renders a hit-test-invisible Slate overlay at viewport Z-order `50`;
+- positions it at the bottom-right with an `18 px` margin;
+- caps the render target to `360x240` while preserving the `FromLZ` camera
+  aspect ratio;
+- uses `RTF_RGBA8`, no mip generation, and a black clear color;
+- creates a transient rooted `USceneCaptureComponent2D`;
+- uses `SCS_FinalColorLDR`, `PRM_UseShowOnlyList`, no capture every frame, no
+  capture on movement, no persistent rendering state, and motion blur off;
+- reuses `FFromLZCaptureUtils::BuildCaptureSubjectActors`,
+  `BuildOrthoFramingActors`, `CalculateSubjectBoundsCenterOrthoWidth`, and
+  `ApplyCaptureSubjectActors` so the preview subject set matches the normal
+  pawn capture path.
+
+Preview projection constants:
+
+- maximum width: `360`;
+- maximum height: `240`;
+- default OrthoWidth fallback: `1536`;
+- near plane: `0`;
+- far plane: `2097152`.
+
+The preview is hidden, but its state is not destroyed, when the sketch board is
+open or minimized. It is fully shut down when the world/viewport is invalid,
+when reset is pending, or when the viewport client is destroyed.
+
+The preview always uses the player pawn's `FromLZ` camera. It does not preview
+the `FromLZCaptureCamera1` or `FromLZCaptureCamera2` tagged-camera paths.
+
 ## 5. End-to-End Control Flow
 
 ```text
 Enter
   -> resolve the controlled pawn's FromLZ camera
   -> snapshot its transform, AspectRatio, and OrthoWidth
+  -> if visible framing actors are valid, derive OrthoWidth from their combined
+     bounds center and the camera FOV
   -> fit the camera aspect ratio inside the current game viewport size
   -> build one offscreen orthographic projection matrix
   -> capture line art, planar faces, and actor/material IDs
@@ -156,6 +240,7 @@ Enter
   -> find exactly one actor with the corresponding capture-camera tag
   -> require exactly one registered active camera component on that actor
   -> snapshot that camera's transform, AspectRatio, and OrthoWidth
+  -> use that camera's OrthoWidth, or the `1536` fallback if invalid
   -> run the same offscreen orthographic capture/output pipeline as Enter
   -> open the sketch board for that exact capture
 
@@ -221,14 +306,33 @@ Missing or duplicate tags abort capture without falling back to `FromLZ`.
 ### 6.2 Dimensions and projection
 
 The current game viewport supplies only the maximum pixel bounds. The selected
-camera supplies the framing parameters:
+camera supplies the transform and aspect ratio:
 
 - transform: selected camera component transform;
 - aspect ratio: selected camera `AspectRatio`;
-- orthographic width: selected camera `OrthoWidth`, or `1536` only when it is
-  invalid;
 - near plane: `0`;
 - far plane: `2097152`.
+
+Orthographic width has path-specific behavior:
+
+- `Enter` allows subject-bounds-derived width. The code combines the valid
+  framing actors' bounds, projects the bounds center along the camera forward
+  vector, and computes `2 * focusDepth * tan(FieldOfView / 2)`. If that fails,
+  it uses the selected camera `OrthoWidth`, or `1536` if that value is invalid.
+- `1` and `2` disable subject-bounds-derived width. They use the tagged
+  camera's `OrthoWidth`, or `1536` if invalid.
+
+The active mode is serialized as `capture_view.ortho_width_mode`:
+
+```text
+subject_bounds_center_from_perspective_fov
+selected_camera_ortho_width
+default_ortho_width_fallback
+```
+
+The root capture JSON also writes
+`capture_ortho_width_from_subject_bounds_center` and
+`capture_ortho_width_used_default`.
 
 Capture dimensions are the largest integer-sized rectangle derived from the
 camera aspect ratio that fits inside the current viewport. For example, a
@@ -275,15 +379,20 @@ SceneCapture uses a show-only actor list.
 Eligible actors must:
 
 - not be the controlled pawn;
+- not be the selected tagged camera actor for `1`/`2` captures;
 - not be actor-hidden;
 - contain a registered, visible static mesh with a mesh, or a registered,
   visible procedural-mesh section;
 - and satisfy one of:
-  - actor name/label starts with `Cube`;
-  - actor name/label contains `Plane`;
+  - actor has Actor Tag `FromLZCaptureSubject`;
+  - actor has Actor Tag `FromLZCapturePlane`;
   - actor is an active Step 11 attachment or Boolean result.
 
 Excavation cutter actors are never active capture subjects.
+
+Actor Tags, not names, labels, folders, or mesh asset names, are the current
+scene-authoring contract for base capture subjects. The old `Cube*` and
+`*Plane*` name/label convention is no longer active code.
 
 An additional camera-relative bounding-box rule excludes an actor only when
 its entire AABB is above the capture camera and the camera lies inside that
@@ -292,6 +401,17 @@ kept.
 
 The selected actor counts and filtering mode are written into capture
 metadata.
+
+The current subject-mode string is:
+
+```text
+tagged_scene_or_active_step11_runtime(subject=...,plane=...,step11=...,bbox_at_or_below_kept=...,bbox_above_outside_xy_kept=...,bbox_above_inside_xy_excluded=...,bbox_camera_unavailable_kept=...)
+```
+
+`FromLZCapturePlane` actors are included in rendering, face segmentation, and
+actor/material ID rasterization. They are excluded only from the
+subject-bounds OrthoWidth framing list used by the `Enter` capture and live
+preview, so helper planes do not expand the derived view width.
 
 ## 8. Capture Outputs
 
@@ -491,11 +611,30 @@ Press numbering scans existing `Press_*` directories and uses max + 1.
 `capture_ref.json` records the exact sketch, capture, face PNG/JSON, and
 actor/material PNG/JSON paths consumed by the press.
 
-The heavy pipeline runs on the UE thread pool. Before dispatch:
+The heavy pipeline is scheduled by the composite scheduler in
+`FromLZSketch2DProcessor.cpp`. Before dispatch:
 
 - the RGBA array is moved into the worker;
 - the current session-generation integer is captured;
-- active composite-task count is incremented.
+- a monotonically increasing request ID is assigned;
+- the request either starts immediately or replaces the single pending slot.
+
+Concurrency is controlled by `FromLZProcessing::GetCompositeMaxWorkers()`:
+
+- CVar: `r.FromLZ.CompositeMaxWorkers`;
+- default: `1`;
+- clamped range: `1..4`.
+
+If active workers are below the limit, the request starts immediately and the
+active-worker count is incremented. If workers are full, exactly one pending
+request is kept. A newer request replaces the older pending request. When a
+worker finishes, stale pending work is dropped if reset is pending or its
+session generation is no longer current; otherwise the pending request starts
+if worker capacity is available.
+
+Only started workers create an `FScopedCompositeTaskCounter`, which increments
+the reset-visible active composite-task count. Pending-but-not-started requests
+do not block Tab reset; they are dropped when stale.
 
 Generation is checked:
 
@@ -505,6 +644,16 @@ Generation is checked:
 
 The task count is decremented after worker completion. Tab reset waits for it
 to reach zero before deleting working data or reloading the map.
+
+Heavy internal loops use `FromLZProcessing::LimitedParallelFor` in the active
+Step 9 selected-candidate writer and Step 10 per-component reconstruction:
+
+- CVar: `r.FromLZ.ParallelForMaxThreads`;
+- default: `8`;
+- clamped range: `1..16`;
+- when the effective worker count is `1`, the loop runs serially;
+- otherwise the code runs `ParallelFor(WorkerCount)` and each worker processes
+  a contiguous index range.
 
 ## 15. Active 2D Stage Parameters
 
@@ -553,13 +702,13 @@ The stroke color sample window radius is `2`.
 
 Executed parameters:
 
-- endpoint gap tolerance: `20 pixels`;
+- endpoint gap tolerance: `10 pixels`;
 - connector thickness: `1`;
 - endpoint trend trace arc: approximately `5 pixels`;
 - strict source/target endpoint angle: at most `60 degrees`;
 - relaxed target endpoint angle: at most `100 degrees`;
-- small-loop bounding-box threshold: `500 px²`;
-- branch-prune max: automatic, `max(30, 3 * gapTol) = 60 pixels`;
+- small-loop bounding-box threshold: `500 px^2`;
+- branch-prune max: automatic, `max(30, 3 * GapTol) = 30 pixels`;
 - color sample radius: `2`.
 
 Skeleton neighborhood policy:
@@ -676,11 +825,11 @@ Small-loop pruning starts from `03d_skeleton_reconnected.png`.
 
 - every green connector is protected unconditionally;
 - a red/black connector is protected when its red/black alternate path forms
-  a bounding box of at least `500 px²`;
+  a bounding box of at least `500 px^2`;
 - for every other connector, only pixels solely owned by that connector are
   temporarily removed;
 - no full-graph alternate path means the connector is required and restored;
-- an alternate-path loop below `500 px²` deletes the connector;
+- an alternate-path loop below `500 px^2` deletes the connector;
 - a larger loop restores the connector;
 - connector ownership is counted, so deleting one connector does not erase a
   pixel still owned by another connector.
@@ -689,7 +838,7 @@ The result is `03b_skeleton_small_loop_pruned.png`.
 
 Final short-branch cleanup traces the surviving full graph, including all
 backfilled connector pixels and green connectors. Branch length is Euclidean
-polyline arc rather than point count. Branches up to `60 pixels` are removed
+polyline arc rather than point count. Branches up to `30 pixels` are removed
 unless at least half of the would-be-deleted samples classify as red or black
 in the effective source-plus-connector color map.
 
@@ -1040,8 +1189,8 @@ as its cap boundary contributes an interior segment longer than `20 pixels`.
 
 Current code uses:
 
-- red-only minimum bounding-box area: `500 px²`;
-- borrowed-black/fallback minimum bounding-box area: `500 px²`.
+- red-only minimum bounding-box area: `500 px^2`;
+- borrowed-black/fallback minimum bounding-box area: `500 px^2`.
 
 Both values are constants in `FromLZImageOps.cpp`.
 
@@ -1258,8 +1407,9 @@ Common failures still create component failure JSON, Step 10 skipped-solid
 JSON, regularization fallback diagnostics, and the press-level regularization
 index.
 
-Components are reconstructed in `ParallelFor`. Runtime actor mutation remains
-on the game thread.
+Components are reconstructed through `FromLZProcessing::LimitedParallelFor`,
+so `r.FromLZ.ParallelForMaxThreads` caps the number of worker chunks. Runtime
+actor mutation remains on the game thread.
 
 ## 21. Step 10 Face Selection Recheck
 
@@ -1729,7 +1879,7 @@ A non-empty result must have:
 - volume reduction at least:
 
 ```text
-max(1 cm³, targetAbsVolume * 0.0001)
+max(1 cm^3, targetAbsVolume * 0.0001)
 ```
 
 An empty result is accepted as complete removal.
@@ -1925,21 +2075,214 @@ closure, or Boolean-manifold failure.
 19. Session generation prevents post-reset worker results from spawning.
 20. Startup preserves sketches; full Tab reset archives and clears them.
 
-## 39. Known Code/Comment Drift
+## 39. Comment and Guide Sync Contract
 
-Developers should not copy these stale descriptions without checking calls:
+The stale-comment drift that earlier versions of this guide warned about has
+been resolved in the active source comments touched by this pass. Current code
+remains the source of truth, but this guide is now intended to be kept strict
+enough that a reader can answer implementation questions without re-reading
+every source file first.
 
-- `FromLZSketch2DProcessor.h` still describes morphology and has duplicate
-  unchecked checklist lines, while active Step 1 performs only binarization
-  and small-component removal.
-- some comments describe older cap-area thresholds; active Step 9 constants
-  are `500 px²` for both red-only and borrowed loops.
-- older documentation describes different face-overlap thresholds; active code
-  requires `25%`.
-- older documentation treated black endpoints as immutable; current
-  octilinear code permits support snapping within `10 pixels`.
-- older documentation described upper area and boundary-distance rejection;
-  current hard metric check only enforces area ratio at least `0.4`.
+When changing behavior, update all three places in the same patch:
 
-When changing parameters, update both this guide and the nearby stale source
-comments so future readers do not have two competing pipelines.
+1. the call-site or constant in code;
+2. the nearby source comment, when one describes that behavior;
+3. this guide, especially the flow section and the final parameter catalog.
+
+Do not reintroduce a separate "known drift" list. If documentation and code
+disagree, fix the disagreement at the point where the code changes.
+
+## 40. Runtime Parameter Catalog
+
+This final catalog is ordered by runtime appearance. "Name" is the preset,
+constant, argument, tag, folder, or CVar name used by the project. "Current
+value" is the current code/config value. "Location" points at the active source
+or config line that owns the value.
+
+### 40.1 Project boot and build
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 0 | `GameDefaultMap` | `/Game/Test1` | `Config/DefaultEngine.ini:4` |
+| 0 | `EditorStartupMap` | `/Game/Test1` | `Config/DefaultEngine.ini:5` |
+| 0 | `GlobalDefaultGameMode` | `/Script/Test_0529_1510.FromLZGameMode` | `Config/DefaultEngine.ini:6` |
+| 0 | `GameViewportClientClassName` | `/Script/Test_0529_1510.FromLZGameViewportClient` | `Config/DefaultEngine.ini:90` |
+| 0 | `DefaultPawnClass` | `AFromLZCameraPawn::StaticClass()` | `Source/Test_0529_1510/FromLZGameMode.cpp:7` |
+| 0 | Startup-cleared Saved folders | `2DDebug`, `FromAction`, `FromLZCaptures`, `FromProcess`, `Logs` | `Source/Test_0529_1510/Test_0529_1510.cpp:21` |
+| 0 | Startup-preserved Saved folder | `FromSketch` ensured but not cleared | `Source/Test_0529_1510/Test_0529_1510.cpp:31` |
+| 0 | Public module dependencies | `Core`, `CoreUObject`, `Engine`, `InputCore`, `EnhancedInput`, `Json`, `JsonUtilities`, `ImageWrapper`, `RenderCore`, `ProceduralMeshComponent`, `GeometryCore` | `Source/Test_0529_1510/Test_0529_1510.Build.cs:12` |
+| 0 | Private module dependencies | `Slate`, `SlateCore` | `Source/Test_0529_1510/Test_0529_1510.Build.cs:15` |
+| 0 | Manifold definitions | `MANIFOLD_PAR=-1`, `MANIFOLD_CROSS_SECTION=0`, `MANIFOLD_NO_IOSTREAM=1`, `MANIFOLD_NO_FILESYSTEM=1`, `TRACY_ENABLE=0`, `TRACY_MEMORY_USAGE=0` | `Source/Test_0529_1510/Test_0529_1510.Build.cs:22` |
+
+### 40.2 Pawn, input, and viewport actions
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 1 | Camera boom component name | `CameraBoom` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:15` |
+| 1 | Read camera component name | `FromLZ` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:23`, `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2920` |
+| 1 | `TargetArmLength` | `1200.0` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:17` |
+| 1 | Initial boom rotation | pitch `-45`, yaw `0`, roll `0` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:18` |
+| 1 | Boom flags | collision test `false`, camera lag `false`, pawn control rotation `false` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:19` |
+| 1 | Camera pawn input defaults | `MoveSpeed=1200`, `ZoomStep=120`, `MinZoom=300`, `MaxZoom=2400`, `PitchSpeed=1`, `YawSpeed=1`, `MinPitch=-89`, `MaxPitch=89` | `Source/Test_0529_1510/FromLZCameraPawn.h:45` |
+| 1 | Auto possess player | `Player0` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:27` |
+| 1 | Movement axis names | `MoveForward`, `MoveRight`, `MoveUp`, `Zoom`, `LookPitch`, `LookYaw` | `Source/Test_0529_1510/FromLZCameraPawn.cpp:34`, `Config/DefaultInput.ini:84` |
+| 1 | Movement keys | `W/S`, `D/A`, `Q/E`, `MouseWheelAxis`, `MouseY` scale `-1`, `MouseX` scale `1` | `Config/DefaultInput.ini:84` |
+| 1 | `PitchLook` action | `LeftMouseButton` | `Config/DefaultInput.ini:93` |
+| 2 | `B` key | restore minimized sketch board | `Source/Test_0529_1510/FromLZGameViewportClient.cpp:48` |
+| 2 | `Enter` key | capture from player pawn `FromLZ` camera; subject-bounds OrthoWidth allowed | `Source/Test_0529_1510/FromLZGameViewportClient.cpp:54`, `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2757` |
+| 2 | `1` key camera tag | `FromLZCaptureCamera1`; exactly one tagged actor required | `Source/Test_0529_1510/FromLZGameViewportClient.cpp:62`, `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2787` |
+| 2 | `2` key camera tag | `FromLZCaptureCamera2`; exactly one tagged actor required | `Source/Test_0529_1510/FromLZGameViewportClient.cpp:68`, `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2787` |
+| 2 | `LeftShift` / `RightShift` | undo latest active Step 11 press | `Source/Test_0529_1510/FromLZGameViewportClient.cpp:72` |
+| 2 | `SpaceBar` | save board sketch and proceed; fallback to latest sketch processing if no board is open | `Source/Test_0529_1510/FromLZGameViewportClient.cpp:77` |
+| 2 | Global `Tab` processor name | `FromLZGlobalTabInputProcessor`; starts full reset | `Source/Test_0529_1510/FromLZSessionReset.cpp:30` |
+
+### 40.3 Preview, capture, and subject selection
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 3 | Capture subject Actor Tag | `FromLZCaptureSubject` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:45` |
+| 3 | Capture plane Actor Tag | `FromLZCapturePlane` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:46` |
+| 3 | Base OrthoWidth fallback | `FromLZDefaultOrthoWidth = 1536.0` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:42` |
+| 3 | Orthographic clip planes | near `0.0`, far `2097152.0` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:43`, `Source/Test_0529_1510/FromLZCaptureUtils.cpp:44` |
+| 3 | Subject-bounds OrthoWidth formula | `2 * focusDepth * tan(FieldOfView / 2)` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:3040` |
+| 3 | Subject-bounds validity | FOV finite and `(1e-3, 179)`, focus depth `> 1e-3`, output width `> 1e-3` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:3028` |
+| 3 | Tagged-camera OrthoWidth mode | subject-bounds width disabled; selected camera OrthoWidth or fallback `1536` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2865` |
+| 3 | Subject-mode naming | `tagged_scene_or_active_step11_runtime(...)` with subject/plane/runtime counters | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:1716` |
+| 3 | Preview max size | `360 x 240` | `Source/Test_0529_1510/FromLZCameraPreview.cpp:19` |
+| 3 | Preview default OrthoWidth | `1536.0` | `Source/Test_0529_1510/FromLZCameraPreview.cpp:22` |
+| 3 | Preview widget layout | bottom-right margin `18`, border padding `3`, viewport Z-order `50` | `Source/Test_0529_1510/FromLZCameraPreview.cpp:258`, `Source/Test_0529_1510/FromLZCameraPreview.cpp:274` |
+| 3 | Preview render target | `RTF_RGBA8`, black clear, no mips | `Source/Test_0529_1510/FromLZCameraPreview.cpp:190` |
+| 3 | Preview scene capture | `SCS_FinalColorLDR`, `PRM_UseShowOnlyList`, capture every frame `false`, capture on movement `false`, motion blur `false` | `Source/Test_0529_1510/FromLZCameraPreview.cpp:232` |
+| 4 | Face segmentation normal tolerance | `12 degrees` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:498` |
+| 4 | Face segmentation depth join tolerance | `0.02` relative depth | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:500` |
+| 4 | Face segmentation minimum area | `200 pixels` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:501` |
+| 4 | Face contour RDP epsilon | `4.0 px` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:502` |
+| 4 | Background depth threshold | `MaxDepth * 0.999` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:513` |
+| 4 | Face palette | `100` fixed colors; random fallback attempts `4096` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:259`, `Source/Test_0529_1510/FromLZCaptureUtils.cpp:307` |
+| 4 | Line-art render targets | depth/normal `RTF_RGBA16f` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2138` |
+| 4 | Line-art thresholds | `DepthRelThreshold=0.0015`, `NormalThreshold=0.3` | `Source/Test_0529_1510/FromLZCaptureUtils.cpp:2221` |
+
+### 40.4 Sketch board and composite preparation
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 5 | Sketch board viewport Z-order | `200` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:603` |
+| 5 | Board outer/side padding | outer `48`, tool panel gap `12`, tool panel padding `8`, button padding `8 x 6` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:476` |
+| 5 | Board tool labels | `Red`, `Green`, `Blue`, `Eraser`, `Clear`, `Proceed`, `Undo`, `Min`, `Close` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:500` |
+| 5 | Brush radius | RGB tools `1`; eraser `10` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:263` |
+| 5 | Brush colors | red `(255,0,0)`, green `(0,255,0)`, blue `(0,0,255)`, eraser/blank `(255,255,255)` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:264` |
+| 5 | Board fit minimum scale | `0.001` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:114` |
+| 5 | Sketch file naming | `Saved/FromSketch/Sketch_%02d.png` | `Source/Test_0529_1510/FromLZSketchBoard.cpp:206` |
+| 6 | Main capture filename filter | `FromLZ_YYYYMMDD_HHMMSS.png` | `Source/Test_0529_1510/FromLZSketchProcessor.cpp:13` |
+| 6 | Composite white threshold | sketch mark is non-white unless `R,G,B > 240` | `Source/Test_0529_1510/FromLZSketchProcessor.cpp:198` |
+| 6 | Capture-line threshold | capture contributes black when `R,G,B < 128` | `Source/Test_0529_1510/FromLZSketchProcessor.cpp:210` |
+| 6 | Sketch/capture fit | center crop/pad, no scaling | `Source/Test_0529_1510/FromLZSketchProcessor.cpp:45` |
+| 6 | Composite output | `Saved/FromProcess/wContextSketch_raw.png` | `Source/Test_0529_1510/FromLZSketchProcessor.cpp:226` |
+
+### 40.5 Async limits, press naming, and reset
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 7 | `Press` folder naming | `Press_%02d`, next index is highest existing `Press_*` plus one | `Source/Test_0529_1510/FromLZPressNaming.cpp:6`, `Source/Test_0529_1510/FromLZPressNaming.cpp:26` |
+| 7 | `capture_ref.json` time format | `%Y%m%d_%H%M%S` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:225` |
+| 7 | Action output root | `Saved/FromAction/Press_##/Component_##/Action.json` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:218`, `Source/Test_0529_1510/FromLZImageOps.cpp:7046` |
+| 7 | `r.FromLZ.CompositeMaxWorkers` | default `1`, clamped `1..4` | `Source/Test_0529_1510/FromLZProcessingLimits.cpp:9`, `Source/Test_0529_1510/FromLZProcessingLimits.cpp:24` |
+| 7 | Composite pending slot | one pending request; newer pending replaces older when workers are full | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:150` |
+| 7 | `r.FromLZ.ParallelForMaxThreads` | default `8`, clamped `1..16`; `1` runs serial | `Source/Test_0529_1510/FromLZProcessingLimits.cpp:16`, `Source/Test_0529_1510/FromLZProcessingLimits.h:13` |
+| 8 | Reset archive naming | `Saved/log_YYYYMMDD_HHMMSS`, suffix `_NN` for `1..999` | `Source/Test_0529_1510/FromLZSessionReset.cpp:58` |
+| 8 | Full reset archived folders | `2DDebug`, `FromAction`, `FromLZCaptures`, `FromProcess`, `FromSketch`, `Logs` | `Source/Test_0529_1510/FromLZSessionReset.cpp:141` |
+| 8 | Full reset recreated folders | `2DDebug`, `FromAction`, `FromLZCaptures`, `FromProcess`, `FromSketch`; `Logs` ensured | `Source/Test_0529_1510/FromLZSessionReset.cpp:112` |
+
+### 40.6 Steps 1-8 2D analysis
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 9 | Step 1 `WhiteThreshold` | `240` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:249` |
+| 9 | Step 1 `MinArea` | `12` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:250` |
+| 9 | Step 1 morphology | not called; `MorphClose` and `Dilate2x2` are helpers only | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:245`, `Source/Test_0529_1510/FromLZImageOps.h:23` |
+| 10 | Step 2 thinning `MaxIter` | `100` default | `Source/Test_0529_1510/FromLZImageOps.h:35` |
+| 10 | Step 2 skeleton `MinArea` | `6` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:269` |
+| 11 | Color classifier white cutoff | `R,G,B > 220` means `none` | `Source/Test_0529_1510/FromLZImageOps.cpp:2602` |
+| 11 | Color dominance margin | `30` channel units | `Source/Test_0529_1510/FromLZImageOps.cpp:2603` |
+| 11 | `ColorSampleRadius` | `2` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:277` |
+| 12 | Step 3 `GapTol` | `10.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:286` |
+| 12 | Step 3 `ConnectThickness` | `1` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:287` |
+| 12 | Step 3 `SmallLoopBboxAreaThresh` | `500.0 px^2` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:288` |
+| 12 | Step 3 `BranchPruneMaxPixels` | `0.0`, meaning auto `max(30, 3*GapTol) = 30 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:289`, `Source/Test_0529_1510/FromLZImageOps.cpp:1703` |
+| 12 | Endpoint trend trace | `5 px` | `Source/Test_0529_1510/FromLZImageOps.cpp:706` |
+| 12 | Strict endpoint angle | `cos >= 0.5`, i.e. max `60 degrees` | `Source/Test_0529_1510/FromLZImageOps.cpp:707` |
+| 12 | Relaxed target angle | `cos >= -0.17364817766693033`, i.e. max `100 degrees` | `Source/Test_0529_1510/FromLZImageOps.cpp:708` |
+| 13 | Step 4 `EndpointTol` | `3.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:302` |
+| 13 | Step 4 `ColorMinRunArc` | `3.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:303` |
+| 13 | Step 4 `TraceMinPixels` | `3` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:309` |
+| 14 | Step 5 `AngleThresh` | `25 degrees` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:323` |
+| 14 | Step 5 `SegmentArc` | `30.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:325` |
+| 14 | Step 5 `SplitPeakMinDistance` | `10.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:326` |
+| 14 | Step 5 `MaxIters` | `5` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:327` |
+| 15 | Step 6 `MaxGap` | `3.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:363` |
+| 15 | Step 6 `MaxAngle` | `12 degrees` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:364` |
+| 15 | Step 6 `MaxIters` | `80` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:365` |
+| 15 | Step 6 `ProtectJunctionRadius` | `3.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:366` |
+| 16 | Step 8 `Thickness` | `3` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:377` |
+
+### 40.7 Step 9 cap selection and face validation
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 17 | Step 9 `ConnectorTol` | `20.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:387` |
+| 17 | Step 9 `BlackSelectTol` | `20.0 px` | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:387` |
+| 17 | `CapLoopGraphNodeSnapTol` | `5.0 px` | `Source/Test_0529_1510/FromLZImageOps.cpp:3757` |
+| 17 | `CapRedOnlyLoopMinBboxArea` | `500.0 px^2` | `Source/Test_0529_1510/FromLZImageOps.cpp:3762` |
+| 17 | `CapBorrowedLoopMinBboxArea` | `500.0 px^2` | `Source/Test_0529_1510/FromLZImageOps.cpp:3763` |
+| 17 | `CapMixedSelectionTimeBudgetSeconds` | longest wait/search budget `5.0 sec` | `Source/Test_0529_1510/FromLZImageOps.cpp:3766`, `Source/Test_0529_1510/FromLZImageOps.cpp:5863` |
+| 17 | `InteriorGreenMinInsideLengthPx` | `10.0 px` | `Source/Test_0529_1510/FromLZImageOps.cpp:6129` |
+| 17 | `GreenTraceEndpointTolPx` | `10.0 px` | `Source/Test_0529_1510/FromLZImageOps.cpp:6482` |
+| 17 | `GreenTraceMaxChainDeviationDeg` | `45.0 degrees` | `Source/Test_0529_1510/FromLZImageOps.cpp:6483` |
+| 17 | Action names | `attach`, `excavate`, `skip` | `Source/Test_0529_1510/FromLZImageOps.h:165` |
+| 18 | `CandidateFaceMinOverlapRatio` | `0.25`, i.e. `25%` | `Source/Test_0529_1510/FromLZFaceReconstructor.h:35` |
+| 18 | `CandidateFaceMaxNormalSideAngleDegrees` | `30.0 degrees` | `Source/Test_0529_1510/FromLZFaceReconstructor.h:36` |
+| 18 | `CandidateFacePreferredNormalSideAngleDegrees` | `10.0 degrees` | `Source/Test_0529_1510/FromLZFaceReconstructor.h:37` |
+| 18 | Candidate validation folder | `CandidateFaceValidation/Candidate_%03d_%s` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:11397` |
+| 18 | Component folder naming | `Component_%02d` | `Source/Test_0529_1510/FromLZImageOps.cpp:7027` |
+
+### 40.8 Step 10/11 reconstruction, runtime tags, and Boolean
+
+| Order | Name | Current value | Location |
+|---:|---|---|---|
+| 19 | Step 10/11 dispatch | `FFromLZFaceReconstructor::ProcessPress(...)` after session-generation check | `Source/Test_0529_1510/FromLZSketch2DProcessor.cpp:395`, `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:11435` |
+| 19 | `r.FromLZ.UsePerFaceCapture` | default `1` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:62` |
+| 19 | `GFromLZPerFaceClipMarginPixels` | `1.5 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:68` |
+| 19 | `r.FromLZ.PureRedAllowDiagonalRoot` | default `0` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:76` |
+| 19 | `MinProjectedNormalPixels` | `1.0 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:45` |
+| 19 | `SolidCollinearTolerancePixels` | `0.75 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:46` |
+| 19 | `SolidRdpTolerancePixels` | `1.25 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:47` |
+| 19 | `SolidTargetMaxLoopPoints` | `384` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:48` |
+| 19 | `MinSolidDepthSamples` | `3` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:49` |
+| 19 | Cap BBox fill/degenerate/square thresholds | `0.70`, `1e-6`, `0.01` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:50` |
+| 19 | `CapBBoxDebugImageSize` | `1024` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:53` |
+| 19 | World-ortho black axis tolerance | `5.0 degrees` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:83` |
+| 19 | World-ortho diagonal threshold | `40.0 degrees` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:84` |
+| 19 | World-ortho angle epsilon | `1e-6 degrees` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:85` |
+| 19 | World-ortho black node snap | `10.0 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:86` |
+| 19 | World-ortho red macro corridor | `5.0 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:87` |
+| 19 | World-ortho red macro min length | `20.0 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:88` |
+| 19 | World-ortho red primitive RDP | `1.0 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:89` |
+| 19 | World-ortho short red edge threshold | `20.0 px` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:90` |
+| 19 | World-ortho minimum area ratio | `0.4` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:91` |
+| 19 | Pure-red root candidate cap | `5` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:92` |
+| 19 | Depth-sample reprojection threshold | `max(25.0 px, 0.75 * sourceToCopiedVectorLength)` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:7626` |
+| 20 | Runtime face tag | `FromLZ_ReconstructedFace` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:35` |
+| 20 | Runtime solid tag | `FromLZ_ReconstructedSolid` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:36` |
+| 20 | Step 11 result/source/action tags | `FromLZ_Step11BooleanResult`, `FromLZ_Step11HiddenSource`, `FromLZ_Action_Attach`, `FromLZ_Action_ExcavateCutter` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:39` |
+| 20 | Press-scoped generated/hidden tag prefixes | `FromLZ_GeneratedBy_Press_`, `FromLZ_HiddenBy_Press_` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:8258` |
+| 20 | Reconstructed actor names | `FromLZ_ReconstructedFace_%s_%s`, `FromLZ_ReconstructedSolid_%s_%s` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:7783`, `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:7358` |
+| 20 | Excavation cutter scale | normal `1.2`, cap/perpendicular `1.1` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:93` |
+| 20 | Step 11 min renderable edge | `0.05 cm` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:95` |
+| 20 | Step 11 bounds expand | `1.0 cm` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:96` |
+| 20 | Boolean required volume delta | `max(1.0 cm^3, targetAbsVolume * 0.0001)` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:9725` |
+| 20 | Dynamic/static mesh weld tolerance | `0.01 cm` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:8873` |
+| 20 | UV scale | `100.0 cm` | `Source/Test_0529_1510/FromLZFaceReconstructor.cpp:9611` |
+| 20 | Boolean backend | `Manifold3D` | `Source/Test_0529_1510/FromLZManifoldBoolean.cpp:237` |
+| 20 | Manifold library version | `3.5.0+37125da` | `Source/Test_0529_1510/FromLZManifoldBoolean.cpp:242` |
+| 20 | Manifold input/weld tolerance | input `0.001 cm`, weld `0.01 cm` | `Source/Test_0529_1510/FromLZManifoldBoolean.cpp:16` |
+| 20 | Manifold error logging | `manifold::ManifoldParams().suppressErrors = true` | `Source/Test_0529_1510/FromLZManifoldBoolean.cpp:295` |

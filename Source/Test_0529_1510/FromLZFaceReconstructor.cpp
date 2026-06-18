@@ -1,10 +1,10 @@
 #include "FromLZFaceReconstructor.h"
 #include "FromLZManifoldBoolean.h"
+#include "FromLZProcessingLimits.h"
 #include "FromLZSessionReset.h"
 
 #include "Algo/Reverse.h"
 #include "Async/Async.h"
-#include "Async/ParallelFor.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Components/PrimitiveComponent.h"
@@ -34,6 +34,8 @@ namespace
 {
 	const FName ReconstructedFaceTag(TEXT("FromLZ_ReconstructedFace"));
 	const FName ReconstructedSolidTag(TEXT("FromLZ_ReconstructedSolid"));
+	const FName FromLZCaptureSubjectTag(TEXT("FromLZCaptureSubject"));
+	const FName FromLZCapturePlaneTag(TEXT("FromLZCapturePlane"));
 	const FName Step11BooleanResultTag(TEXT("FromLZ_Step11BooleanResult"));
 	const FName Step11HiddenSourceTag(TEXT("FromLZ_Step11HiddenSource"));
 	const FName Step11ActionAttachTag(TEXT("FromLZ_Action_Attach"));
@@ -8358,6 +8360,13 @@ namespace
 		return Actor && Actor->ActorHasTag(Step11ActionExcavateCutterTag);
 	}
 
+	static bool ActorIsTaggedBaseCaptureSubject(const AActor* Actor)
+	{
+		return Actor &&
+			Actor->ActorHasTag(FromLZCaptureSubjectTag) &&
+			!Actor->ActorHasTag(FromLZCapturePlaneTag);
+	}
+
 	static void MergeStep11StringSet(TSet<FString>& Dest, const TSet<FString>& Source)
 	{
 		for (const FString& Value : Source)
@@ -10575,7 +10584,8 @@ namespace
 			AActor* Actor = *It;
 			if (!Actor || Actor->IsHidden() ||
 				Actor->ActorHasTag(ReconstructedFaceTag) ||
-				ActorHasAnyStep11RuntimeTag(Actor))
+				ActorHasAnyStep11RuntimeTag(Actor) ||
+				!ActorIsTaggedBaseCaptureSubject(Actor))
 			{
 				continue;
 			}
@@ -11539,7 +11549,7 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 
 	TArray<FComponentResult> Results;
 	Results.SetNum(ComponentNames.Num());
-	ParallelFor(ComponentNames.Num(), [&](int32 Index)
+	FromLZProcessing::LimitedParallelFor(ComponentNames.Num(), [&](int32 Index)
 	{
 		Results[Index] = ProcessComponent(ComponentNames[Index], PressDir, ActionPressDir, Inputs);
 	});

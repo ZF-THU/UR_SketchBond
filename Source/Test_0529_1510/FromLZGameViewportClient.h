@@ -17,4 +17,5 @@ public:
 	virtual void Tick(float DeltaTime) override;
 	virtual void Draw(FViewport* Viewport, FCanvas* SceneCanvas) override;
 	virtual bool InputKey(const FInputKeyEventArgs& EventArgs) override;
+	virtual void BeginDestroy() override;
 };

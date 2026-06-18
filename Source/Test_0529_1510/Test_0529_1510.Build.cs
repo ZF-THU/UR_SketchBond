@@ -11,8 +11,11 @@ public class Test_0529_1510 : ModuleRules
 	
 		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "Json", "JsonUtilities", "ImageWrapper", "RenderCore", "ProceduralMeshComponent", "GeometryCore" });
 
+		// Slate/SlateCore are used by the runtime sketch board and live preview overlays.
 		PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 
+		// Manifold is vendored under ThirdParty and compiled through the small wrapper
+		// translation units in Source/Test_0529_1510/ManifoldBuild.
 		string ManifoldPath = Path.GetFullPath(Path.Combine(ModuleDirectory, "..", "..", "ThirdParty", "Manifold", "manifold"));
 		PublicIncludePaths.Add(Path.Combine(ManifoldPath, "include"));
 		PrivateIncludePaths.Add(Path.Combine(ManifoldPath, "src"));
@@ -25,13 +28,5 @@ public class Test_0529_1510 : ModuleRules
 			"TRACY_ENABLE=0",
 			"TRACY_MEMORY_USAGE=0"
 		});
-
-		// Uncomment if you are using Slate UI
-		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
-		
-		// Uncomment if you are using online features
-		// PrivateDependencyModuleNames.Add("OnlineSubsystem");
-
-		// To include OnlineSubsystemSteam, add it to the plugins section in your uproject file with the Enabled attribute set to true
 	}
 }

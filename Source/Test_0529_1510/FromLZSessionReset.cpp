@@ -1,5 +1,6 @@
 #include "FromLZSessionReset.h"
 
+#include "FromLZCameraPreview.h"
 #include "FromLZCaptureUtils.h"
 #include "FromLZFaceReconstructor.h"
 #include "FromLZSketchBoard.h"
@@ -232,6 +233,7 @@ bool FFromLZSessionReset::HandleGlobalTab(UWorld* World)
 	++GFromLZSessionGeneration;
 
 	FFromLZCaptureUtils::CancelPendingCapture();
+	FFromLZCameraPreview::Shutdown();
 	FFromLZSketchBoard::Close();
 
 	if (GFromLZActiveCompositeTaskCount.Load() > 0)
@@ -271,6 +273,20 @@ void FFromLZSessionReset::NotifyCompositeTaskFinished()
 	--GFromLZActiveCompositeTaskCount;
 }
 
+FFromLZSessionReset::FScopedCompositeTaskCounter::FScopedCompositeTaskCounter()
+{
+	FFromLZSessionReset::NotifyCompositeTaskStarted();
+}
+
+FFromLZSessionReset::FScopedCompositeTaskCounter::~FScopedCompositeTaskCounter()
+{
+	if (bActive)
+	{
+		FFromLZSessionReset::NotifyCompositeTaskFinished();
+		bActive = false;
+	}
+}
+
 void FFromLZSessionReset::FinalizePendingReset(UWorld* World)
 {
 	if (!bFromLZResetPending || bFromLZReloadIssued)
@@ -279,6 +295,7 @@ void FFromLZSessionReset::FinalizePendingReset(UWorld* World)
 	}
 
 	FFromLZCaptureUtils::CancelPendingCapture();
+	FFromLZCameraPreview::Shutdown();
 	FFromLZSketchBoard::Close();
 	FFromLZFaceReconstructor::ResetAllRuntimeState(World);
 

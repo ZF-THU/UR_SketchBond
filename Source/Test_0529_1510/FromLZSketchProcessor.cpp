@@ -175,9 +175,9 @@ void FFromLZSketchProcessor::ProcessSketch(UWorld* World, const FString& SketchP
 		SaveRGBAToPng(SketchPixels, SW, SH, ProcessDir / TEXT("Sketch_fitted.png"));
 	}
 
-	// 3) Composite onto a clean white canvas at the sketch resolution:
+	// 3) Composite onto a clean white canvas in the active processing resolution:
 	//      - non-white sketch pixels (the red/green/blue lines) are copied as-is
-	//      - elsewhere, black lines from the capture (scaled to the sketch size) are drawn black
+	//      - elsewhere, black capture pixels are drawn black
 	//    Result: white background with black + red + green + blue lines.
 	TArray<uint8> Composite;
 	Composite.SetNumUninitialized(SW * SH * 4);
@@ -233,8 +233,8 @@ void FFromLZSketchProcessor::ProcessSketch(UWorld* World, const FString& SketchP
 		UE_LOG(LogTemp, Warning, TEXT("ProcessSketch: failed to save composite %s"), *CompositePath);
 	}
 
-	// Run the migrated 2D sketch-analysis pipeline (steps 1-8) on the composite,
-	// off the game thread. Debug artifacts go to <ProjectSaved>/2DDebug/.
+	// Run the migrated sketch-analysis/reconstruction dispatch pipeline on the
+	// composite off the game thread. Debug artifacts go to <ProjectSaved>/2DDebug/.
 	{
 		const FString TwoDDebugDir = FPaths::ProjectSavedDir() / TEXT("2DDebug");
 

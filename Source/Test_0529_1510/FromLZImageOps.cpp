@@ -1,8 +1,8 @@
 #include "FromLZImageOps.h"
 #include "FromLZFaceReconstructor.h"
+#include "FromLZProcessingLimits.h"
 
 #include "Algo/Reverse.h"
-#include "Async/ParallelFor.h"
 #include "HAL/FileManager.h"
 #include "HAL/PlatformTime.h"
 #include "IImageWrapper.h"
@@ -7021,7 +7021,7 @@ namespace FromLZImageOps
 
 		// Each selected red-driven loop writes into its own Component_%% folder.
 		OutResults.SetNum(SelectedCandidateIndices.Num());
-		ParallelFor(SelectedCandidateIndices.Num(), [&](int32 i)
+		FromLZProcessing::LimitedParallelFor(SelectedCandidateIndices.Num(), [&](int32 i)
 		{
 			const FLoopCandidate Candidate = Candidates[SelectedCandidateIndices[i]];
 			const FString CompDir = PressDir / FString::Printf(TEXT("Component_%02d"), i + 1);

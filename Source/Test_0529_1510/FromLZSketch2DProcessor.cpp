@@ -4,31 +4,189 @@
 #include "FromLZFaceReconstructor.h"
 #include "FromLZImageOps.h"
 #include "FromLZPressNaming.h"
+#include "FromLZProcessingLimits.h"
 #include "FromLZSessionReset.h"
 #include "HAL/FileManager.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/DateTime.h"
 #include "IImageWrapper.h"
 #include "IImageWrapperModule.h"
 #include "Misc/FileHelper.h"
+#include "Misc/ScopeExit.h"
 #include "Misc/Paths.h"
 #include "Modules/ModuleManager.h"
+
+namespace
+{
+	struct FFromLZCompositeWorkItem
+	{
+		TArray<uint8> Pixels;
+		int32 Width = 0;
+		int32 Height = 0;
+		FString DebugDir;
+		FSketchSourceInfo Source;
+		TWeakObjectPtr<UWorld> World;
+		int32 SessionGeneration = 0;
+		uint64 RequestId = 0;
+	};
+
+	FCriticalSection GFromLZCompositeSchedulerLock;
+	int32 GFromLZActiveCompositeWorkers = 0;
+	bool bGFromLZHasPendingCompositeWork = false;
+	FFromLZCompositeWorkItem GFromLZPendingCompositeWork;
+	uint64 GFromLZNextCompositeRequestId = 0;
+
+	void StartCompositeWorker(FFromLZCompositeWorkItem&& Work);
+
+	bool ShouldDropPendingCompositeWork(const FFromLZCompositeWorkItem& Work)
+	{
+		return FFromLZSessionReset::IsResetPending()
+			|| !FFromLZSessionReset::IsSessionGenerationCurrent(Work.SessionGeneration);
+	}
+
+	void FinishCompositeWorker()
+	{
+		FFromLZCompositeWorkItem WorkToStart;
+		bool bShouldStartPending = false;
+		uint64 DroppedRequestId = 0;
+		int32 ActiveAfterFinish = 0;
+		int32 MaxWorkers = 1;
+
+		{
+			FScopeLock Lock(&GFromLZCompositeSchedulerLock);
+			GFromLZActiveCompositeWorkers = FMath::Max(0, GFromLZActiveCompositeWorkers - 1);
+			MaxWorkers = FromLZProcessing::GetCompositeMaxWorkers();
+
+			if (bGFromLZHasPendingCompositeWork && ShouldDropPendingCompositeWork(GFromLZPendingCompositeWork))
+			{
+				DroppedRequestId = GFromLZPendingCompositeWork.RequestId;
+				bGFromLZHasPendingCompositeWork = false;
+				GFromLZPendingCompositeWork = FFromLZCompositeWorkItem();
+			}
+
+			if (bGFromLZHasPendingCompositeWork && GFromLZActiveCompositeWorkers < MaxWorkers)
+			{
+				WorkToStart = MoveTemp(GFromLZPendingCompositeWork);
+				bGFromLZHasPendingCompositeWork = false;
+				GFromLZPendingCompositeWork = FFromLZCompositeWorkItem();
+				++GFromLZActiveCompositeWorkers;
+				bShouldStartPending = true;
+			}
+
+			ActiveAfterFinish = GFromLZActiveCompositeWorkers;
+		}
+
+		if (DroppedRequestId != 0)
+		{
+			UE_LOG(LogTemp, Log, TEXT("Sketch2D: dropped stale pending composite request %llu."), static_cast<unsigned long long>(DroppedRequestId));
+		}
+
+		if (bShouldStartPending)
+		{
+			UE_LOG(LogTemp, Log, TEXT("Sketch2D: starting pending composite request %llu (active=%d/max=%d)."), static_cast<unsigned long long>(WorkToStart.RequestId), ActiveAfterFinish, MaxWorkers);
+			StartCompositeWorker(MoveTemp(WorkToStart));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Verbose, TEXT("Sketch2D: composite worker finished (active=%d/max=%d)."), ActiveAfterFinish, MaxWorkers);
+		}
+	}
+
+	void StartCompositeWorker(FFromLZCompositeWorkItem&& Work)
+	{
+		TSharedRef<FFromLZSessionReset::FScopedCompositeTaskCounter, ESPMode::ThreadSafe> TaskCounter =
+			MakeShared<FFromLZSessionReset::FScopedCompositeTaskCounter, ESPMode::ThreadSafe>();
+
+		Async(EAsyncExecution::ThreadPool, [Work = MoveTemp(Work), TaskCounter]() mutable
+		{
+			ON_SCOPE_EXIT
+			{
+				FinishCompositeWorker();
+			};
+
+			FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(
+				Work.Pixels,
+				Work.Width,
+				Work.Height,
+				Work.DebugDir,
+				Work.Source,
+				Work.SessionGeneration,
+				Work.World);
+		});
+	}
+
+	void ScheduleCompositeWork(FFromLZCompositeWorkItem&& Work)
+	{
+		FFromLZCompositeWorkItem WorkToStart;
+		bool bShouldStart = false;
+		bool bReplacedPending = false;
+		bool bDiscardedPendingForImmediateStart = false;
+		uint64 PendingRequestId = 0;
+		int32 ActiveWorkers = 0;
+		int32 MaxWorkers = 1;
+
+		{
+			FScopeLock Lock(&GFromLZCompositeSchedulerLock);
+			MaxWorkers = FromLZProcessing::GetCompositeMaxWorkers();
+			Work.RequestId = ++GFromLZNextCompositeRequestId;
+
+			if (GFromLZActiveCompositeWorkers < MaxWorkers)
+			{
+				bDiscardedPendingForImmediateStart = bGFromLZHasPendingCompositeWork;
+				bGFromLZHasPendingCompositeWork = false;
+				GFromLZPendingCompositeWork = FFromLZCompositeWorkItem();
+				++GFromLZActiveCompositeWorkers;
+				WorkToStart = MoveTemp(Work);
+				bShouldStart = true;
+			}
+			else
+			{
+				bReplacedPending = bGFromLZHasPendingCompositeWork;
+				GFromLZPendingCompositeWork = MoveTemp(Work);
+				bGFromLZHasPendingCompositeWork = true;
+				PendingRequestId = GFromLZPendingCompositeWork.RequestId;
+			}
+
+			ActiveWorkers = GFromLZActiveCompositeWorkers;
+		}
+
+		if (bShouldStart)
+		{
+			if (bDiscardedPendingForImmediateStart)
+			{
+				UE_LOG(LogTemp, Log, TEXT("Sketch2D: discarded older pending composite because a newer request can start immediately."));
+			}
+			UE_LOG(LogTemp, Log, TEXT("Sketch2D: starting composite request %llu (active=%d/max=%d)."), static_cast<unsigned long long>(WorkToStart.RequestId), ActiveWorkers, MaxWorkers);
+			StartCompositeWorker(MoveTemp(WorkToStart));
+		}
+		else
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("Sketch2D: %s pending composite request %llu because active workers are full (active=%d/max=%d)."),
+				bReplacedPending ? TEXT("replaced") : TEXT("queued"),
+				static_cast<unsigned long long>(PendingRequestId),
+				ActiveWorkers,
+				MaxWorkers);
+		}
+	}
+}
 
 void FFromLZSketch2DProcessor::ProcessCompositeAsync(TArray<uint8> RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, UWorld* World)
 {
 	// RGBA is taken by value; move it into the async task so the heavy work runs off the game thread.
-	const FString DebugDirCopy = DebugDir;
-	const FSketchSourceInfo SourceCopy = Source;
-	const TWeakObjectPtr<UWorld> WorldCopy(World);
-	const int32 SessionGeneration = FFromLZSessionReset::GetSessionGeneration();
-	TArray<uint8> Pixels = MoveTemp(RGBA);
+	FFromLZCompositeWorkItem Work;
+	Work.Pixels = MoveTemp(RGBA);
+	Work.Width = Width;
+	Work.Height = Height;
+	Work.DebugDir = DebugDir;
+	Work.Source = Source;
+	Work.World = TWeakObjectPtr<UWorld>(World);
+	Work.SessionGeneration = FFromLZSessionReset::GetSessionGeneration();
 
-	FFromLZSessionReset::NotifyCompositeTaskStarted();
-	Async(EAsyncExecution::ThreadPool, [Pixels = MoveTemp(Pixels), Width, Height, DebugDirCopy, SourceCopy, WorldCopy, SessionGeneration]() mutable
-	{
-		FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(Pixels, Width, Height, DebugDirCopy, SourceCopy, SessionGeneration, WorldCopy);
-		FFromLZSessionReset::NotifyCompositeTaskFinished();
-	});
+	ScheduleCompositeWork(MoveTemp(Work));
 }
 
 bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, TWeakObjectPtr<UWorld> World)
@@ -228,7 +386,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	const int32 NumCaps = FromLZImageOps::RecoverCapExtrusionsPerComponent(
 		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 20.0f, Width, Height, PressDir, ActionPressDir, Caps);
 
-	// ---- Step 10: per-component action -> face-mask overlap -> runtime face rebuild --
+	// ---- Step 10/11: face validation -> solid rebuild -> runtime spawn/Boolean --
 	if (!FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
 	{
 		UE_LOG(LogTemp, Log, TEXT("Sketch2D: skipped stale Step10/11 reconstruction because the session generation changed during processing."));
@@ -237,7 +395,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	FFromLZFaceReconstructor::ProcessPress(PressDir, ActionPressDir, World, SessionGeneration);
 
 	const double Elapsed = FPlatformTime::Seconds() - StartTime;
-	UE_LOG(LogTemp, Log, TEXT("Sketch2D: steps 1-10 done in %.3fs (%dx%d): %d merged strokes; %d cap component(s) -> %s"),
+	UE_LOG(LogTemp, Log, TEXT("Sketch2D: steps 1-11 dispatched in %.3fs (%dx%d): %d merged strokes; %d cap component(s) -> %s"),
 		Elapsed, Width, Height, Merged.Num(), NumCaps, *PressDir);
 
 	return true;
