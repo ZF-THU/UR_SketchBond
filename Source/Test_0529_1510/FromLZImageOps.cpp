@@ -2594,13 +2594,18 @@ namespace FromLZImageOps
 
 	EStrokeColor ClassifyRGB(uint8 R, uint8 G, uint8 B)
 	{
+		return ClassifyRGB(R, G, B, /*WhiteCutoff*/ 220, /*DominanceMargin*/ 30);
+	}
+
+	EStrokeColor ClassifyRGB(uint8 R, uint8 G, uint8 B, uint8 WhiteCutoff, int32 DominanceMargin)
+	{
 		// Near-white background.
-		if (R > 220 && G > 220 && B > 220)
+		if (R > WhiteCutoff && G > WhiteCutoff && B > WhiteCutoff)
 		{
 			return EStrokeColor::None;
 		}
 		const int32 r = R, g = G, b = B;
-		const int32 Dom = 30; // channel dominance margin
+		const int32 Dom = FMath::Max(0, DominanceMargin);
 		if (r >= g + Dom && r >= b + Dom)
 		{
 			return EStrokeColor::Red;
@@ -2619,12 +2624,17 @@ namespace FromLZImageOps
 
 	void BuildColorClassMap(const TArray<uint8>& RGBA, int32 Width, int32 Height, TArray<uint8>& OutMap)
 	{
+		BuildColorClassMap(RGBA, Width, Height, /*WhiteCutoff*/ 220, /*DominanceMargin*/ 30, OutMap);
+	}
+
+	void BuildColorClassMap(const TArray<uint8>& RGBA, int32 Width, int32 Height, uint8 WhiteCutoff, int32 DominanceMargin, TArray<uint8>& OutMap)
+	{
 		const int32 N = Width * Height;
 		OutMap.SetNumUninitialized(N);
 		for (int32 i = 0; i < N; ++i)
 		{
 			const int32 Off = i * 4;
-			OutMap[i] = uint8(ClassifyRGB(RGBA[Off + 0], RGBA[Off + 1], RGBA[Off + 2]));
+			OutMap[i] = uint8(ClassifyRGB(RGBA[Off + 0], RGBA[Off + 1], RGBA[Off + 2], WhiteCutoff, DominanceMargin));
 		}
 	}
 

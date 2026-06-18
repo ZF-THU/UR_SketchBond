@@ -5,6 +5,32 @@
 class AActor;
 class UWorld;
 
+struct FFromLZPressProcessResult
+{
+	bool bSuccess = false;
+	FString Message;
+	FString PressDir;
+	FString ActionPressDir;
+	TArray<FString> OutputFiles;
+	int32 SpawnedRuntimeActorCount = 0;
+};
+
+using FFromLZPressCompletionCallback = TFunction<void(const FFromLZPressProcessResult& Result)>;
+
+struct FFromLZStep11UndoResult
+{
+	bool bSuccess = false;
+	FString Message;
+	FString PressId;
+	FString UndoDiagnosticPath;
+	TArray<FString> OutputFiles;
+	int32 DestroyedActorCount = 0;
+	int32 DestroyedBooleanComponentCount = 0;
+	int32 RestoredHiddenSourceCount = 0;
+};
+
+using FFromLZStep11UndoCompletionCallback = TFunction<void(const FFromLZStep11UndoResult& Result)>;
+
 struct FFromLZCandidateFaceRequest
 {
 	FString CandidateSource;
@@ -43,8 +69,15 @@ public:
 		const TArray<FFromLZCandidateFaceRequest>& Requests,
 		TArray<FFromLZCandidateFaceEvaluation>& OutEvaluations,
 		FString& OutError);
-	static void ProcessPress(const FString& PressDir, const FString& ActionPressDir, TWeakObjectPtr<UWorld> World, int32 SessionGeneration = INDEX_NONE);
-	static void RestoreStep11RuntimeBooleans(TWeakObjectPtr<UWorld> World);
+	static void ProcessPress(
+		const FString& PressDir,
+		const FString& ActionPressDir,
+		TWeakObjectPtr<UWorld> World,
+		int32 SessionGeneration = INDEX_NONE,
+		FFromLZPressCompletionCallback CompletionCallback = nullptr);
+	static void RestoreStep11RuntimeBooleans(
+		TWeakObjectPtr<UWorld> World,
+		FFromLZStep11UndoCompletionCallback CompletionCallback = nullptr);
 	static void ResetAllRuntimeState(TWeakObjectPtr<UWorld> World);
 	static bool IsStep11RuntimeActor(const AActor* Actor);
 	static bool IsStep11RuntimeActorActiveForCapture(const AActor* Actor);

@@ -27,6 +27,9 @@ namespace
 		FString DebugDir;
 		FSketchSourceInfo Source;
 		TWeakObjectPtr<UWorld> World;
+		FFromLZProcessParams Params;
+		FFromLZCompositeStartedCallback StartedCallback;
+		FFromLZPressCompletionCallback CompletionCallback;
 		int32 SessionGeneration = 0;
 		uint64 RequestId = 0;
 	};
@@ -38,6 +41,42 @@ namespace
 	uint64 GFromLZNextCompositeRequestId = 0;
 
 	void StartCompositeWorker(FFromLZCompositeWorkItem&& Work);
+
+	void DispatchPressCallback(FFromLZPressCompletionCallback& Callback, const FFromLZPressProcessResult& Result)
+	{
+		if (!Callback)
+		{
+			return;
+		}
+
+		FFromLZPressCompletionCallback CallbackToRun = MoveTemp(Callback);
+		AsyncTask(ENamedThreads::GameThread, [CallbackToRun = MoveTemp(CallbackToRun), Result]() mutable
+		{
+			CallbackToRun(Result);
+		});
+	}
+
+	void DispatchStartedCallback(FFromLZCompositeStartedCallback& Callback, const FFromLZPressProcessResult& Result)
+	{
+		if (!Callback)
+		{
+			return;
+		}
+
+		FFromLZCompositeStartedCallback CallbackToRun = MoveTemp(Callback);
+		AsyncTask(ENamedThreads::GameThread, [CallbackToRun = MoveTemp(CallbackToRun), Result]() mutable
+		{
+			CallbackToRun(Result);
+		});
+	}
+
+	void FailCompositeWork(FFromLZCompositeWorkItem& Work, const FString& Message)
+	{
+		FFromLZPressProcessResult Result;
+		Result.bSuccess = false;
+		Result.Message = Message;
+		DispatchPressCallback(Work.CompletionCallback, Result);
+	}
 
 	bool ShouldDropPendingCompositeWork(const FFromLZCompositeWorkItem& Work)
 	{
@@ -61,6 +100,7 @@ namespace
 			if (bGFromLZHasPendingCompositeWork && ShouldDropPendingCompositeWork(GFromLZPendingCompositeWork))
 			{
 				DroppedRequestId = GFromLZPendingCompositeWork.RequestId;
+				FailCompositeWork(GFromLZPendingCompositeWork, TEXT("Composite request was dropped because the session reset or generation changed."));
 				bGFromLZHasPendingCompositeWork = false;
 				GFromLZPendingCompositeWork = FFromLZCompositeWorkItem();
 			}
@@ -105,14 +145,21 @@ namespace
 				FinishCompositeWorker();
 			};
 
-			FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(
+			const bool bDispatched = FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(
 				Work.Pixels,
 				Work.Width,
 				Work.Height,
 				Work.DebugDir,
 				Work.Source,
 				Work.SessionGeneration,
-				Work.World);
+				Work.World,
+				Work.Params,
+				MoveTemp(Work.StartedCallback),
+				MoveTemp(Work.CompletionCallback));
+			if (!bDispatched && Work.CompletionCallback)
+			{
+				FailCompositeWork(Work, TEXT("Composite processing failed before Step 10/11 dispatch."));
+			}
 		});
 	}
 
@@ -134,6 +181,10 @@ namespace
 			if (GFromLZActiveCompositeWorkers < MaxWorkers)
 			{
 				bDiscardedPendingForImmediateStart = bGFromLZHasPendingCompositeWork;
+				if (bGFromLZHasPendingCompositeWork)
+				{
+					FailCompositeWork(GFromLZPendingCompositeWork, TEXT("Composite request was discarded because a newer request started immediately."));
+				}
 				bGFromLZHasPendingCompositeWork = false;
 				GFromLZPendingCompositeWork = FFromLZCompositeWorkItem();
 				++GFromLZActiveCompositeWorkers;
@@ -143,6 +194,10 @@ namespace
 			else
 			{
 				bReplacedPending = bGFromLZHasPendingCompositeWork;
+				if (bGFromLZHasPendingCompositeWork)
+				{
+					FailCompositeWork(GFromLZPendingCompositeWork, TEXT("Composite request was replaced by a newer pending request."));
+				}
 				GFromLZPendingCompositeWork = MoveTemp(Work);
 				bGFromLZHasPendingCompositeWork = true;
 				PendingRequestId = GFromLZPendingCompositeWork.RequestId;
@@ -176,6 +231,20 @@ namespace
 
 void FFromLZSketch2DProcessor::ProcessCompositeAsync(TArray<uint8> RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, UWorld* World)
 {
+	ProcessCompositeAsync(MoveTemp(RGBA), Width, Height, DebugDir, Source, World, FFromLZProcessParams(), nullptr, nullptr);
+}
+
+void FFromLZSketch2DProcessor::ProcessCompositeAsync(
+	TArray<uint8> RGBA,
+	int32 Width,
+	int32 Height,
+	const FString& DebugDir,
+	const FSketchSourceInfo& Source,
+	UWorld* World,
+	const FFromLZProcessParams& Params,
+	FFromLZCompositeStartedCallback StartedCallback,
+	FFromLZPressCompletionCallback CompletionCallback)
+{
 	// RGBA is taken by value; move it into the async task so the heavy work runs off the game thread.
 	FFromLZCompositeWorkItem Work;
 	Work.Pixels = MoveTemp(RGBA);
@@ -184,6 +253,9 @@ void FFromLZSketch2DProcessor::ProcessCompositeAsync(TArray<uint8> RGBA, int32 W
 	Work.DebugDir = DebugDir;
 	Work.Source = Source;
 	Work.World = TWeakObjectPtr<UWorld>(World);
+	Work.Params = Params;
+	Work.StartedCallback = MoveTemp(StartedCallback);
+	Work.CompletionCallback = MoveTemp(CompletionCallback);
 	Work.SessionGeneration = FFromLZSessionReset::GetSessionGeneration();
 
 	ScheduleCompositeWork(MoveTemp(Work));
@@ -191,19 +263,54 @@ void FFromLZSketch2DProcessor::ProcessCompositeAsync(TArray<uint8> RGBA, int32 W
 
 bool FFromLZSketch2DProcessor::ProcessComposite(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, TWeakObjectPtr<UWorld> World)
 {
-	return ProcessCompositeWithGeneration(RGBA, Width, Height, DebugDir, Source, FFromLZSessionReset::GetSessionGeneration(), World);
+	return ProcessComposite(RGBA, Width, Height, DebugDir, Source, World, FFromLZProcessParams());
+}
+
+bool FFromLZSketch2DProcessor::ProcessComposite(
+	const TArray<uint8>& RGBA,
+	int32 Width,
+	int32 Height,
+	const FString& DebugDir,
+	const FSketchSourceInfo& Source,
+	TWeakObjectPtr<UWorld> World,
+	const FFromLZProcessParams& Params)
+{
+	return ProcessCompositeWithGeneration(RGBA, Width, Height, DebugDir, Source, FFromLZSessionReset::GetSessionGeneration(), World, Params);
 }
 
 bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, int32 SessionGeneration, TWeakObjectPtr<UWorld> World)
 {
+	return ProcessCompositeWithGeneration(RGBA, Width, Height, DebugDir, Source, SessionGeneration, World, FFromLZProcessParams());
+}
+
+bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(
+	const TArray<uint8>& RGBA,
+	int32 Width,
+	int32 Height,
+	const FString& DebugDir,
+	const FSketchSourceInfo& Source,
+	int32 SessionGeneration,
+	TWeakObjectPtr<UWorld> World,
+	const FFromLZProcessParams& Params,
+	FFromLZCompositeStartedCallback StartedCallback,
+	FFromLZPressCompletionCallback CompletionCallback)
+{
 	if (Width <= 0 || Height <= 0 || RGBA.Num() < Width * Height * 4)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("Sketch2D: invalid input (%dx%d, %d bytes)"), Width, Height, RGBA.Num());
+		FFromLZPressProcessResult Result;
+		Result.bSuccess = false;
+		Result.Message = TEXT("Invalid composite input.");
+		DispatchPressCallback(CompletionCallback, Result);
 		return false;
 	}
 	if (!FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
 	{
 		UE_LOG(LogTemp, Log, TEXT("Sketch2D: skipped stale composite because the session generation changed before processing started."));
+		FFromLZPressProcessResult Result;
+		Result.bSuccess = false;
+		Result.Message = TEXT("Skipped stale composite because the session generation changed before processing started.");
+		DispatchPressCallback(CompletionCallback, Result);
 		return false;
 	}
 
@@ -218,6 +325,15 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	// Action.json outputs live under Saved/FromAction/Press_##/ (sibling of 2DDebug).
 	const FString ActionPressDir = FPaths::GetPath(DebugDir) / TEXT("FromAction") / PressName;
 	IFileManager::Get().MakeDirectory(*ActionPressDir, true);
+
+	{
+		FFromLZPressProcessResult StartedResult;
+		StartedResult.bSuccess = true;
+		StartedResult.Message = TEXT("Composite processing started.");
+		StartedResult.PressDir = PressDir;
+		StartedResult.ActionPressDir = ActionPressDir;
+		DispatchStartedCallback(StartedCallback, StartedResult);
+	}
 
 	// Record which FromLZCaptures / FromSketch source files this press consumed
 	// (paths relative to Saved/). Written into the Press_## folder as capture_ref.json.
@@ -246,8 +362,8 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	// Non-white -> foreground (replaces grayscale+Gaussian+Otsu for the colored composite),
 	// then remove small components without changing the source-stroke topology.
 	TArray<uint8> Bin;
-	FromLZImageOps::BinarizeNonWhite(RGBA, Width, Height, /*WhiteThreshold*/ 240, Bin);
-	FromLZImageOps::RemoveSmallComponents(Bin, Width, Height, /*MinArea*/ 12);
+	FromLZImageOps::BinarizeNonWhite(RGBA, Width, Height, Params.Step1WhiteThreshold, Bin);
+	FromLZImageOps::RemoveSmallComponents(Bin, Width, Height, Params.Step1MinArea);
 
 	// 00_input is the raw composite (saved for reference), 01_binary is the cleaned mask.
 	{
@@ -265,16 +381,22 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 
 	// ---- Step 2: skeletonize ------------------------------------------------
 	TArray<uint8> Skel;
-	FromLZImageOps::ZhangSuenThinning(Bin, Width, Height, Skel);
-	FromLZImageOps::RemoveSmallComponents(Skel, Width, Height, /*MinArea*/ 6);
+	FromLZImageOps::ZhangSuenThinning(Bin, Width, Height, Skel, Params.Step2ThinningMaxIter);
+	FromLZImageOps::RemoveSmallComponents(Skel, Width, Height, Params.Step2SkeletonMinArea);
 	FromLZImageOps::SaveMaskPng(Skel, Width, Height, PressDir / TEXT("02_skeleton.png"), /*bInvertForDisplay*/ true);
 
 	// Per-pixel color-class map of the composite (red/green/blue/black/none).
 	// Step 3 uses it to keep short dangling branches that still correspond to
 	// source red/black marks; later steps reuse it for stroke color assignment.
 	TArray<uint8> ColorMap;
-	FromLZImageOps::BuildColorClassMap(RGBA, Width, Height, ColorMap);
-	const int32 ColorSampleRadius = 2;
+	FromLZImageOps::BuildColorClassMap(
+		RGBA,
+		Width,
+		Height,
+		static_cast<uint8>(FMath::Clamp(Params.ColorWhiteCutoff, 0, 255)),
+		Params.ColorDominanceMargin,
+		ColorMap);
+	const int32 ColorSampleRadius = Params.ColorSampleRadius;
 
 	// ---- Step 3: skeleton gap repair ---------------------------------------
 	// Run full-skeleton connection, red/black graph reconnect, full-graph backfill,
@@ -283,10 +405,10 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	TArray<uint8> EffectiveColorMap;
 	FromLZImageOps::CleanupSkeletonEndpoints(
 		Skel, Width, Height,
-		/*GapTol*/ 10.0f,
-		/*ConnectThickness*/ 1,
-		/*SmallLoopBboxAreaThresh*/ 500.0f,
-		/*BranchPruneMaxPixels*/ 0.0f, // 0 -> auto = max(30, 3*GapTol)
+		Params.Step3GapTol,
+		Params.Step3ConnectThickness,
+		Params.Step3SmallLoopBboxAreaThresh,
+		Params.Step3BranchPruneMaxPixels,
 		ColorMap,
 		ColorSampleRadius,
 		PressDir / TEXT("03a_red_black_connectors.png"),
@@ -299,14 +421,14 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	FromLZImageOps::SaveMaskPng(SkelClean, Width, Height, PressDir / TEXT("03_skeleton_clean.png"), /*bInvertForDisplay*/ true);
 
 	// The color map also keeps RGB strokes from being merged together.
-	const float EndpointTol = 3.0f;
-	const float ColorMinRunArc = 3.0f; // absorb short color "blips" at crossings into neighbors
+	const float EndpointTol = Params.Step4EndpointTol;
+	const float ColorMinRunArc = Params.Step4ColorMinRunArc;
 
 	// ---- Step 4: stroke tracing + color classification --------------------
 	// Crossing-number node classification + 8-connected polyline tracing, then
 	// assign red/green/blue/black per stroke and split at color boundaries
 	// (gap-repair runs reclassified by neighbor color/direction).
-	const int32 TraceMinPixels = 3; // --trace-min-pixels
+	const int32 TraceMinPixels = Params.Step4TraceMinPixels;
 	TArray<FromLZImageOps::FStroke> Strokes;
 	FromLZImageOps::TraceStrokes(SkelClean, Width, Height, TraceMinPixels, Strokes);
 	FromLZImageOps::SaveStrokesPng(Strokes, Width, Height, PressDir / TEXT("04_strokes.png"));
@@ -320,11 +442,11 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	TArray<FromLZImageOps::FColoredStroke> SplitColored;
 	FromLZImageOps::SplitColoredStrokesAtCorners(
 		ColoredStrokes,
-		/*AngleThresh*/ 25.0f,            // --split-corner-angle
+		Params.Step5AngleThresh,
 		/*MinPixels*/ TraceMinPixels,
-		/*SegmentArc*/ 30.0f,             // --split-segment-arc
-		/*SplitPeakMinDistance*/ 10.0f,   // default
-		/*MaxIters*/ 5,                   // default
+		Params.Step5SegmentArc,
+		Params.Step5SplitPeakMinDistance,
+		Params.Step5MaxIters,
 		SplitColored);
 
 	// Raw per-stroke palette render (each piece a distinct color), same style as 04_strokes.png.
@@ -360,10 +482,10 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	TArray<FromLZImageOps::FColoredStroke> Merged;
 	FromLZImageOps::MergeColoredStrokesSameColor(
 		SplitColored,
-		/*MaxGap*/ 3.0f,                 // --post-split-merge-gap
-		/*MaxAngle*/ 12.0f,              // --post-split-merge-angle
-		/*MaxIters*/ 80,
-		/*ProtectJunctionRadius*/ 3.0f,
+		Params.Step6MaxGap,
+		Params.Step6MaxAngle,
+		Params.Step6MaxIters,
+		Params.Step6ProtectJunctionRadius,
 		Merged);
 	SaveStrokeTriplet(Merged, TEXT("06_merged"));
 
@@ -374,7 +496,7 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 
 	// ---- Step 8: enclosed-region mask ------------------------------------
 	TArray<uint8> EnclosedMask, EnclosedBarrier;
-	FromLZImageOps::ComputeEnclosedRegionMask(Merged, Width, Height, /*Thickness*/ 3, EnclosedMask, EnclosedBarrier);
+	FromLZImageOps::ComputeEnclosedRegionMask(Merged, Width, Height, Params.Step8Thickness, EnclosedMask, EnclosedBarrier);
 	FromLZImageOps::SaveMaskPng(EnclosedBarrier, Width, Height, PressDir / TEXT("08a_enclosed_barrier.png"), /*bInvertForDisplay*/ true);
 	FromLZImageOps::SaveMaskPng(EnclosedMask, Width, Height, PressDir / TEXT("08_enclosed_mask.png"), /*bInvertForDisplay*/ true);
 
@@ -384,15 +506,21 @@ bool FFromLZSketch2DProcessor::ProcessCompositeWithGeneration(const TArray<uint8
 	// graph and an independent real-red-segment/black-segment fallback pass within 20px.
 	TArray<FromLZImageOps::FCapExtrusionResult> Caps;
 	const int32 NumCaps = FromLZImageOps::RecoverCapExtrusionsPerComponent(
-		Merged, /*ConnectorTol*/ 20.0f, /*BlackSelectTol*/ 20.0f, Width, Height, PressDir, ActionPressDir, Caps);
+		Merged, Params.Step9ConnectorTol, Params.Step9BlackSelectTol, Width, Height, PressDir, ActionPressDir, Caps);
 
 	// ---- Step 10/11: face validation -> solid rebuild -> runtime spawn/Boolean --
 	if (!FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
 	{
 		UE_LOG(LogTemp, Log, TEXT("Sketch2D: skipped stale Step10/11 reconstruction because the session generation changed during processing."));
+		FFromLZPressProcessResult Result;
+		Result.bSuccess = false;
+		Result.Message = TEXT("Skipped stale Step10/11 reconstruction because the session generation changed during processing.");
+		Result.PressDir = PressDir;
+		Result.ActionPressDir = ActionPressDir;
+		DispatchPressCallback(CompletionCallback, Result);
 		return false;
 	}
-	FFromLZFaceReconstructor::ProcessPress(PressDir, ActionPressDir, World, SessionGeneration);
+	FFromLZFaceReconstructor::ProcessPress(PressDir, ActionPressDir, World, SessionGeneration, MoveTemp(CompletionCallback));
 
 	const double Elapsed = FPlatformTime::Seconds() - StartTime;
 	UE_LOG(LogTemp, Log, TEXT("Sketch2D: steps 1-11 dispatched in %.3fs (%dx%d): %d merged strokes; %d cap component(s) -> %s"),

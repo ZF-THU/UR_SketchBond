@@ -89,7 +89,7 @@ struct FFromLZCameraProjectionSnapshot
 	bool bConstrainAspectRatio = false;
 };
 
-static bool IsUsableOrthographicProjectionMatrix(const FMatrix& Matrix)
+static bool FromLZIsUsableOrthographicProjectionMatrix(const FMatrix& Matrix)
 {
 	return
 		FMath::IsFinite(Matrix.M[0][0]) &&
@@ -125,7 +125,7 @@ static bool TryGetOrthographicViewPlanePosition(
 	double& OutRight,
 	double& OutUp)
 {
-	if (!IsUsableOrthographicProjectionMatrix(ProjectionMatrix))
+	if (!FromLZIsUsableOrthographicProjectionMatrix(ProjectionMatrix))
 	{
 		return false;
 	}
@@ -218,6 +218,7 @@ struct FPendingFromLZCapture
 	bool bUsedSubjectBoundsCenterOrthoWidth = false;
 	bool bSourceOrthoWidthUsedDefault = false;
 	bool bViewportReferenceSaved = false;
+	bool bOpenSketchBoardOnSuccess = true;
 	FFromLZCaptureCompletionCallback CompletionCallback;
 };
 
@@ -547,7 +548,7 @@ static bool SaveNormalFaces(
 {
 	using namespace FromLZFaces;
 
-	if (bCaptureOrthographic && !IsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
+	if (bCaptureOrthographic && !FromLZIsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ: faces output requires a valid offscreen orthographic projection matrix."));
 		return false;
@@ -979,7 +980,7 @@ namespace FromLZActorMaterialId
 		FProjectedVertex& Out)
 	{
 		Out = FProjectedVertex();
-		if (W <= 0 || H <= 0 || !IsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
+		if (W <= 0 || H <= 0 || !FromLZIsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
 		{
 			return false;
 		}
@@ -1270,7 +1271,7 @@ namespace FromLZActorMaterialId
 	{
 		if (!World || W <= 0 || H <= 0 ||
 			CaptureOrthoWidth <= 1e-6 ||
-			!IsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
+			!FromLZIsUsableOrthographicProjectionMatrix(CaptureProjectionMatrix))
 		{
 			return false;
 		}
@@ -1510,7 +1511,7 @@ static bool BuildOffscreenOrthographicCaptureView(
 	OutView.OrthoWidth = ViewInfo.OrthoWidth;
 	OutView.OrthoBackoff = 0.0;
 	OutView.ProjectionMatrix = ViewInfo.CalculateProjectionMatrix();
-	OutView.bUseCustomProjectionMatrix = IsUsableOrthographicProjectionMatrix(OutView.ProjectionMatrix);
+	OutView.bUseCustomProjectionMatrix = FromLZIsUsableOrthographicProjectionMatrix(OutView.ProjectionMatrix);
 	OutView.SourceViewTransformSource = TEXT("selected_camera_component_transform_snapshot");
 	OutView.TransformSource = TEXT("selected_camera_component_transform_snapshot");
 	OutView.FramingMode = TEXT("camera_aspect_ratio_max_inscribed_offscreen");
@@ -1602,7 +1603,7 @@ static bool ConfigureSceneCaptureFromCaptureView(
 {
 	if (!SceneCapture ||
 		!CaptureView.bUseCustomProjectionMatrix ||
-		!IsUsableOrthographicProjectionMatrix(CaptureView.ProjectionMatrix))
+		!FromLZIsUsableOrthographicProjectionMatrix(CaptureView.ProjectionMatrix))
 	{
 		return false;
 	}
@@ -2137,7 +2138,7 @@ static bool FinalizeProjectionDebugFiles(const FPendingFromLZCapture& Pending)
 	Validation->SetBoolField(TEXT("source_camera_unchanged"), true);
 	Validation->SetBoolField(
 		TEXT("offscreen_projection_matrix_usable"),
-		IsUsableOrthographicProjectionMatrix(Pending.CaptureView.ProjectionMatrix));
+		FromLZIsUsableOrthographicProjectionMatrix(Pending.CaptureView.ProjectionMatrix));
 	Validation->SetBoolField(
 		TEXT("scene_capture_uses_offscreen_projection_matrix"),
 		bSceneCaptureUsesCustomProjection && bSceneCaptureProjectionMatchesOffscreenView);
@@ -2539,7 +2540,7 @@ static bool CompleteCaptureFromTarget(
 	USpringArmComponent* CameraBoom = Cast<USpringArmComponent>(CameraComponent->GetAttachParent());
 
 	if (!CaptureView.bUseCustomProjectionMatrix ||
-		!IsUsableOrthographicProjectionMatrix(CaptureView.ProjectionMatrix))
+		!FromLZIsUsableOrthographicProjectionMatrix(CaptureView.ProjectionMatrix))
 	{
 		UE_LOG(LogTemp, Warning, TEXT("CaptureFromLZ failed: offscreen orthographic capture view is invalid."));
 		return false;
@@ -2576,6 +2577,7 @@ static bool CompleteCaptureFromTarget(
 	RootObject->SetStringField(TEXT("actor_material_json_path"), OutputPaths.ActorMaterialJsonPath);
 	RootObject->SetStringField(TEXT("capture_camera_source"), Pending.CameraSource);
 	RootObject->SetStringField(TEXT("requested_camera_tag"), Pending.RequestedCameraTag.IsNone() ? FString() : Pending.RequestedCameraTag.ToString());
+	RootObject->SetBoolField(TEXT("open_sketch_board_on_success"), Pending.bOpenSketchBoardOnSuccess);
 	RootObject->SetStringField(TEXT("capture_camera_actor"), GetNameSafe(CameraActor));
 	RootObject->SetStringField(TEXT("capture_camera_component"), GetNameSafe(CameraComponent));
 	RootObject->SetBoolField(TEXT("view_target_was_changed"), false);
@@ -2687,9 +2689,13 @@ static bool CompleteCaptureFromTarget(
 	if (bRequiredOutputsAvailable)
 	{
 		UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ saved json to %s and line-art png to %s"), *OutputPaths.JsonPath, *OutputPaths.PngPath);
-		if (GEngine && GEngine->GameViewport)
+		if (Pending.bOpenSketchBoardOnSuccess && GEngine && GEngine->GameViewport)
 		{
 			FFromLZSketchBoard::ShowForCapture(Pawn->GetWorld(), GEngine->GameViewport, OutputPaths.PngPath);
+		}
+		else if (!Pending.bOpenSketchBoardOnSuccess)
+		{
+			UE_LOG(LogTemp, Log, TEXT("CaptureFromLZ: sketch board suppressed for source=%s."), *Pending.CameraSource);
 		}
 	}
 	else
@@ -2748,6 +2754,7 @@ static bool BeginResolvedOffscreenCapture(
 	const FString& CameraSource,
 	FName RequestedCameraTag,
 	bool bAllowSubjectBoundsCenterOrthoWidth,
+	bool bOpenSketchBoardOnSuccess = true,
 	FFromLZCaptureCompletionCallback CompletionCallback = nullptr)
 {
 	if (!World || !Viewport || !Pawn || !CameraActor || !Camera)
@@ -2765,6 +2772,7 @@ static bool BeginResolvedOffscreenCapture(
 	Pending->OutputPaths = MakeCaptureOutputPaths();
 	Pending->CameraSource = CameraSource;
 	Pending->RequestedCameraTag = RequestedCameraTag;
+	Pending->bOpenSketchBoardOnSuccess = bOpenSketchBoardOnSuccess;
 	Pending->CompletionCallback = MoveTemp(CompletionCallback);
 
 	TArray<AActor*> SubjectActors;
@@ -3000,6 +3008,7 @@ bool FFromLZCaptureUtils::BeginCaptureFromCameraComponent(
 		TEXT("blueprint_camera_offscreen"),
 		NAME_None,
 		/*bAllowSubjectBoundsCenterOrthoWidth*/ false,
+		/*bOpenSketchBoardOnSuccess*/ false,
 		MoveTemp(CompletionCallback));
 }
 

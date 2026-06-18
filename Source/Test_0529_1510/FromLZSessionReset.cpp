@@ -25,6 +25,7 @@ namespace
 	TAtomic<int32> GFromLZActiveCompositeTaskCount(0);
 	bool bFromLZResetPending = false;
 	bool bFromLZReloadIssued = false;
+	FFromLZSessionResetCompletionCallback GFromLZPendingResetCompletionCallback;
 	FDelegateHandle GFromLZPostLoadMapHandle;
 
 	class FFromLZGlobalTabInputProcessor : public IInputProcessor
@@ -104,6 +105,25 @@ namespace
 		return PlatformFile.CopyDirectoryTree(*DestDir, *SourceDir, true);
 	}
 
+	void AppendResetWorkingFolderPaths(TArray<FString>& OutFolders)
+	{
+		const FString SavedDir = FPaths::ProjectSavedDir();
+		const TCHAR* RecreatedDirs[] =
+		{
+			TEXT("2DDebug"),
+			TEXT("FromAction"),
+			TEXT("FromLZCaptures"),
+			TEXT("FromProcess"),
+			TEXT("FromSketch"),
+			TEXT("Logs"),
+		};
+
+		for (const TCHAR* SubDir : RecreatedDirs)
+		{
+			OutFolders.Add(SavedDir / SubDir);
+		}
+	}
+
 	void ResetSavedWorkingFolders()
 	{
 		const FString SavedDir = FPaths::ProjectSavedDir();
@@ -128,6 +148,30 @@ namespace
 		}
 
 		FileManager.MakeDirectory(*(SavedDir / TEXT("Logs")), true);
+	}
+
+	void DispatchPendingResetCompletion(const FFromLZSessionResetResult& Result)
+	{
+		if (!GFromLZPendingResetCompletionCallback)
+		{
+			return;
+		}
+
+		FFromLZSessionResetCompletionCallback CallbackToRun = MoveTemp(GFromLZPendingResetCompletionCallback);
+		if (CallbackToRun)
+		{
+			CallbackToRun(Result);
+		}
+	}
+
+	void DispatchResetCompletionNow(
+		FFromLZSessionResetCompletionCallback& CompletionCallback,
+		const FFromLZSessionResetResult& Result)
+	{
+		if (CompletionCallback)
+		{
+			CompletionCallback(Result);
+		}
 	}
 
 	bool ArchiveSavedFolders(FString& OutArchiveDir)
@@ -197,6 +241,7 @@ void FFromLZSessionReset::Shutdown()
 		FSlateApplication::Get().UnregisterInputPreProcessor(GFromLZGlobalTabInputProcessor);
 	}
 	GFromLZGlobalTabInputProcessor.Reset();
+	GFromLZPendingResetCompletionCallback = nullptr;
 }
 
 void FFromLZSessionReset::Tick(UWorld* World)
@@ -214,23 +259,34 @@ void FFromLZSessionReset::Tick(UWorld* World)
 	FinalizePendingReset(World);
 }
 
-bool FFromLZSessionReset::HandleGlobalTab(UWorld* World)
+bool FFromLZSessionReset::HandleGlobalTab(
+	UWorld* World,
+	FFromLZSessionResetCompletionCallback CompletionCallback)
 {
 	if (!World)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("FromLZ reset: Tab ignored because no game world is available."));
+		FFromLZSessionResetResult Result;
+		Result.Message = TEXT("No game world is available.");
+		Result.SessionGeneration = GFromLZSessionGeneration.Load();
+		DispatchResetCompletionNow(CompletionCallback, Result);
 		return false;
 	}
 
 	if (bFromLZResetPending)
 	{
 		UE_LOG(LogTemp, Log, TEXT("FromLZ reset: Tab ignored because a reset is already pending."));
+		FFromLZSessionResetResult Result;
+		Result.Message = TEXT("Reset already pending.");
+		Result.SessionGeneration = GFromLZSessionGeneration.Load();
+		DispatchResetCompletionNow(CompletionCallback, Result);
 		return true;
 	}
 
 	bFromLZResetPending = true;
 	bFromLZReloadIssued = false;
 	++GFromLZSessionGeneration;
+	GFromLZPendingResetCompletionCallback = MoveTemp(CompletionCallback);
 
 	FFromLZCaptureUtils::CancelPendingCapture();
 	FFromLZCameraPreview::Shutdown();
@@ -307,11 +363,33 @@ void FFromLZSessionReset::FinalizePendingReset(UWorld* World)
 	if (!World || LevelName.IsEmpty())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("FromLZ reset: archive=%d, but level reload failed because world or level name is unavailable."), bArchiveOk ? 1 : 0);
+		FFromLZSessionResetResult Result;
+		Result.bSuccess = false;
+		Result.Message = TEXT("Level reload failed because world or level name is unavailable.");
+		Result.ArchiveDir = ArchiveDir;
+		Result.LevelName = LevelName;
+		AppendResetWorkingFolderPaths(Result.RecreatedFolders);
+		Result.bArchiveOk = bArchiveOk;
+		Result.bReloadIssued = false;
+		Result.SessionGeneration = GFromLZSessionGeneration.Load();
+		DispatchPendingResetCompletion(Result);
 		bFromLZResetPending = false;
 		return;
 	}
 
 	bFromLZReloadIssued = true;
+	FFromLZSessionResetResult Result;
+	Result.bSuccess = true;
+	Result.Message = bArchiveOk
+		? TEXT("Full session reset completed; level reload issued.")
+		: TEXT("Full session reset completed with archive copy warnings; level reload issued.");
+	Result.ArchiveDir = ArchiveDir;
+	Result.LevelName = LevelName;
+	AppendResetWorkingFolderPaths(Result.RecreatedFolders);
+	Result.bArchiveOk = bArchiveOk;
+	Result.bReloadIssued = true;
+	Result.SessionGeneration = GFromLZSessionGeneration.Load();
+	DispatchPendingResetCompletion(Result);
 	UE_LOG(LogTemp, Log, TEXT("FromLZ reset: archived Saved state to %s, cleared working folders, and is reloading level %s."), *ArchiveDir, *LevelName);
 	UGameplayStatics::OpenLevel(World, FName(*LevelName), true);
 }

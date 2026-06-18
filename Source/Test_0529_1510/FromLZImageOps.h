@@ -92,9 +92,11 @@ namespace FromLZImageOps
 
 	// Classify one RGB sample into a color class.
 	EStrokeColor ClassifyRGB(uint8 R, uint8 G, uint8 B);
+	EStrokeColor ClassifyRGB(uint8 R, uint8 G, uint8 B, uint8 WhiteCutoff, int32 DominanceMargin);
 
 	// Per-pixel color-class map (values are EStrokeColor cast to uint8) for the composite.
 	void BuildColorClassMap(const TArray<uint8>& RGBA, int32 Width, int32 Height, TArray<uint8>& OutMap);
+	void BuildColorClassMap(const TArray<uint8>& RGBA, int32 Width, int32 Height, uint8 WhiteCutoff, int32 DominanceMargin, TArray<uint8>& OutMap);
 
 	// Dominant non-None color class within a square window of the given radius (None if empty).
 	EStrokeColor SampleColorAt(const TArray<uint8>& ColorMap, int32 Width, int32 Height, int32 X, int32 Y, int32 Radius);

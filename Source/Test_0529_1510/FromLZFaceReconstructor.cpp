@@ -10200,22 +10200,28 @@ namespace
 		Component->SetHiddenInGame(true, true);
 	}
 
-	static void RestoreStep11BooleanResults(UWorld* World, const FString& PressId)
+	static FFromLZStep11UndoResult RestoreStep11BooleanResults(UWorld* World, const FString& PressId)
 	{
+		FFromLZStep11UndoResult Result;
+		Result.PressId = PressId;
+
 		if (!World)
 		{
-			return;
+			Result.Message = TEXT("World is no longer valid.");
+			return Result;
 		}
 
 		if (PressId.IsEmpty())
 		{
 			UE_LOG(LogTemp, Warning, TEXT("Step11: no active press id; skipped press-scoped restore."));
-			return;
+			Result.Message = TEXT("No active Step11 press to undo.");
+			return Result;
 		}
 
 		const FName GeneratedByTag = Step11GeneratedByPressTag(PressId);
 		const FName HiddenByTag = Step11HiddenByPressTag(PressId);
 		const FString UndoDiagnosticPath = FPaths::ProjectSavedDir() / TEXT("2DDebug") / PressId / TEXT("11_undo_diagnostics.json");
+		Result.UndoDiagnosticPath = UndoDiagnosticPath;
 		TSharedRef<FJsonObject> UndoRoot = MakeShared<FJsonObject>();
 		UndoRoot->SetNumberField(TEXT("diagnostic_version"), 2);
 		UndoRoot->SetStringField(TEXT("press_id"), PressId);
@@ -10318,7 +10324,21 @@ namespace
 		UndoRoot->SetNumberField(TEXT("skipped_other_generated_actor_count"), SkippedOtherGeneratedActorCount);
 		UndoRoot->SetNumberField(TEXT("skipped_other_generated_component_count"), SkippedOtherGeneratedComponentCount);
 		UndoRoot->SetNumberField(TEXT("skipped_other_hidden_source_component_count"), SkippedOtherHiddenSourceComponentCount);
-		SaveJsonObject(UndoRoot, UndoDiagnosticPath);
+		IFileManager::Get().MakeDirectory(*FPaths::GetPath(UndoDiagnosticPath), true);
+		if (SaveJsonObject(UndoRoot, UndoDiagnosticPath))
+		{
+			Result.OutputFiles.Add(UndoDiagnosticPath);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Step11: failed to save undo diagnostics %s"), *UndoDiagnosticPath);
+		}
+
+		Result.bSuccess = true;
+		Result.Message = FString::Printf(TEXT("Step11 undo completed for %s."), *PressId);
+		Result.DestroyedActorCount = ActorsToDestroy.Num();
+		Result.DestroyedBooleanComponentCount = GeneratedComponents.Num();
+		Result.RestoredHiddenSourceCount = HiddenSourceComponents.Num();
 		UE_LOG(
 			LogTemp,
 			Log,
@@ -10330,6 +10350,7 @@ namespace
 			SkippedOtherGeneratedActorCount,
 			SkippedOtherGeneratedComponentCount,
 			SkippedOtherHiddenSourceComponentCount);
+		return Result;
 	}
 
 	static void ApplyStep11BooleanOperations(
@@ -11029,18 +11050,60 @@ namespace
 		return false;
 	}
 
+	static void DispatchPressCompletion(
+		FFromLZPressCompletionCallback& CompletionCallback,
+		const FFromLZPressProcessResult& Result)
+	{
+		if (!CompletionCallback)
+		{
+			return;
+		}
+
+		FFromLZPressCompletionCallback CallbackToRun = MoveTemp(CompletionCallback);
+		AsyncTask(ENamedThreads::GameThread, [CallbackToRun = MoveTemp(CallbackToRun), Result]() mutable
+		{
+			CallbackToRun(Result);
+		});
+	}
+
 	static void SpawnMeshesOnGameThread(
 		TWeakObjectPtr<UWorld> WorldPtr,
 		TArray<FReconstructedMesh> Meshes,
 		FString DebugObjPath = FString(),
 		FString PressId = FString(),
-		int32 SessionGeneration = INDEX_NONE)
+		int32 SessionGeneration = INDEX_NONE,
+		FString PressDir = FString(),
+		FString ActionPressDir = FString(),
+		bool bPipelineSuccess = true,
+		FString CompletionMessage = FString(),
+		FFromLZPressCompletionCallback CompletionCallback = nullptr)
 	{
-		AsyncTask(ENamedThreads::GameThread, [WorldPtr, Meshes = MoveTemp(Meshes), DebugObjPath = MoveTemp(DebugObjPath), PressId = MoveTemp(PressId), SessionGeneration]() mutable
+		AsyncTask(ENamedThreads::GameThread, [
+			WorldPtr,
+			Meshes = MoveTemp(Meshes),
+			DebugObjPath = MoveTemp(DebugObjPath),
+			PressId = MoveTemp(PressId),
+			SessionGeneration,
+			PressDir = MoveTemp(PressDir),
+			ActionPressDir = MoveTemp(ActionPressDir),
+			bPipelineSuccess,
+			CompletionMessage = MoveTemp(CompletionMessage),
+			CompletionCallback = MoveTemp(CompletionCallback)]() mutable
 		{
+			FFromLZPressProcessResult CompletionResult;
+			CompletionResult.bSuccess = bPipelineSuccess;
+			CompletionResult.Message = CompletionMessage.IsEmpty()
+				? (bPipelineSuccess ? FString(TEXT("Step 10/11 completed.")) : FString(TEXT("Step 10/11 failed.")))
+				: CompletionMessage;
+			CompletionResult.PressDir = PressDir;
+			CompletionResult.ActionPressDir = ActionPressDir;
+
 			if (SessionGeneration != INDEX_NONE && !FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
 			{
 				UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: skipped stale runtime mesh spawn on the game thread for press=%s."), *PressId);
+				CompletionResult.bSuccess = false;
+				CompletionResult.Message = TEXT("Skipped stale runtime mesh spawn because the session generation changed.");
+				DispatchPressCompletion(CompletionCallback, CompletionResult);
 				return;
 			}
 
@@ -11048,6 +11111,9 @@ namespace
 			if (!World)
 			{
 				UE_LOG(LogTemp, Warning, TEXT("FaceReconstruct: world is no longer valid; skipped runtime mesh spawn."));
+				CompletionResult.bSuccess = false;
+				CompletionResult.Message = TEXT("World is no longer valid; skipped runtime mesh spawn.");
+				DispatchPressCompletion(CompletionCallback, CompletionResult);
 				return;
 			}
 
@@ -11072,6 +11138,7 @@ namespace
 			ApplyStep11BooleanOperations(World, Meshes, PressId, Step11DiagnosticJsonPath, AcceptedCutterActorNames);
 
 			UMaterialInterface* VertexColorMaterial = GetReconstructionVertexColorMaterial();
+			int32 SpawnedRuntimeActorCount = 0;
 			for (const FReconstructedMesh& MeshData : Meshes)
 			{
 				if (MeshData.VerticesWorld.Num() < 3 || MeshData.Triangles.Num() < 3)
@@ -11094,6 +11161,7 @@ namespace
 					UE_LOG(LogTemp, Warning, TEXT("FaceReconstruct: failed to spawn actor %s"), *MeshData.ActorName);
 					continue;
 				}
+				++SpawnedRuntimeActorCount;
 
 				Actor->Tags.AddUnique(MeshData.Tag);
 				Actor->Tags.AddUnique(GeneratedByTag);
@@ -11232,6 +11300,8 @@ namespace
 			}
 
 			UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: press=%s spawned %d runtime reconstruction actor(s)."), *PressId, Meshes.Num());
+			CompletionResult.SpawnedRuntimeActorCount = SpawnedRuntimeActorCount;
+			DispatchPressCompletion(CompletionCallback, CompletionResult);
 		});
 	}
 
@@ -11432,11 +11502,22 @@ bool FFromLZFaceReconstructor::EvaluateCandidateFaces(
 	return true;
 }
 
-void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FString& ActionPressDir, TWeakObjectPtr<UWorld> World, int32 SessionGeneration)
+void FFromLZFaceReconstructor::ProcessPress(
+	const FString& PressDir,
+	const FString& ActionPressDir,
+	TWeakObjectPtr<UWorld> World,
+	int32 SessionGeneration,
+	FFromLZPressCompletionCallback CompletionCallback)
 {
 	if (SessionGeneration != INDEX_NONE && !FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
 	{
 		UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: skipped stale press %s because the session generation changed before processing started."), *FPaths::GetCleanFilename(PressDir));
+		FFromLZPressProcessResult Result;
+		Result.bSuccess = false;
+		Result.Message = TEXT("Skipped stale press because the session generation changed before processing started.");
+		Result.PressDir = PressDir;
+		Result.ActionPressDir = ActionPressDir;
+		DispatchPressCompletion(CompletionCallback, Result);
 		return;
 	}
 
@@ -11458,7 +11539,11 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 
 	if (ComponentNames.Num() == 0)
 	{
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, true,
+			TEXT("No component folders were found; Step 10/11 completed with no runtime meshes."),
+			MoveTemp(CompletionCallback));
 		UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: no component folders found in %s"), *PressDir);
 		return;
 	}
@@ -11467,19 +11552,31 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (!LoadCaptureRef(PressDir, Inputs))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, TEXT("Failed to read capture_ref.json or resolve capture/faces paths"));
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, false,
+			TEXT("Failed to read capture_ref.json or resolve capture/faces paths."),
+			MoveTemp(CompletionCallback));
 		return;
 	}
 	if (!DecodePngToRGBA(Inputs.FacesPngPath, Inputs.FacesRGBA, Inputs.FacesWidth, Inputs.FacesHeight))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to decode faces png: %s"), *Inputs.FacesPngPath));
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, false,
+			FString::Printf(TEXT("Failed to decode faces png: %s"), *Inputs.FacesPngPath),
+			MoveTemp(CompletionCallback));
 		return;
 	}
 	if (!LoadFacesJson(Inputs.FacesJsonPath, Inputs.Faces, Inputs.FacesProjection))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FString::Printf(TEXT("Failed to read faces json: %s"), *Inputs.FacesJsonPath));
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, false,
+			FString::Printf(TEXT("Failed to read faces json: %s"), *Inputs.FacesJsonPath),
+			MoveTemp(CompletionCallback));
 		return;
 	}
 	if (!Inputs.ActorMaterialPngPath.IsEmpty() && !Inputs.ActorMaterialJsonPath.IsEmpty())
@@ -11515,14 +11612,22 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (!LoadCameraJson(Inputs.CaptureJsonPath, Inputs.Camera, CameraLoadError))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, CameraLoadError);
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, false,
+			CameraLoadError,
+			MoveTemp(CompletionCallback));
 		return;
 	}
 	FString ProjectionValidationError;
 	if (!ValidateProjectionMetadata(Inputs, ProjectionValidationError))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, ProjectionValidationError);
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, false,
+			ProjectionValidationError,
+			MoveTemp(CompletionCallback));
 		return;
 	}
 	UE_LOG(
@@ -11541,7 +11646,11 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (!BuildFaceLookups(Inputs, FaceLookupError))
 	{
 		SaveCommonFailureForComponents(ComponentNames, PressDir, FaceLookupError);
-		SpawnMeshesOnGameThread(World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration);
+		SpawnMeshesOnGameThread(
+			World, TArray<FReconstructedMesh>(), FString(), PressId, SessionGeneration,
+			PressDir, ActionPressDir, false,
+			FaceLookupError,
+			MoveTemp(CompletionCallback));
 		return;
 	}
 
@@ -11592,10 +11701,26 @@ void FFromLZFaceReconstructor::ProcessPress(const FString& PressDir, const FStri
 	if (SessionGeneration != INDEX_NONE && !FFromLZSessionReset::IsSessionGenerationCurrent(SessionGeneration))
 	{
 		UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: skipped stale runtime spawn for press %s because the session generation changed after reconstruction."), *PressId);
+		FFromLZPressProcessResult Result;
+		Result.bSuccess = false;
+		Result.Message = TEXT("Skipped stale runtime spawn because the session generation changed after reconstruction.");
+		Result.PressDir = PressDir;
+		Result.ActionPressDir = ActionPressDir;
+		DispatchPressCompletion(CompletionCallback, Result);
 		return;
 	}
 
-	SpawnMeshesOnGameThread(World, MoveTemp(MeshesToSpawn), PressDir / TEXT("10_reconstruction_scene.obj"), PressId, SessionGeneration);
+	SpawnMeshesOnGameThread(
+		World,
+		MoveTemp(MeshesToSpawn),
+		PressDir / TEXT("10_reconstruction_scene.obj"),
+		PressId,
+		SessionGeneration,
+		PressDir,
+		ActionPressDir,
+		true,
+		TEXT("Step 10/11 completed."),
+		MoveTemp(CompletionCallback));
 	UE_LOG(LogTemp, Log, TEXT("FaceReconstruct: processed %d component(s) for %s."), ComponentNames.Num(), *PressDir);
 }
 
@@ -11622,14 +11747,27 @@ bool FFromLZFaceReconstructor::IsStep11RuntimeActorActiveForCapture(const AActor
 	return bCaptureRuntimeActor && ActorHasActiveStep11GeneratedByTag(Actor);
 }
 
-void FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans(TWeakObjectPtr<UWorld> World)
+void FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans(
+	TWeakObjectPtr<UWorld> World,
+	FFromLZStep11UndoCompletionCallback CompletionCallback)
 {
-	AsyncTask(ENamedThreads::GameThread, [World]()
+	AsyncTask(ENamedThreads::GameThread, [World, CompletionCallback = MoveTemp(CompletionCallback)]() mutable
 	{
+		auto DispatchCompletion = [&CompletionCallback](const FFromLZStep11UndoResult& Result)
+		{
+			if (CompletionCallback)
+			{
+				CompletionCallback(Result);
+			}
+		};
+
 		UWorld* WorldPtr = World.Get();
 		if (!WorldPtr)
 		{
 			UE_LOG(LogTemp, Warning, TEXT("Step11: world is no longer valid; skipped restore."));
+			FFromLZStep11UndoResult Result;
+			Result.Message = TEXT("World is no longer valid.");
+			DispatchCompletion(Result);
 			return;
 		}
 
@@ -11637,10 +11775,13 @@ void FFromLZFaceReconstructor::RestoreStep11RuntimeBooleans(TWeakObjectPtr<UWorl
 		if (PressId.IsEmpty())
 		{
 			UE_LOG(LogTemp, Warning, TEXT("Step11: no active press id; skipped restore."));
+			FFromLZStep11UndoResult Result;
+			Result.Message = TEXT("No active Step11 press to undo.");
+			DispatchCompletion(Result);
 			return;
 		}
 
-		RestoreStep11BooleanResults(WorldPtr, PressId);
+		DispatchCompletion(RestoreStep11BooleanResults(WorldPtr, PressId));
 	});
 }
 

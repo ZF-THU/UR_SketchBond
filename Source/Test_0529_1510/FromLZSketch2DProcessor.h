@@ -1,8 +1,55 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "FromLZFaceReconstructor.h"
 
 class UWorld;
+
+struct FFromLZProcessParams
+{
+	uint8 Step1WhiteThreshold = 240;
+	int32 Step1MinArea = 12;
+	int32 Step2ThinningMaxIter = 100;
+	int32 Step2SkeletonMinArea = 6;
+	int32 ColorSampleRadius = 2;
+	int32 ColorWhiteCutoff = 220;
+	int32 ColorDominanceMargin = 30;
+	float Step3GapTol = 10.0f;
+	int32 Step3ConnectThickness = 1;
+	float Step3SmallLoopBboxAreaThresh = 500.0f;
+	float Step3BranchPruneMaxPixels = 0.0f;
+	float Step4EndpointTol = 3.0f;
+	float Step4ColorMinRunArc = 3.0f;
+	int32 Step4TraceMinPixels = 3;
+	float Step5AngleThresh = 25.0f;
+	float Step5SegmentArc = 30.0f;
+	float Step5SplitPeakMinDistance = 10.0f;
+	int32 Step5MaxIters = 5;
+	float Step6MaxGap = 3.0f;
+	float Step6MaxAngle = 12.0f;
+	int32 Step6MaxIters = 80;
+	float Step6ProtectJunctionRadius = 3.0f;
+	int32 Step8Thickness = 3;
+	float Step9ConnectorTol = 20.0f;
+	float Step9BlackSelectTol = 20.0f;
+
+	float CapLoopGraphNodeSnapTol = 5.0f;
+	float CapRedOnlyLoopMinBboxArea = 500.0f;
+	float CapBorrowedLoopMinBboxArea = 500.0f;
+	float CapMixedSelectionTimeBudgetSeconds = 5.0f;
+	float InteriorGreenMinInsideLengthPx = 10.0f;
+	float GreenTraceEndpointTolPx = 10.0f;
+	float GreenTraceMaxChainDeviationDeg = 45.0f;
+
+	float CandidateFaceMinOverlapRatio = 0.25f;
+	float CandidateFaceMaxNormalSideAngleDegrees = 30.0f;
+	float CandidateFacePreferredNormalSideAngleDegrees = 10.0f;
+
+	int32 CompositeMaxWorkers = 1;
+	int32 ParallelForMaxThreads = 8;
+};
+
+using FFromLZCompositeStartedCallback = TFunction<void(const FFromLZPressProcessResult& Result)>;
 
 // Migrated sketch pipeline: Steps 1-9 analyze the composite image in C++, then
 // Step 10/11 are dispatched to the face reconstructor for runtime geometry.
@@ -47,9 +94,38 @@ public:
 	// Moves the RGBA buffer into the bounded background scheduler so the game
 	// thread never blocks on the heavy 2D/3D processing path.
 	static void ProcessCompositeAsync(TArray<uint8> RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, UWorld* World);
+	static void ProcessCompositeAsync(
+		TArray<uint8> RGBA,
+		int32 Width,
+		int32 Height,
+		const FString& DebugDir,
+		const FSketchSourceInfo& Source,
+		UWorld* World,
+		const FFromLZProcessParams& Params,
+		FFromLZCompositeStartedCallback StartedCallback,
+		FFromLZPressCompletionCallback CompletionCallback);
 
 	// Synchronous entry point (runs on the calling thread). Returns true on success.
 	static bool ProcessComposite(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, TWeakObjectPtr<UWorld> World);
+	static bool ProcessComposite(
+		const TArray<uint8>& RGBA,
+		int32 Width,
+		int32 Height,
+		const FString& DebugDir,
+		const FSketchSourceInfo& Source,
+		TWeakObjectPtr<UWorld> World,
+		const FFromLZProcessParams& Params);
 
 	static bool ProcessCompositeWithGeneration(const TArray<uint8>& RGBA, int32 Width, int32 Height, const FString& DebugDir, const FSketchSourceInfo& Source, int32 SessionGeneration, TWeakObjectPtr<UWorld> World);
+	static bool ProcessCompositeWithGeneration(
+		const TArray<uint8>& RGBA,
+		int32 Width,
+		int32 Height,
+		const FString& DebugDir,
+		const FSketchSourceInfo& Source,
+		int32 SessionGeneration,
+		TWeakObjectPtr<UWorld> World,
+		const FFromLZProcessParams& Params,
+		FFromLZCompositeStartedCallback StartedCallback = nullptr,
+		FFromLZPressCompletionCallback CompletionCallback = nullptr);
 };
